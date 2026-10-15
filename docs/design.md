@@ -161,7 +161,7 @@ lines only once the interfaces between them have settled.
 | `gateway-core` | Principals, classification, the decision function, the tool registry, the audit record type, denial sentences. No I/O. |
 | `gateway-identity` | Token verifiers, one per issuer type, and the team manifest loader. |
 | `audit-postgres` | The audit store over Postgres: the schema, its two roles, the migrations and the boot check. |
-| `connector-github` | The GitHub connector, in the gateway's own process: Otto's GitHub tools, so far `github__get_file`, `github__get_pr` and `github__get_issue`. Every token comes from the key custodian, through the client in `key-custodian`. A fake GitHub REST API behind `test-support`. |
+| `connector-github` | The GitHub connector, in the gateway's own process: Otto's GitHub tools, so far its eight reads other than search and skill bodies. Every token comes from the key custodian, through the client in `key-custodian`. A fake GitHub REST API behind `test-support`. |
 | `key-custodian` | The key custodian (`switchboard-custodian`), the one process that holds the GitHub App key, and its client, a library module the GitHub connector depends on. The gateway never starts the key-holding process; it links the whole crate, server code too, until the crate gains a client-only feature (#219). |
 | `gateway-otto` | The Otto adapter: Otto's policy profile, the turn-grant verifier and the client for Otto's resolver interface. The core crates do not depend on it. |
 | `connector-proxy` | The connector that forwards to a separate MCP server. |
@@ -705,19 +705,24 @@ the custodian's own record, with the revision it was checked against and never t
 is counted on a metrics listener of its own. No demo deploys it: that needs a real App.
 
 **The GitHub connector as built** (#12, the crate `connector-github`). It runs in the
-gateway's own process and holds no key. For each call it asks the custodian for one token,
-naming the caller's proved team, the tool, the repositories, the tool's entry's permission set
-as `[[connectors]]` states it, and the revision the call was decided under, which the core
-hands every connector with the call. The repositories are narrowed as the entry says: `limit`,
-the caller's limit as the snapshot the call was decided under holds it, its GitHub
+gateway's own process and holds no key. For each call it asks the custodian for a token,
+naming the caller's proved team, the tool, the repositories, a permission set and the revision
+the call was decided under, which the core hands every connector with the call. The
+permission set is the tool's entry's, as `[[connectors]]` states it, for `github__get_file`,
+`github__get_pr` and `github__get_issue`; the newer reads each ask for their own, as Otto's
+gateway does, and the connector refuses to be built with an entry that serves one of them
+without stating every permission it asks for (section 13). The repositories are narrowed as
+the entry says: `limit`, the caller's limit as the snapshot the call was decided under holds
+it, its GitHub
 repositories on the one organization the deployment configures, which the decision carries to
 the connector with the call; or `call`, the one repository the call names. The connector
 refuses to be built for an entry narrowed `none`. A token is used for its one call and
 dropped; it never appears in an answer, a row or a log line. A refusal by the custodian is an
 `error` of the kind `custodian_refusal`, GitHub's refusal to issue the token `vendor_refusal`,
 and a custodian that cannot be reached or does not answer in time `other`. The deployment
-file's `[github]` table names the organization, GitHub's API URL and its CA file, and the
-custodian's socket; the gateway reads no key and names none.
+file's `[github]` table names the organization, GitHub's API URL and its CA file, the
+custodian's socket, and the hosts a job log redirect may point to; the gateway reads no key and
+names none.
 
 ## 10. The denial contract
 
@@ -1147,8 +1152,10 @@ in the gateway's own process under `[connectors.<name>]`, and a cap or rate quot
 does not name, and with a `[connectors.<name>]` for a connector it does not run in its own
 process. The one built-in connector wired is GitHub's, under the name of each GitHub entry that
 declares its credential (section 13), so any other `[connectors.<name>]` is refused at start.
-It refuses to start, too, with such an entry and no `[github]` table, and with a `[github]`
-table and no such entry (#12). The boot gates wrap every connector in the gateway's own process
+It refuses to start, too, with such an entry and no `[github]` table, with a `[github]`
+table and no such entry, with a job log host its API URL's rules refuse, and with an entry
+serving one of the newer reads that does not state every permission the read asks for (#12).
+The boot gates wrap every connector in the gateway's own process
 in its bound, and in the rate quotas, so none runs without them, and refuse one wired with a
 bound of zero or past the ceilings. The
 termination grace must cover the longest deadline either table sets, and demo-checks holds the
@@ -1400,8 +1407,10 @@ call or to the limit, and no built-in entry: its connector narrows. A reload tha
 built-in entry under the same revision is refused as an unchanged revision, as the custodian
 refuses it, and under a new one until a restart, since the connector was built with the entry.
 
-The GitHub connector serves three of Otto's read tools so far: `github__get_file`,
-`github__get_pr` and `github__get_issue`. Each checks, before anything is asked of the
+The GitHub connector serves eight of Otto's read tools so far: `github__get_file`,
+`github__get_pr`, `github__get_issue`, `github__get_checks`, `github__get_job_log`,
+`github__list_releases`, `github__pr_template` and `github__repo_conventions`. Each checks,
+before anything is asked of the
 custodian or of GitHub, what Otto's gateway checks (docs/otto-baseline.md): its arguments
 parse into its own types, and a malformed one is `error` with the kind `invalid_arguments`; its
 owner is the configured organization, and a call naming another is `refused`, with the
@@ -1412,9 +1421,43 @@ this gateway for a repository of another organization that a limit holds. A file
 256 KiB and an issue's or a pull request's comments at the first twenty, oldest first, each
 said to be cut; every result carries `provenance`, with `"trust": "untrusted-external"`. GitHub's
 404, which it also answers for a repository the token cannot see, is `other`; its 403 is
-`vendor_refusal`; its rate limit is `other`, with a sentence saying so. None of the three checks
+`vendor_refusal`; its rate limit is `other`, with a sentence saying so. None of them checks
 its own scope, so none has resources to report when it finishes: each is declared from its
-arguments, and its row names its repository. The other read tools, the write tools, Jira, the
+arguments, and its row names its repository.
+
+The five newer reads keep the bounds and behavior docs/otto-baseline.md records:
+
+- `github__get_checks` reads the pull request's head, then its first thirty check runs; for
+  each failing one, its first ten annotations and, for a GitHub Actions run, its job's steps;
+  then the head's combined status and its first thirty statuses. Each list says when it was
+  cut, and a summary or an annotation's message is cut at 4 KiB.
+- `github__get_job_log` asks GitHub for the log and does not follow the redirect it answers
+  with: it asks a host pinned in the deployment file's `[github] job_log_hosts` for the
+  redirect's path and query, with no token, and only when the redirect's scheme, host and port
+  are that host's. A redirect anywhere else is `refused` before any request to it, naming its
+  scheme, host and port and never its signed path or query; a log served without a redirect is
+  an `error` whose body is not read, and so is no log. At most 32 MiB is read and the last
+  64 KiB kept, said to be cut. With no host pinned, every redirect is refused.
+- `github__list_releases` reads thirty releases, without their notes, on a token for
+  `contents`, and thirty tags on one for `metadata`, each list said to be cut.
+- `github__pr_template` and `github__repo_conventions` read the repository's default branch
+  and its head commit, then every file at that commit. The template is the first
+  `pull_request_template.md` in `.github`, the root or `docs`. `AGENTS.md` is served only
+  when CODEOWNERS (the first of `.github/CODEOWNERS`, `CODEOWNERS` and `docs/CODEOWNERS`) gives
+  it an owner, by the last line whose pattern matches it; otherwise it is not read at all.
+  Served, it is quoted between two markers that carry a token made for the call from the
+  operating system's random source, so a marker in the file cannot close the quote. Each text
+  is cut at 64 KiB, said to be cut.
+
+Each newer read asks for its own permission set, every permission at `read`, as Otto's gateway
+does: `actions`, `checks`, `pull_requests` and `statuses` for checks; `actions` for a job log;
+`contents` and then `metadata` for releases and tags; and `contents` for the template and
+`AGENTS.md`. Three differences from Otto's gateway are deliberate. `github__pr_template` and
+`github__repo_conventions` take `owner` as well as `repo`, since a registry adapter names a
+repository from two arguments, as a limit holds it. Their configuration is read within the call,
+not loaded in the background and answered as pending while it loads. And a malformed owner or
+repository names a repository outside every limit, so check 6 denies it before the connector
+parses it. The write tools, Jira, `otto__declare_unverified_claim`, `github__skill_body`, the
 lookup by marker and the comment exception are not built.
 
 **Proxied servers** are onboarded through the registry:
@@ -2241,11 +2284,35 @@ that removes the exception-list check.
   entry's permissions and the revision; a custodian refusal and a custodian that is not there;
   each vendor error; no token in an answer, a row or a log line; the in-process bound, late
   and oversized; the team's rate quota, from the wiring and from the deployment file; each
-  start refusal; and a reload that changes an entry. Not built: the other read tools, the
-  write tools, Jira, lookups, the comment exception, and any deployment of a GitHub entry,
-  which needs a real App. Left as they are: GitHub names are compared case-sensitively, so a
-  call that writes an owner or a repository in another case than its limit does is denied;
-  and each GitHub entry has quota buckets of its own, not GitHub as a whole.
+  start refusal; and a reload that changes an entry. Not built: search, the write tools,
+  Jira, lookups, the comment exception, and any deployment of a GitHub entry, which needs a
+  real App. Left as they are: GitHub names are compared case-sensitively, so a call that
+  writes an owner or a repository in another case than its limit does is denied; and each
+  GitHub entry has quota buckets of its own, not GitHub as a whole.
+
+- Built, in `connector-github`: the five newer reads, `github__get_checks`,
+  `github__get_job_log`, `github__list_releases`, `github__pr_template` and
+  `github__repo_conventions` (section 13), each asking the custodian for its own permission
+  set, and `[github] job_log_hosts`, the hosts a job log redirect may point to. The fake GitHub
+  REST API serves them, with a fake job log host, and the fake App's installation has
+  `actions`, `checks` and `statuses` at `read`. Their tests run over HTTP as the first three's
+  do: each tool's success and its bounds; its token narrowed to the team's repositories with
+  its own permission set, and two tokens for releases and tags; another organization refused
+  and a repository outside the limit denied, with no request; malformed arguments; and vendor
+  errors, with no token in what the caller reads or a row holds. A job log is read from the
+  pinned host at the redirect's path and query with no credential, and a redirect to another
+  host is refused with no request made to it. The template and `AGENTS.md` are read at the
+  default branch's head, and `AGENTS.md` without a CODEOWNERS owner is neither served nor
+  read; with one, it is quoted in a frame whose token differs on every call. Mutations remove
+  each bound, the host check, the CODEOWNERS check and the frame token's randomness, and ask
+  for the wrong permission set. Not built: `otto__declare_unverified_claim`, which records a
+  claim and reaches no vendor, so it is no GitHub tool, and would need a built-in connector of
+  its own with no credential, which the registry's built-in entries do not yet have; and
+  `github__skill_body`, which serves a skill only from the set pinned for the turn, and the
+  v3 grant carries no skill set. Left as they are: the differences section 13 lists; GitHub's
+  own job log hosts are not named here, so a deployment pins them in `job_log_hosts` and its
+  CA file must hold their CAs; and the CODEOWNERS reading follows GitHub's documented rules
+  without GitHub's own check that each owner exists and may own the file.
 
 **#12, the bound around in-process connectors and the rate quotas** (decision 0014, sections 1
 and 2). Built before any built-in connector, so the first one is bounded from its first call:
