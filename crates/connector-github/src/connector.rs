@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::api::{Answered, Api, ApiError};
+use crate::report;
 use crate::tools::{self, Call};
 use crate::{REPOSITORY, SYSTEM};
 
@@ -45,10 +46,11 @@ pub enum SettingsError {
     #[error(transparent)]
     Api(#[from] ApiError),
     /// A GitHub entry that serves approved tools is not narrowed: GitHub tokens are always
-    /// narrowed, to the caller's limit or to the call's repository.
+    /// narrowed, to the caller's limit or to the call's repository, except a reach report's
+    /// (see [`crate::report`]).
     #[error(
         "connector `{0}` says its credential is narrowed \"none\"; the GitHub connector narrows \
-         every token, so declare \"limit\" or \"call\""
+         every token but a reach report's, so declare \"limit\" or \"call\""
     )]
     NotNarrowed(ConnectorName),
 }
@@ -58,6 +60,8 @@ pub enum SettingsError {
 struct EntryCredential {
     narrowing: Narrowing,
     permissions: BTreeMap<String, Access>,
+    /// Whether the entry is a reach report's, which serves only the report's tool.
+    reports_reach: bool,
 }
 
 /// The GitHub connector. See the [crate documentation](crate).
@@ -101,7 +105,7 @@ impl GitHubConnector {
             let Some(declaration) = &entry.declaration else {
                 continue;
             };
-            if declaration.narrowing == Narrowing::None {
+            if declaration.narrowing == Narrowing::None && !entry.reports_reach {
                 return Err(SettingsError::NotNarrowed(entry.name.clone()));
             }
             served.insert(
@@ -109,6 +113,7 @@ impl GitHubConnector {
                 EntryCredential {
                     narrowing: declaration.narrowing,
                     permissions: entry.permissions.clone(),
+                    reports_reach: entry.reports_reach,
                 },
             );
         }
@@ -133,6 +138,9 @@ impl GitHubConnector {
 
     async fn call(&self, call: ToolCall) -> ToolOutcome {
         let tool = call.tool().name.clone();
+        if tool.as_str() == report::LIST_INSTALLATION_REPOSITORIES {
+            return self.report(&call).await;
+        }
         let Some(parsed) = tools::parse(tool.as_str(), call.arguments()) else {
             return ToolOutcome::error(
                 ErrorKind::Other,
@@ -186,6 +194,60 @@ impl GitHubConnector {
             }
         };
         self.read(&parsed, token.expose()).await
+    }
+
+    /// The reach report's call (see [`crate::report`]): served only on an entry declared a
+    /// reach report, with no arguments, and a token asked for with no repositories and
+    /// `metadata: read` alone, which the key custodian gives a reach report's tool and no other.
+    async fn report(&self, call: &ToolCall) -> ToolOutcome {
+        let tool = call.tool().name.clone();
+        if call
+            .arguments()
+            .as_object()
+            .is_none_or(|arguments| !arguments.is_empty())
+        {
+            return ToolOutcome::error(
+                ErrorKind::InvalidArguments,
+                format!("`{tool}` takes no arguments"),
+            );
+        }
+        let reporting = self
+            .entries
+            .get(&call.tool().connector)
+            .is_some_and(|entry| entry.reports_reach);
+        if !reporting {
+            return ToolOutcome::error(
+                ErrorKind::Other,
+                format!(
+                    "the GitHub connector serves `{tool}` only on an entry the registry declares \
+                     a reach report, and `{}` is not one",
+                    call.tool().connector
+                ),
+            );
+        }
+        let PrincipalKind::Workload { team, .. } = &call.call().caller.principal.get().kind else {
+            return ToolOutcome::error(
+                ErrorKind::Other,
+                "the GitHub connector serves a team's workloads only: a token is asked for the \
+                 caller's team, and a person has none",
+            );
+        };
+        let request = TokenRequest {
+            team: team.clone(),
+            tool: tool.clone(),
+            repositories: Vec::new(),
+            permissions: BTreeMap::from([(report::REPORT_PERMISSION.to_owned(), Access::Read)]),
+            revision: call.policy_revision().clone(),
+        };
+        let token = match self.custodian.token(&request).await {
+            Ok(token) => token,
+            Err(error) => {
+                let kind = error.error_kind();
+                tracing::warn!(%tool, %error, "the key custodian gave no GitHub token");
+                return ToolOutcome::error(kind, custodian_sentence(&request.team, kind));
+            }
+        };
+        report::read(&self.api, token.expose()).await
     }
 
     /// The repositories a call's token is asked for, as its entry narrows it.
