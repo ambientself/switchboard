@@ -102,12 +102,9 @@ impl From<IdempotencyKey> for String {
 }
 
 /// The identifying fields of a delegation, as one value, that scope a key along with the
-/// principal: for Otto, the session and the turn, and the execution if a turn is unique only
-/// within one, as Otto's owners agree (decision 0009, Still open 8).
-///
-/// The core's [`Delegation`](crate::Delegation) does not carry Otto's session, turn and
-/// execution yet. The turn-grant verifier fills this once it does (#22). Until then no
-/// delegation has one, so a key is scoped to the principal alone.
+/// principal: a verified delegation's session, execution and turn, as
+/// [`Delegation::key_scope`](crate::Delegation::key_scope) writes them. Provisional until
+/// Otto's owners agree which of a grant's fields scope a key (decision 0009, Still open 8).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct DelegationKeyScope(String);
@@ -134,8 +131,8 @@ impl DelegationKeyScope {
 pub struct KeyScope {
     /// The proved principal's issuer and subject.
     pub principal: PrincipalId,
-    /// The delegation's identifying fields. `None` without a delegation, and, until #22, with
-    /// one: see [`DelegationKeyScope`].
+    /// The verified delegation's identifying fields: see [`DelegationKeyScope`]. `None` without
+    /// one.
     pub delegation: Option<DelegationKeyScope>,
 }
 
@@ -168,7 +165,7 @@ impl ArgumentDigest {
 
     /// The digest as 64 lowercase hex digits.
     pub fn to_hex(&self) -> String {
-        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
+        sha256_to_hex(&self.0)
     }
 }
 
@@ -182,23 +179,35 @@ impl TryFrom<String> for ArgumentDigest {
     type Error = InvalidArgumentDigest;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        let hex = value.as_bytes();
-        if hex.len() != 64 || !hex.iter().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')) {
-            return Err(InvalidArgumentDigest);
-        }
-        let nibble = |c: u8| {
-            if c.is_ascii_digit() {
-                c - b'0'
-            } else {
-                c - b'a' + 10
-            }
-        };
-        let mut bytes = [0u8; 32];
-        for (at, byte) in bytes.iter_mut().enumerate() {
-            *byte = nibble(hex[2 * at]) << 4 | nibble(hex[2 * at + 1]);
-        }
-        Ok(Self(bytes))
+        sha256_from_hex(&value)
+            .map(Self)
+            .ok_or(InvalidArgumentDigest)
     }
+}
+
+/// A SHA-256 digest written as 64 lowercase hex digits, read back; `None` for anything else.
+pub(crate) fn sha256_from_hex(value: &str) -> Option<[u8; 32]> {
+    let hex = value.as_bytes();
+    if hex.len() != 64 || !hex.iter().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    let nibble = |c: u8| {
+        if c.is_ascii_digit() {
+            c - b'0'
+        } else {
+            c - b'a' + 10
+        }
+    };
+    let mut bytes = [0u8; 32];
+    for (at, byte) in bytes.iter_mut().enumerate() {
+        *byte = nibble(hex[2 * at]) << 4 | nibble(hex[2 * at + 1]);
+    }
+    Some(bytes)
+}
+
+/// A SHA-256 digest as 64 lowercase hex digits.
+pub(crate) fn sha256_to_hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 impl From<ArgumentDigest> for String {

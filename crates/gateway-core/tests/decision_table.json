@@ -1,5 +1,5 @@
 {
-  "about": "The decision table. Each case names a snapshot, a principal and a delegation defined below, the profile, surface, tool and resources of one call, and the decision expected, with the exact sentence for a denial. tests/decision_table.rs runs every case and reports every one that fails. To add a policy rule, add cases here first and watch them fail.",
+  "about": "The decision table. Each case names a snapshot, a principal and a delegation defined below, the profile, surface, tool and resources of one call, its key and its currency answer when it has them, and the decision expected, with the exact sentence for a denial. tests/decision_table.rs runs every case and reports every one that fails. To add a policy rule, add cases here first and watch them fail.",
   "deployment": "test",
   "principals": {
     "payments-sandbox": {
@@ -75,7 +75,13 @@
     "search-turn": { "acting_person": "requester@example.test", "team": "search", "tools": ["github__get_file", "github__search_code", "github__list_org_repos", "github__open_pull_request", "github__delete_branch", "jira__get_issue", "jira__create_issue", "jira__add_comment", "jira__transition_issue"] },
     "search-turn-narrow": { "acting_person": "requester@example.test", "team": "search", "tools": ["github__get_file"] },
     "inventory-turn": { "acting_person": "requester@example.test", "team": "inventory", "tools": ["docs__search", "jira__get_issue", "jira__create_issue", "jira__add_comment", "jira__transition_issue"] },
-    "inventory-turn-narrow": { "acting_person": "requester@example.test", "team": "inventory", "tools": ["jira__get_issue"] }
+    "inventory-turn-narrow": { "acting_person": "requester@example.test", "team": "inventory", "tools": ["jira__get_issue"] },
+    "payments-turn-forged": { "unverified": "signature" },
+    "payments-turn-unknown-key": { "unverified": "unknown_key" },
+    "payments-turn-malformed": { "unverified": "malformed" },
+    "payments-turn-expired": { "unverified": "expired", "digest": "1fd2a1d8f8a1e14f0a34e7a2ea1b9a54a3e1ef5a8c0a5d1d5f7d03d1b3f4c2a7" },
+    "payments-turn-elsewhere": { "unverified": "wrong_audience", "digest": "1fd2a1d8f8a1e14f0a34e7a2ea1b9a54a3e1ef5a8c0a5d1d5f7d03d1b3f4c2a7" },
+    "payments-turn-other-pod": { "unverified": "wrong_pod", "digest": "1fd2a1d8f8a1e14f0a34e7a2ea1b9a54a3e1ef5a8c0a5d1d5f7d03d1b3f4c2a7" }
   },
   "snapshots": {
     "base": {
@@ -124,6 +130,7 @@
       ],
       "profiles": [
         { "name": "otto", "classifications": ["read", "propose"], "requires_delegation": true },
+        { "name": "otto-fenced", "classifications": ["read", "propose"], "requires_delegation": true, "requires_currency": true },
         { "name": "employee", "classifications": ["read", "propose"], "requires_delegation": false },
         { "name": "service", "classifications": ["read", "propose"], "requires_delegation": false },
         { "name": "lists-everything", "classifications": ["read", "propose", "write", "destructive"], "requires_delegation": false },
@@ -876,6 +883,295 @@
       "resources": { "reach": { "entry": "sumologic-archive", "resources": [] } },
       "expect": { "decision": "deny", "reason": "resource_outside_limit",
         "sentence": "Tool `sumologic__search_archive` reaches resources the gateway must check, and this call named none of them, so it cannot be allowed. Name the resource the call is for." }
+    },
+    {
+      "name": "currency: a read is allowed whatever the answer (current)",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "currency": "current",
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "currency: a read is allowed whatever the answer (superseded)",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "currency": "superseded",
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "currency: a read is allowed whatever the answer (ended)",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "currency": "ended",
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "currency: a read is allowed whatever the answer (revoked)",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "currency": "revoked",
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "currency: a read is allowed whatever the answer (unconfirmed)",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "currency": "unconfirmed",
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "currency: a read is allowed whatever the answer (not asked)",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "currency: a proposal is allowed while the turn is current",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "key": "toolu_currency_100",
+      "currency": "current",
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "currency: a proposal is denied when the turn is superseded",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "key": "toolu_currency_101",
+      "currency": "superseded",
+      "expect": { "decision": "deny", "reason": "not_current",
+        "sentence": "Tool `github__open_pull_request` is classified `propose`, so a call to it is allowed only while the control plane that issued this call's delegation says its turn is current. It says the turn is no longer current, so the call was refused and nothing ran. Do not retry it under this delegation." }
+    },
+    {
+      "name": "currency: a proposal is denied when the turn is ended",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "key": "toolu_currency_102",
+      "currency": "ended",
+      "expect": { "decision": "deny", "reason": "not_current",
+        "sentence": "Tool `github__open_pull_request` is classified `propose`, so a call to it is allowed only while the control plane that issued this call's delegation says its turn is current. It says the turn is no longer current, so the call was refused and nothing ran. Do not retry it under this delegation." }
+    },
+    {
+      "name": "currency: a proposal is denied when the turn is revoked",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "key": "toolu_currency_103",
+      "currency": "revoked",
+      "expect": { "decision": "deny", "reason": "not_current",
+        "sentence": "Tool `github__open_pull_request` is classified `propose`, so a call to it is allowed only while the control plane that issued this call's delegation says its turn is current. It says the turn is no longer current, so the call was refused and nothing ran. Do not retry it under this delegation." }
+    },
+    {
+      "name": "currency: a proposal is denied when currency is unconfirmed",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "key": "toolu_currency_104",
+      "currency": "unconfirmed",
+      "expect": { "decision": "deny", "reason": "currency_unconfirmed",
+        "sentence": "Tool `github__open_pull_request` is classified `propose`, so a call to it is allowed only while the control plane that issued this call's delegation says its turn is current. That could not be confirmed, so the call was refused and nothing ran. Try again shortly." }
+    },
+    {
+      "name": "currency: a proposal whose currency was not asked is denied as unconfirmed",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "key": "toolu_currency_105",
+      "expect": { "decision": "deny", "reason": "currency_unconfirmed",
+        "sentence": "Tool `github__open_pull_request` is classified `propose`, so a call to it is allowed only while the control plane that issued this call's delegation says its turn is current. That could not be confirmed, so the call was refused and nothing ran. Try again shortly." }
+    },
+    {
+      "name": "currency: a profile that does not require it allows a proposal whatever the answer (superseded)",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "key": "toolu_currency_106",
+      "currency": "superseded",
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "currency: a profile that does not require it allows a proposal whatever the answer (unconfirmed)",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "key": "toolu_currency_107",
+      "currency": "unconfirmed",
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "currency: every proposal tool is fenced, a Jira proposal as well as a pull request",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "jira__create_issue",
+      "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "PAY" }] },
+      "key": "toolu_currency_108",
+      "expect": { "decision": "deny", "reason": "currency_unconfirmed",
+        "sentence": "Tool `jira__create_issue` is classified `propose`, so a call to it is allowed only while the control plane that issued this call's delegation says its turn is current. That could not be confirmed, so the call was refused and nothing ran. Try again shortly." }
+    },
+    {
+      "name": "order: a direct write is reported before currency",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "jira__transition_issue",
+      "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "PAY" }] },
+      "key": "toolu_currency_109",
+      "currency": "revoked",
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `jira__transition_issue` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it." }
+    },
+    {
+      "name": "order: a destructive classification is reported before currency not asked",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__delete_branch",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "key": "toolu_currency_110",
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `github__delete_branch` is classified `destructive`, and destructive tools are denied in every profile. Ask a person to make this change." }
+    },
+    {
+      "name": "order: the delegation's tool list is reported before currency",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn-narrow",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "key": "toolu_currency_111",
+      "currency": "ended",
+      "expect": { "decision": "deny", "reason": "tool_not_in_delegation",
+        "sentence": "Tool `github__open_pull_request` is not among the tools this delegation permits. Call only the tools the delegation lists." }
+    },
+    {
+      "name": "order: currency is reported before a resource outside the limit",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/handbook" }] },
+      "key": "toolu_currency_112",
+      "currency": "superseded",
+      "expect": { "decision": "deny", "reason": "not_current",
+        "sentence": "Tool `github__open_pull_request` is classified `propose`, so a call to it is allowed only while the control plane that issued this call's delegation says its turn is current. It says the turn is no longer current, so the call was refused and nothing ran. Do not retry it under this delegation." }
+    },
+    {
+      "name": "order: a resource outside the limit is reported after a current turn",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/handbook" }] },
+      "key": "toolu_currency_113",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "resource_outside_limit",
+        "sentence": "Tool `github__open_pull_request` names github repository `example-org/handbook`, which is outside what workload `system:serviceaccount:otto:sandbox-payments` of team `payments` from issuer `https://cluster-a.example.test` may reach. Name only resources within that limit." }
+    },
+    {
+      "name": "order: currency is reported before a missing key",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "currency": "unconfirmed",
+      "expect": { "decision": "deny", "reason": "currency_unconfirmed",
+        "sentence": "Tool `github__open_pull_request` is classified `propose`, so a call to it is allowed only while the control plane that issued this call's delegation says its turn is current. That could not be confirmed, so the call was refused and nothing ran. Try again shortly." }
+    },
+    {
+      "name": "order: a missing key is reported after a current turn",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "key_missing",
+        "sentence": "Tool `github__open_pull_request` is classified `propose`, so a call to it must carry a key that identifies this one call: a retry under the same key is then answered without making the change again. This call carried none, so it was refused and nothing ran. Send the call with its tool-use identifier, which is its key, or with a key of its own in `_meta` under `switchboard/idempotencyKey`." }
+    },
+    {
+      "name": "unverified: a delegation whose signature does not verify is denied at check 3 with the one fixed sentence",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn-forged",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "expect": { "decision": "deny", "reason": "delegation_unverified",
+        "sentence": "This gateway requires a verifiable turn grant on every call, and this call's did not verify." }
+    },
+    {
+      "name": "unverified: a delegation under a key this gateway does not hold is denied at check 3 with the one fixed sentence",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn-unknown-key",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "expect": { "decision": "deny", "reason": "delegation_unverified",
+        "sentence": "This gateway requires a verifiable turn grant on every call, and this call's did not verify." }
+    },
+    {
+      "name": "unverified: a delegation whose claims are malformed after its signature verified is denied at check 3 with the one fixed sentence",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn-malformed",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "expect": { "decision": "deny", "reason": "delegation_unverified",
+        "sentence": "This gateway requires a verifiable turn grant on every call, and this call's did not verify." }
+    },
+    {
+      "name": "unverified: an expired delegation, recorded with its digest is denied at check 3 with the one fixed sentence",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn-expired",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "expect": { "decision": "deny", "reason": "delegation_unverified",
+        "sentence": "This gateway requires a verifiable turn grant on every call, and this call's did not verify." }
+    },
+    {
+      "name": "unverified: a delegation for another deployment, recorded with its digest is denied at check 3 with the one fixed sentence",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn-elsewhere",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "expect": { "decision": "deny", "reason": "delegation_unverified",
+        "sentence": "This gateway requires a verifiable turn grant on every call, and this call's did not verify." }
+    },
+    {
+      "name": "unverified: a delegation bound to another pod, recorded with its digest is denied at check 3 with the one fixed sentence",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn-other-pod",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "expect": { "decision": "deny", "reason": "delegation_unverified",
+        "sentence": "This gateway requires a verifiable turn grant on every call, and this call's did not verify." }
+    },
+    {
+      "name": "unverified: a delegation that did not verify is denied even where the profile does not require one",
+      "snapshot": "base", "principal": "inventory-service", "delegation": "payments-turn-forged",
+      "profile": "service", "surface": "service", "tool": "jira__get_issue",
+      "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "INV" }] },
+      "expect": { "decision": "deny", "reason": "delegation_unverified",
+        "sentence": "This gateway requires a verifiable turn grant on every call, and this call's did not verify." }
+    },
+    {
+      "name": "unverified: a user presenting a delegation that did not verify reads the same sentence",
+      "snapshot": "base", "principal": "eng-user", "delegation": "payments-turn-expired",
+      "profile": "employee", "surface": "employee", "tool": "docs__search",
+      "resources": { "named": [] },
+      "expect": { "decision": "deny", "reason": "delegation_unverified",
+        "sentence": "This gateway requires a verifiable turn grant on every call, and this call's did not verify." }
+    },
+    {
+      "name": "unverified: a proposal under a delegation that did not verify is denied at check 3, not asked for currency",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn-forged",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "key": "toolu_currency_114",
+      "expect": { "decision": "deny", "reason": "delegation_unverified",
+        "sentence": "This gateway requires a verifiable turn grant on every call, and this call's did not verify." }
+    },
+    {
+      "name": "order: a destructive tool under a delegation that did not verify is denied at check 3",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn-other-pod",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__delete_branch",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "key": "toolu_currency_115",
+      "expect": { "decision": "deny", "reason": "delegation_unverified",
+        "sentence": "This gateway requires a verifiable turn grant on every call, and this call's did not verify." }
+    },
+    {
+      "name": "order: an unknown tool is reported before a delegation that did not verify, and its row records no failure",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn-forged",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__force_push",
+      "resources": { "named": [] },
+      "expect": { "decision": "deny", "reason": "unknown_tool",
+        "sentence": "Tool `github__force_push` is not available on surface `otto-sandbox`. Call `tools/list` to see the tools this surface serves." }
     }
   ],
   "lists": [
@@ -944,6 +1240,24 @@
       "snapshot": "base", "principal": "inventory-service", "delegation": null,
       "profile": "service", "surface": "no-such-surface",
       "expect": []
+    },
+    {
+      "name": "a delegation that did not verify lists nothing",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn-forged",
+      "profile": "otto", "surface": "otto-sandbox",
+      "expect": []
+    },
+    {
+      "name": "a delegation that did not verify lists nothing where the profile does not require one",
+      "snapshot": "base", "principal": "inventory-service", "delegation": "payments-turn-expired",
+      "profile": "service", "surface": "service",
+      "expect": []
+    },
+    {
+      "name": "the list skips the currency check, so a profile that requires currency still lists its proposals",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox",
+      "expect": ["github__comment_on_own_proposal", "github__get_file", "github__list_org_repos", "github__open_pull_request", "github__search_code", "jira__create_issue", "jira__get_issue"]
     }
   ]
 }

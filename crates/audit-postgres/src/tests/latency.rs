@@ -28,6 +28,7 @@ async fn one_call(store: &PgAuditStore, fixture: &Fixture) -> (Duration, Duratio
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
         tool: RequestedTool::new(call.tool),
         key: None,
+        currency: gateway_core::Currency::NotAsked,
     };
     let decision = decide(&fixture.policy, &context);
     let started = Instant::now();

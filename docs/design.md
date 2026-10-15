@@ -477,6 +477,33 @@ records for Otto's two comment tools names it. Under the profile for Otto's sand
 of any tool not classified `read` also needs a current control plane
 ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)).
 
+**A delegation that does not verify is denied at check 3.** The delegation's verifier never
+denies. A delegation that fails one of its checks reaches the decision function as present and
+unverified, carrying which check failed and, only when its signature verified, its digest, and
+nothing from its claims. Which check failed is one of a closed set the core defines and an
+adapter maps its own failures into: version, unknown key, retired key, encoding, signature,
+malformed, expired, not yet valid, lifetime over the ceiling, wrong audience and wrong pod. Check
+3 denies such a delegation whether or not the profile requires one, under the reason kind
+`delegation_unverified`, with one fixed sentence whatever failed. The sentence is Otto's for a
+bad turn grant, as the conformance suite records it, with a capital and a full stop: "This
+gateway requires a verifiable turn grant on every call, and this call's did not verify." The
+failure is recorded on the row and never told to the caller, and is not a reason kind. A
+delegation that verified and names another team is still denied naming both teams. The core
+does this; the gateway builds no delegation until the Otto adapter is wired in (#22).
+
+**A profile can require a current control plane,** with `requires_currency = true`. It is false
+unless a policy says so, in the JSON configuration and in the registry file alike, so no policy
+written before it changes meaning. The call context carries the call's currency: what the
+control plane that issued its delegation answered, current, superseded, ended, revoked or
+unconfirmed, or that it was not asked. Under such a profile the currency check, after check 5
+and before check 6, allows a call of a tool not classified `read` only if the answer is current.
+That covers every such tool, `propose` and any `write` tool an exception lets past check 5, not
+`propose` alone. Superseded, ended and revoked are denied as `not_current`; unconfirmed, and not
+asked, as `currency_unconfirmed`; each kind has its sentence. `tools/list` skips the check, as
+it skips check 6. Nothing asks a control plane yet: the gateway decides every call as not asked,
+and no registry sets the profile setting, until the resolver client comes with the Otto
+adapter's wiring (#22).
+
 **A profile can declare that its callers set the `Idempotency-Key` header per request,** with
 `idempotency_key_header = true`. It is false unless a policy says so, in the JSON
 configuration and in the registry file alike, and only then does the gateway read a side
@@ -765,10 +792,22 @@ written complete, has no finish, and is never open.
 - **A tool that checks its own scope reports what it reached** when it finishes, in place of
   `unknown`. This is required before milestone 4.
 - **A turn grant is recorded by what identifies it:** its digest (the SHA-256 of the grant as
-  presented), issuer, key ID, the pod UID, the turn's egress setting and, for a call of a tool
-  not classified `read`, Otto's currency answer. A grant that fails verification is denied at
-  check 3 as an unverified delegation. Its row records which check failed and no claims, and,
-  if its signature verified, its digest.
+  presented), issuer, key ID, session, turn, execution and epoch, the turn's egress setting when
+  the grant carries one, and the pod UID the caller's token proves; and, when Otto was asked,
+  its currency answer. A grant that fails verification is denied at check 3 as an unverified
+  delegation. Its row records which check failed and no claims, and, if its signature verified
+  and a binding then failed (the audience, the lifetime or the pod), its digest. That digest is
+  the one exception decision 0012 makes to decision 0009's rule that such a row holds nothing
+  from the grant: a digest is not a claim. Built in the core and both stores (#22, #56): the
+  record carries a verified delegation's columns, the failure, and the currency answer, and the
+  Postgres store writes them in the columns migration 0010 adds, `proved_pod`,
+  `delegation_digest`, `delegation_issuer`, `delegation_key_id`, `delegation_session`,
+  `delegation_turn`, `delegation_execution`, `delegation_epoch`, `delegation_egress`,
+  `delegation_failure` and `currency`. A list row records the pod and a verified delegation's
+  columns, but no failure, which only a call row denied at check 3 has, and no currency
+  answer. The issuer, key, session, turn and execution are escaped and capped at 128 characters,
+  like the surface. Rows written before migration 0010 hold NULL in every one, which means not
+  recorded. Nothing fills the delegation's columns until the gateway verifies grants (#22).
 - Otto's `gateway_audit` table has none of these. They stay in this gateway's own record unless
   Otto adds them. Whether it does is part of the question about that table in Q18.
 
@@ -813,7 +852,16 @@ not handed off, as its next attempt, at the database's time, and refuses every c
 removal for every role. `receipt_moves` lets reconciliation settle a receipt only on a lookup
 recorded on it that establishes the state. The boot check refuses a missing or disabled trigger
 of the four, an unlogged receipt or lookup table, a missing column of reconciliation's, and
-grants on either table wider than the role's own. Deletion for retention uses a separate
+grants on either table wider than the role's own. Migration 0010 adds decision 0012's columns,
+which the role inserts at begin and does not read, and holds their shape for every role: a
+verified delegation's columns together, with its team and person (`delegation_shape`); a
+failure exactly on a call row denied at check 3 for it (`delegation_failure_shape`), beside
+nothing from the delegation's claims (`delegation_failure_unclaimed`); a digest only with a
+verified delegation or a failure that follows a verified signature
+(`delegation_digest_shape`); a currency answer only on a call row (`currency_shape`); a pod UID
+only for a workload (`proved_pod_shape`); and each value one the core names. The boot check
+requires the columns, their types and the role's grants on them. Deletion for retention uses a
+separate
 role, created before the first production deployment; until it exists nothing is deleted
 ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)). None of this
 protects rows against a database superuser.
@@ -1400,8 +1448,8 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   token (decision 0012). The verifier reads `kubernetes.io.pod.uid` for a workload issuer
   only, after the signature and every other check. A token that names no pod proves none; a
   pod UID that is not a lowercase hyphenated UUID refuses the token as a malformed
-  `kubernetes.io` claim, carrying nothing from it. No decision reads the pod, and no row, log
-  line or sentence records it yet: the row's pod column comes with #22 and #56.
+  `kubernetes.io` claim, carrying nothing from it. No decision reads the pod, and no log line or
+  sentence records it. The row records it in `proved_pod` (migration 0010, #56).
 - Already built: the claimed issuer and subject are available beside a verification error,
   escaped and capped, for the identity-failure telemetry event (decision 0009), and the error
   itself still carries nothing from the token. The `identity_failed` event records them (#26).
@@ -1460,11 +1508,16 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   0007 adds the reach to the resources check (`resources_known`, `reach_shape`) and the two
   columns (`credential_mode_known`, `credential_shape`), which the gateway's role inserts and
   does not read: a repeated begin still compares only the decision. Rows written before it
-  hold NULL in both, which means not recorded. Not built: the columns of decision 0012, an
-  unverified delegation's failure kind and a grant's digest, issuer, key ID, pod UID, egress
-  setting and currency answer, which go with #22; and, with #12, a column for the exception
-  that allowed a call, since the row's shape constraint rightly allows no reason on an allowed
-  row.
+  hold NULL in both, which means not recorded. The columns of decision 0012: built in the core,
+  both in-memory stores and Postgres (#22, #56). An unverified delegation's failure kind and,
+  after a verified signature, its digest; a verified delegation's digest, issuer, key ID,
+  session, turn, execution, epoch and egress setting; the pod UID; and the currency answer.
+  Migration 0010 adds them, additive, with the shape constraints section 11 lists; the boot
+  check covers them, and the contract suite runs them and their refusals on both stores. Rows
+  written before it hold NULL in each, which means not recorded. Nothing fills the delegation's
+  columns or the currency answer until the gateway verifies grants and asks Otto's resolver
+  (#22). Not built: with #12, a column for the exception that allowed a call, since the row's
+  shape constraint rightly allows no reason on an allowed row.
 - Rows of kind `list`, written complete, with a list form of the record in the core: built in
   the core and the stores, and wired into `tools/list` (#40). The core's `listed` writes a
   `ListRecord`, with the caller columns, the policy revision and the first 64 tool names, each
@@ -1547,7 +1600,7 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   characters other than space, the bound the gateway already keeps a tool-use identifier
   within. The call context carries it, rather than `RequestMetadata`, so the key the
   decision saw is the one the receipt holds. The key check joins `decide` last, after check 6
-  and after a comment marking where decision 0012's currency check goes (#22), denies a call
+  and after decision 0012's currency check (#22), denies a call
   of a tool not classified `read` that carries no key with the reason kind `key_missing` and
   a sentence asking for one, and is skipped for `tools/list`. The decision table has the
   cases, and the properties `tools_list_is_decide_run_once_per_tool` and
@@ -1559,8 +1612,9 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   the digest, the resources, its state, how that was established and the vendor's reference,
   and, since reconciliation, its vendor target, its lookups and when it was handed to a person.
   The scope is the proved
-  principal and the delegation's key scope, which no verifier fills until the delegation
-  carries Otto's session, turn and execution (#22, decision 0009 Still open 8), so a key is
+  principal and a verified delegation's key scope: its session, execution and turn, as
+  decision 0009's Still open 8 recommends, provisional until Otto's owners agree which of a
+  grant's fields scope a key (#22). The gateway builds no delegation yet, so its keys are
   scoped to the principal alone today. The moves the state table allows, among them that the
   call settles its receipt only before its row's deadline, and a `pending` receipt past its
   deadline read as `unknown`, are the core's; the in-memory store completes a late finish's
@@ -2004,6 +2058,27 @@ sentences; the resolver client with its one-second budget; the grant-key and pod
 at boot and at snapshot load, reading the selector rules; the gate that allows grant checking
 off only in a development build, with CI's check of the release artifact; and the row fields
 (with #10).
+
+- Built in the core (#22): the delegation in the call context is absent, present and verified,
+  or present and unverified. An unverified one carries its failure kind, from the core's closed
+  `DelegationFailure`, and its digest only for a failure that follows a verified signature,
+  which `UnverifiedDelegation` refuses otherwise; nothing from its claims. Check 3 denies it
+  under `delegation_unverified` with Otto's fixed sentence (section 8). A verified delegation
+  carries its issuer, digest, key ID, session, turn, execution, epoch and egress setting, which
+  no check reads, and its key scope is its session, execution and turn, provisionally. The call
+  context carries the call's currency, a profile has `requires_currency`, false by default, and
+  the currency check sits between check 5 and check 6 with the reason kinds `not_current` and
+  `currency_unconfirmed`. The decision table has a case for each answer, and for not asked,
+  against a read and a proposal under a profile that requires currency, cases of a proposal
+  allowed whatever the answer under one that does not, cases of the order around the check,
+  and cases of unverified delegations at check 3. The properties are restated: the list is
+  what `decide` allows except the currency check, check 6 and the key check, and an opened
+  world's call is current. A new one: under a profile that requires currency, a call of a tool
+  not classified `read` is never allowed unless current. The row fields: built (#10 and #56,
+  above).
+- Not built: the turn-grant verifier, the resolver client, the gates, and the gateway's wiring
+  of them. The gateway decides every call with currency not asked and builds no delegation, so
+  its behaviour is unchanged.
 
 **#26, the HTTP path.**
 

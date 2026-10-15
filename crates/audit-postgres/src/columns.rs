@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use gateway_core::audit::{
     AuditRecord, AuditRowId, Completion, DecisionKind, ErrorKind, ListRecord, Outcome,
-    RecordedResources, RowKind,
+    RecordedDelegation, RecordedFailure, RecordedResources, RowKind,
 };
 use gateway_core::receipt::ReceiptRequest;
 use gateway_core::{
@@ -70,6 +70,12 @@ use crate::store::{Budgets, PgAuditError};
 /// - The fixed words and numbers: `id` 36, `reason` 28, `credential_mode` 21, `classification`
 ///   11, `proved_kind` 8, `decision` 5, `kind` 4, and `resources_omitted` and `allowance_ms` 8
 ///   each.
+/// - Decision 0012's columns (migration 0010), 801 at most together: `delegation_issuer`,
+///   `delegation_key_id`, `delegation_session`, `delegation_turn` and `delegation_execution`
+///   131 each, escaped and capped by the core; `delegation_digest` 64, `proved_pod` 36,
+///   `delegation_failure` 21, `currency` 11, `delegation_epoch` 8 and `delegation_egress` 6. A
+///   verified delegation's values come from the control plane that signed it, and nothing from
+///   a delegation that did not verify reaches a row.
 ///
 /// The rest have no cap of their own. `deployment`, `profile`, `connector`, `policy_revision`,
 /// `proved_issuer`, `proved_team` and `credential_principal` come from the gateway's own
@@ -219,6 +225,123 @@ pub(crate) struct BeginRow {
     pub credential_mode: Option<&'static str>,
     /// The vendor-side principal the entry states, never the secret.
     pub credential_principal: Option<String>,
+    /// The proved pod and the verified delegation's columns.
+    pub delegation: DelegationColumns,
+    /// Which check a delegation that did not verify failed, on a row check 3 denied.
+    pub delegation_failure: Option<&'static str>,
+    /// What the control plane answered when asked whether the turn is current.
+    pub currency: Option<&'static str>,
+}
+
+/// The proved pod and the verified delegation's columns (decision 0012), which a call row and a
+/// list row both write, in the order of their parameters. A digest is also written for a
+/// delegation that did not verify, when its signature did.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct DelegationColumns {
+    pub proved_pod: Option<String>,
+    pub delegation_digest: Option<String>,
+    pub delegation_issuer: Option<String>,
+    pub delegation_key_id: Option<String>,
+    pub delegation_session: Option<String>,
+    pub delegation_turn: Option<String>,
+    pub delegation_execution: Option<String>,
+    pub delegation_epoch: Option<i64>,
+    pub delegation_egress: Option<&'static str>,
+}
+
+impl DelegationColumns {
+    /// The columns, in order.
+    pub const NAMES: [&'static str; 9] = [
+        "proved_pod",
+        "delegation_digest",
+        "delegation_issuer",
+        "delegation_key_id",
+        "delegation_session",
+        "delegation_turn",
+        "delegation_execution",
+        "delegation_epoch",
+        "delegation_egress",
+    ];
+
+    /// The columns for `principal`'s pod, `delegation`, a verified delegation, and `failure`,
+    /// one that did not verify, whose digest is written only when it has one. Refuses an epoch
+    /// past the column's range, and a text value holding U+0000.
+    fn of(
+        principal: &Principal,
+        delegation: Option<&RecordedDelegation>,
+        failure: Option<&RecordedFailure>,
+    ) -> Result<Self, PgAuditError> {
+        let mut columns = Self {
+            proved_pod: principal.pod().map(|pod| pod.as_str().to_owned()),
+            delegation_digest: failure
+                .and_then(|failure| failure.digest)
+                .map(|digest| digest.to_hex()),
+            ..Self::default()
+        };
+        if let Some(delegation) = delegation {
+            columns.delegation_digest = Some(delegation.digest.to_hex());
+            columns.delegation_issuer =
+                Some(stored("delegation_issuer", delegation.issuer.as_str())?);
+            columns.delegation_key_id =
+                Some(stored("delegation_key_id", delegation.key_id.as_str())?);
+            columns.delegation_session =
+                Some(stored("delegation_session", delegation.session.as_str())?);
+            columns.delegation_turn = Some(stored("delegation_turn", delegation.turn.as_str())?);
+            columns.delegation_execution = Some(stored(
+                "delegation_execution",
+                delegation.execution.as_str(),
+            )?);
+            columns.delegation_epoch = Some(i64::try_from(delegation.epoch).map_err(|_| {
+                PgAuditError::Column("a delegation's epoch past the column's range")
+            })?);
+            columns.delegation_egress = delegation.egress.map(|egress| egress.as_str());
+        }
+        Ok(columns)
+    }
+
+    /// Each column and its bytes, as [`MAX_ROW_BYTES`] counts them.
+    fn sizes(&self) -> [(&'static str, usize); 9] {
+        let [
+            pod,
+            digest,
+            issuer,
+            key_id,
+            session,
+            turn,
+            execution,
+            epoch,
+            egress,
+        ] = Self::NAMES;
+        [
+            (pod, optional_bytes(self.proved_pod.as_deref())),
+            (digest, optional_bytes(self.delegation_digest.as_deref())),
+            (issuer, optional_bytes(self.delegation_issuer.as_deref())),
+            (key_id, optional_bytes(self.delegation_key_id.as_deref())),
+            (session, optional_bytes(self.delegation_session.as_deref())),
+            (turn, optional_bytes(self.delegation_turn.as_deref())),
+            (
+                execution,
+                optional_bytes(self.delegation_execution.as_deref()),
+            ),
+            (epoch, self.delegation_epoch.map_or(0, |_| INTEGER_BYTES)),
+            (egress, optional_bytes(self.delegation_egress)),
+        ]
+    }
+
+    /// The values, in order.
+    fn parameters(&self) -> [&(dyn ToSql + Sync); 9] {
+        [
+            &self.proved_pod,
+            &self.delegation_digest,
+            &self.delegation_issuer,
+            &self.delegation_key_id,
+            &self.delegation_session,
+            &self.delegation_turn,
+            &self.delegation_execution,
+            &self.delegation_epoch,
+            &self.delegation_egress,
+        ]
+    }
 }
 
 impl BeginRow {
@@ -230,10 +353,14 @@ impl BeginRow {
             resources, resources_omitted, decision, reason, sentence, policy_revision,
             proved_issuer, proved_subject, proved_kind, proved_team, proved_groups,
             proved_delegation_team, claimed_acting_person, claimed_team, instance, kind,
-            allowance_ms, credential_mode, credential_principal
+            allowance_ms, credential_mode, credential_principal,
+            proved_pod, delegation_digest, delegation_issuer, delegation_key_id,
+            delegation_session, delegation_turn, delegation_execution, delegation_epoch,
+            delegation_egress, delegation_failure, currency
         ) VALUES (
             ($1::text)::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-            $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27
+            $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27,
+            $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38
         ) ON CONFLICT (id) DO NOTHING";
 
     /// The first half of a row and the answer to a reused key, in one insert: the row written
@@ -245,11 +372,15 @@ impl BeginRow {
             proved_issuer, proved_subject, proved_kind, proved_team, proved_groups,
             proved_delegation_team, claimed_acting_person, claimed_team, instance, kind,
             allowance_ms, credential_mode, credential_principal,
+            proved_pod, delegation_digest, delegation_issuer, delegation_key_id,
+            delegation_session, delegation_turn, delegation_execution, delegation_epoch,
+            delegation_egress, delegation_failure, currency,
             outcome, outcome_sentence, latency_ms, duplicate_of
         ) VALUES (
             ($1::text)::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
             $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27,
-            $28, $29, $30, ($31::text)::uuid
+            $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38,
+            $39, $40, $41, ($42::text)::uuid
         ) ON CONFLICT (id) DO NOTHING";
 
     /// The decision of the row already stored under an identifier, read with only the columns
@@ -285,6 +416,11 @@ impl BeginRow {
         let (proved_kind, proved_team, proved_groups) = principal_kind(principal)?;
         let (resources, resources_omitted) = resources(record)?;
         let (credential_mode, credential_principal) = credential(record.credential.as_ref())?;
+        let delegation = DelegationColumns::of(
+            principal,
+            record.delegation.as_ref(),
+            record.delegation_failure.as_ref(),
+        )?;
         let row = Self {
             id: id.as_str().to_owned(),
             tool_use_id: optional(
@@ -332,13 +468,30 @@ impl BeginRow {
                 .map_err(|_| PgAuditError::Column("an allowance past the column's range"))?,
             credential_mode,
             credential_principal,
+            delegation,
+            delegation_failure: record
+                .delegation_failure
+                .as_ref()
+                .map(|failure| failure.failure.as_str()),
+            currency: record.currency.map(|answer| answer.as_str()),
         };
         within_bound(&row.sizes(), MAX_BEGUN_ROW_BYTES)?;
         Ok(row)
     }
 
     /// Each column and its bytes, as [`MAX_ROW_BYTES`] counts them.
-    pub fn sizes(&self) -> [(&'static str, usize); 27] {
+    pub fn sizes(&self) -> [(&'static str, usize); 38] {
+        let [
+            pod,
+            digest,
+            issuer,
+            key_id,
+            session,
+            turn,
+            execution,
+            epoch,
+            egress,
+        ] = self.delegation.sizes();
         [
             ("id", text_bytes(&self.id)),
             ("tool_use_id", optional_bytes(self.tool_use_id.as_deref())),
@@ -376,6 +529,20 @@ impl BeginRow {
                 "credential_principal",
                 optional_bytes(self.credential_principal.as_deref()),
             ),
+            pod,
+            digest,
+            issuer,
+            key_id,
+            session,
+            turn,
+            execution,
+            epoch,
+            egress,
+            (
+                "delegation_failure",
+                optional_bytes(self.delegation_failure),
+            ),
+            ("currency", optional_bytes(self.currency)),
         ]
     }
 
@@ -388,7 +555,18 @@ impl BeginRow {
     }
 
     /// The values for [`INSERT`](Self::INSERT), in order.
-    pub fn parameters(&self) -> [&(dyn ToSql + Sync); 27] {
+    pub fn parameters(&self) -> [&(dyn ToSql + Sync); 38] {
+        let [
+            pod,
+            digest,
+            issuer,
+            key_id,
+            session,
+            turn,
+            execution,
+            epoch,
+            egress,
+        ] = self.delegation.parameters();
         [
             &self.id,
             &self.tool_use_id,
@@ -417,6 +595,17 @@ impl BeginRow {
             &self.allowance_ms,
             &self.credential_mode,
             &self.credential_principal,
+            pod,
+            digest,
+            issuer,
+            key_id,
+            session,
+            turn,
+            execution,
+            epoch,
+            egress,
+            &self.delegation_failure,
+            &self.currency,
         ]
     }
 }
@@ -489,6 +678,8 @@ pub(crate) struct ListRow {
     pub listed_tools: Value,
     /// How many tools were listed past those named.
     pub listed_omitted: i64,
+    /// The proved pod and the verified delegation's columns.
+    pub delegation: DelegationColumns,
 }
 
 impl ListRow {
@@ -498,10 +689,13 @@ impl ListRow {
     pub const INSERT: &'static str = "INSERT INTO switchboard_audit.call_rows (
             id, deployment, surface, profile, policy_revision, proved_issuer, proved_subject,
             proved_kind, proved_team, proved_groups, proved_delegation_team,
-            claimed_acting_person, claimed_team, instance, kind, listed_tools, listed_omitted
+            claimed_acting_person, claimed_team, instance, kind, listed_tools, listed_omitted,
+            proved_pod, delegation_digest, delegation_issuer, delegation_key_id,
+            delegation_session, delegation_turn, delegation_execution, delegation_epoch,
+            delegation_egress
         ) VALUES (
             ($1::text)::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'list',
-            $15, $16
+            $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25
         ) ON CONFLICT (id) DO NOTHING";
 
     /// The kind of the row already stored under an identifier, read with only the columns the
@@ -558,6 +752,7 @@ impl ListRow {
             listed_omitted: i64::try_from(record.tools_omitted).map_err(|_| {
                 PgAuditError::Column("a count of tools left out past the column's range")
             })?,
+            delegation: DelegationColumns::of(principal, record.delegation.as_ref(), None)?,
         };
         // A list row is written complete and never completed, so it needs no room for one.
         within_bound(&row.sizes(), MAX_ROW_BYTES)?;
@@ -566,7 +761,18 @@ impl ListRow {
 
     /// Each column and its bytes, as [`MAX_ROW_BYTES`] counts them: each parameter, and the
     /// kind `list`, which [`INSERT`](Self::INSERT) writes itself.
-    pub fn sizes(&self) -> [(&'static str, usize); 17] {
+    pub fn sizes(&self) -> [(&'static str, usize); 26] {
+        let [
+            pod,
+            digest,
+            issuer,
+            key_id,
+            session,
+            turn,
+            execution,
+            epoch,
+            egress,
+        ] = self.delegation.sizes();
         [
             ("id", text_bytes(&self.id)),
             ("deployment", text_bytes(&self.deployment)),
@@ -591,11 +797,31 @@ impl ListRow {
             ("kind", text_bytes(kind(RowKind::List))),
             ("listed_tools", json_bytes(&self.listed_tools)),
             ("listed_omitted", INTEGER_BYTES),
+            pod,
+            digest,
+            issuer,
+            key_id,
+            session,
+            turn,
+            execution,
+            epoch,
+            egress,
         ]
     }
 
     /// The values for [`INSERT`](Self::INSERT), in order.
-    pub fn parameters(&self) -> [&(dyn ToSql + Sync); 16] {
+    pub fn parameters(&self) -> [&(dyn ToSql + Sync); 25] {
+        let [
+            pod,
+            digest,
+            issuer,
+            key_id,
+            session,
+            turn,
+            execution,
+            epoch,
+            egress,
+        ] = self.delegation.parameters();
         [
             &self.id,
             &self.deployment,
@@ -613,6 +839,15 @@ impl ListRow {
             &self.instance,
             &self.listed_tools,
             &self.listed_omitted,
+            pod,
+            digest,
+            issuer,
+            key_id,
+            session,
+            turn,
+            execution,
+            epoch,
+            egress,
         ]
     }
 }
@@ -1201,9 +1436,20 @@ fn largest_denial() -> AuditRecord {
             "kind": "user",
             "groups": (1..=4).map(|n| format!("{n}{}", "g".repeat(2_047))).collect::<Vec<_>>()
         },
-        "proved_delegation_team": null,
-        "claimed_acting_person": null,
+        "proved_delegation_team": "largest",
+        "claimed_acting_person": "largest",
         "claimed_team": null,
+        "delegation": {
+            "digest": "f".repeat(64),
+            "issuer": cut("i", 128),
+            "key_id": cut("k", 128),
+            "session": cut("s", 128),
+            "turn": cut("t", 128),
+            "execution": cut("e", 128),
+            "epoch": i64::MAX,
+            "egress": "sealed"
+        },
+        "currency": "unconfirmed",
         "credential": {"mode": "team_service_identity", "principal": "largest"},
         "completion": null
     }))
@@ -1268,9 +1514,37 @@ mod tests {
             "proved_delegation_team": "team-d",
             "claimed_acting_person": "person@fixture.test",
             "claimed_team": "team-c",
+            "delegation": {
+                "digest": DIGEST,
+                "issuer": "otto-fixture",
+                "key_id": "key-1",
+                "session": "session-1",
+                "turn": "turn-1",
+                "execution": "execution-1",
+                "epoch": 42,
+                "egress": "open"
+            },
+            "currency": "superseded",
             "credential": {"mode": "gateway_token", "principal": "fixture-token"},
             "completion": null
         }))
+    }
+
+    /// The SHA-256 of `test`, as a delegation's digest is written.
+    const DIGEST: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+    /// A workload with a pod, denied at check 3 for a delegation that expired after its
+    /// signature verified: the failure and the digest, and nothing from the claims.
+    fn denied_unverified() -> AuditRecord {
+        let mut record = allowed_workload();
+        record.decision = DecisionKind::Deny;
+        record.reason = Some(gateway_core::ReasonKind::DelegationUnverified);
+        record.sentence = Some("Denied.".into());
+        record.delegation_failure = Some(RecordedFailure {
+            failure: gateway_core::DelegationFailure::Expired,
+            digest: Some(gateway_core::DelegationDigest::parse(DIGEST).unwrap()),
+        });
+        record
     }
 
     fn allowed_workload() -> AuditRecord {
@@ -1294,7 +1568,8 @@ mod tests {
             "proved_principal": {
                 "id": {"issuer": "https://workload-issuer.fixture.test", "subject": "sa"},
                 "kind": "workload",
-                "team": "team-a"
+                "team": "team-a",
+                "pod": "0f8fad5b-d9cb-469f-a165-70867728950e"
             },
             "proved_delegation_team": null,
             "claimed_acting_person": null,
@@ -1339,8 +1614,85 @@ mod tests {
                 allowance_ms: 1_500 + 5_000 + 20_000 + 2_250,
                 credential_mode: Some("gateway_token"),
                 credential_principal: Some("fixture-token".into()),
+                delegation: DelegationColumns {
+                    proved_pod: None,
+                    delegation_digest: Some(DIGEST.into()),
+                    delegation_issuer: Some("otto-fixture".into()),
+                    delegation_key_id: Some("key-1".into()),
+                    delegation_session: Some("session-1".into()),
+                    delegation_turn: Some("turn-1".into()),
+                    delegation_execution: Some("execution-1".into()),
+                    delegation_epoch: Some(42),
+                    delegation_egress: Some("open"),
+                },
+                delegation_failure: None,
+                currency: Some("superseded"),
             }
         );
+    }
+
+    /// A delegation that did not verify writes its failure and, after a verified signature,
+    /// its digest, and none of a verified delegation's columns; a workload's pod is written as
+    /// its token proves it.
+    #[test]
+    fn an_unverified_delegation_writes_its_failure_and_digest_alone() {
+        let row = BeginRow::from_record(&id(), &denied_unverified(), &budgets()).unwrap();
+        assert_eq!(
+            row.delegation,
+            DelegationColumns {
+                proved_pod: Some("0f8fad5b-d9cb-469f-a165-70867728950e".into()),
+                delegation_digest: Some(DIGEST.into()),
+                ..DelegationColumns::default()
+            }
+        );
+        assert_eq!(row.delegation_failure, Some("expired"));
+        assert_eq!(row.reason.as_deref(), Some("delegation_unverified"));
+        assert_eq!(row.currency, None);
+        let mut before_signature = denied_unverified();
+        before_signature.delegation_failure = Some(RecordedFailure {
+            failure: gateway_core::DelegationFailure::Signature,
+            digest: None,
+        });
+        let row = BeginRow::from_record(&id(), &before_signature, &budgets()).unwrap();
+        assert_eq!(row.delegation.delegation_digest, None);
+        assert_eq!(row.delegation_failure, Some("signature"));
+    }
+
+    /// Every failure and every currency answer is written as the core names it, and an epoch
+    /// past the column's range is refused rather than written as another.
+    #[test]
+    fn each_failure_and_answer_is_named_as_the_core_names_it_and_an_epoch_past_the_column_is_refused()
+     {
+        for failure in gateway_core::DelegationFailure::ALL {
+            let mut record = denied_unverified();
+            record.delegation_failure = Some(RecordedFailure {
+                failure,
+                digest: None,
+            });
+            let row = BeginRow::from_record(&id(), &record, &budgets()).unwrap();
+            assert_eq!(row.delegation_failure, Some(failure.as_str()));
+            assert_eq!(name_of(&failure).unwrap(), failure.as_str());
+        }
+        for answer in gateway_core::CurrencyAnswer::ALL {
+            let mut record = allowed_workload();
+            record.currency = Some(answer);
+            let row = BeginRow::from_record(&id(), &record, &budgets()).unwrap();
+            assert_eq!(row.currency, Some(answer.as_str()));
+            assert_eq!(name_of(&answer).unwrap(), answer.as_str());
+        }
+        let mut record = denied_user_with_delegation();
+        if let Some(delegation) = &mut record.delegation {
+            delegation.epoch = i64::MAX.unsigned_abs();
+        }
+        let row = BeginRow::from_record(&id(), &record, &budgets()).unwrap();
+        assert_eq!(row.delegation.delegation_epoch, Some(i64::MAX));
+        if let Some(delegation) = &mut record.delegation {
+            delegation.epoch = i64::MAX.unsigned_abs() + 1;
+        }
+        assert!(matches!(
+            BeginRow::from_record(&id(), &record, &budgets()),
+            Err(PgAuditError::Column(_))
+        ));
     }
 
     /// A NUL in any text value refuses the record, naming the column, rather than write the
@@ -1546,6 +1898,16 @@ mod tests {
             "proved_delegation_team": "team-d",
             "claimed_acting_person": "person@fixture.test",
             "claimed_team": "team-c",
+            "delegation": {
+                "digest": DIGEST,
+                "issuer": "otto-fixture",
+                "key_id": "key-1",
+                "session": "session-1",
+                "turn": "turn-1",
+                "execution": "execution-1",
+                "epoch": 42,
+                "egress": null
+            },
             "tools": ["fixture__read", "fixture__write"],
             "tools_omitted": 3
         }))
@@ -1573,6 +1935,17 @@ mod tests {
                 instance: "gateway-7f9c".into(),
                 listed_tools: json!(["fixture__read", "fixture__write"]),
                 listed_omitted: 3,
+                delegation: DelegationColumns {
+                    proved_pod: None,
+                    delegation_digest: Some(DIGEST.into()),
+                    delegation_issuer: Some("otto-fixture".into()),
+                    delegation_key_id: Some("key-1".into()),
+                    delegation_session: Some("session-1".into()),
+                    delegation_turn: Some("turn-1".into()),
+                    delegation_execution: Some("execution-1".into()),
+                    delegation_epoch: Some(42),
+                    delegation_egress: None,
+                },
             }
         );
         let row = ListRow::from_record(&id(), &list_record()).unwrap();
@@ -1888,6 +2261,7 @@ mod tests {
         for record in [
             denied_user_with_delegation(),
             allowed_workload(),
+            denied_unverified(),
             reach,
             escaped,
             largest_record(MAX_BEGUN_ROW_BYTES),
@@ -1906,6 +2280,7 @@ mod tests {
         workload.tools = vec!["back\\slash \"quoted\" é".to_owned()];
         let mut none = list_record();
         none.tools = Vec::new();
+        none.delegation = None;
         for record in [list_record(), workload, none] {
             let row = ListRow::from_record(&id(), &record).unwrap();
             assert_eq!(

@@ -238,6 +238,7 @@ impl Harness {
             resources,
             // A key of its own, which the draft tool needs and a read ignores.
             key: Some(fresh_key()),
+            currency: gateway_core::Currency::NotAsked,
         };
         let decision = decide(&self.fixture.policy, &call);
         assert!(decision.is_allowed(), "{decision:?}");

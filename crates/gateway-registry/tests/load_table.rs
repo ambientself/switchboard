@@ -1782,6 +1782,35 @@ fn a_profile_declares_the_key_header_only_when_it_says_so() {
     );
 }
 
+/// A profile requires a current control plane for its side effects only when it says so
+/// (decision 0012): a profile that does not mention it, as every file written before the
+/// setting does not, does not require it.
+#[test]
+fn a_profile_requires_currency_only_when_it_says_so() {
+    let mut table = base();
+    set(&mut table, "profiles.0", "requires_currency", value("true"));
+    let registry = load(&table).unwrap();
+    let requires = |name: &str| {
+        registry
+            .snapshot()
+            .profile(&name.into())
+            .unwrap()
+            .requires_currency
+    };
+    assert!(requires("workload-read"));
+    assert!(!requires("user-read"));
+    set(
+        &mut table,
+        "profiles.0",
+        "requires_currency",
+        value("\"yes\""),
+    );
+    assert!(
+        load(&table).is_err(),
+        "a setting that is not a boolean loaded"
+    );
+}
+
 #[test]
 fn a_tool_declared_as_the_reach_is_approved_as_declared_from_the_reach() {
     let mut table = base();

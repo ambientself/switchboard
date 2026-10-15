@@ -14,9 +14,10 @@
 //! list row's kind `list`, which its statement writes itself, included.
 
 use gateway_core::audit::{
-    AuditRecord, AuditRowId, DecisionKind, ListRecord, RecordedResources, RowKind, StoreError,
+    AuditRecord, AuditRowId, DecisionKind, ListRecord, RecordedDelegation, RecordedFailure,
+    RecordedResources, RowKind, StoreError,
 };
-use gateway_core::{CredentialMode, Principal, PrincipalKind};
+use gateway_core::{CredentialMode, CurrencyAnswer, Egress, Principal, PrincipalKind};
 use serde_json::{Value, json};
 
 /// The most a row may hold, in bytes: 512 KiB, the completion finish writes included.
@@ -91,9 +92,41 @@ fn resources(resources: &RecordedResources) -> Value {
     }
 }
 
+/// `proved_pod` and a verified delegation's columns, as `audit_postgres`'s `DelegationColumns`
+/// counts them, in the same order. A digest is written for a delegation that did not verify,
+/// when its signature did.
+fn delegation_sizes(
+    principal: &Principal,
+    delegation: Option<&RecordedDelegation>,
+    failure: Option<&RecordedFailure>,
+) -> [(&'static str, usize); 9] {
+    let digest = delegation
+        .map(|delegation| delegation.digest)
+        .or_else(|| failure.and_then(|failure| failure.digest))
+        .map_or(0, |digest| digest.to_hex().len());
+    let text = |value: fn(&RecordedDelegation) -> &str| delegation.map_or(0, |d| value(d).len());
+    [
+        (
+            "proved_pod",
+            principal.pod().map_or(0, |pod| pod.as_str().len()),
+        ),
+        ("delegation_digest", digest),
+        ("delegation_issuer", text(|d| d.issuer.as_str())),
+        ("delegation_key_id", text(|d| d.key_id.as_str())),
+        ("delegation_session", text(|d| d.session.as_str())),
+        ("delegation_turn", text(|d| d.turn.as_str())),
+        ("delegation_execution", text(|d| d.execution.as_str())),
+        ("delegation_epoch", delegation.map_or(0, |_| INTEGER_BYTES)),
+        (
+            "delegation_egress",
+            optional_bytes(delegation.and_then(|d| d.egress).map(Egress::as_str)),
+        ),
+    ]
+}
+
 /// Each column of the call row begin writes for `record` as the row `id`, and its bytes, as
 /// `audit_postgres`'s `BeginRow::sizes` counts them, in the same order.
-pub fn call_row_sizes(id: &AuditRowId, record: &AuditRecord) -> [(&'static str, usize); 27] {
+pub fn call_row_sizes(id: &AuditRowId, record: &AuditRecord) -> [(&'static str, usize); 38] {
     let principal = record.proved_principal.get();
     let [proved_kind, proved_team, proved_groups] = principal_sizes(principal);
     let reason = record
@@ -114,6 +147,21 @@ pub fn call_row_sizes(id: &AuditRowId, record: &AuditRecord) -> [(&'static str, 
         DecisionKind::Allow => "allow",
         DecisionKind::Deny => "deny",
     };
+    let [
+        pod,
+        digest,
+        issuer,
+        key_id,
+        session,
+        turn,
+        execution,
+        epoch,
+        egress,
+    ] = delegation_sizes(
+        principal,
+        record.delegation.as_ref(),
+        record.delegation_failure.as_ref(),
+    );
     [
         ("id", id.as_str().len()),
         (
@@ -178,16 +226,49 @@ pub fn call_row_sizes(id: &AuditRowId, record: &AuditRecord) -> [(&'static str, 
                     .map(|credential| credential.principal.as_str()),
             ),
         ),
+        pod,
+        digest,
+        issuer,
+        key_id,
+        session,
+        turn,
+        execution,
+        epoch,
+        egress,
+        (
+            "delegation_failure",
+            optional_bytes(
+                record
+                    .delegation_failure
+                    .as_ref()
+                    .map(|failure| failure.failure.as_str()),
+            ),
+        ),
+        (
+            "currency",
+            optional_bytes(record.currency.map(CurrencyAnswer::as_str)),
+        ),
     ]
 }
 
 /// Each column of the list row list writes for `record` as the row `id`, and its bytes, as
 /// `audit_postgres`'s `ListRow::sizes` counts them, in the same order: the kind `list` among
 /// them.
-pub fn list_row_sizes(id: &AuditRowId, record: &ListRecord) -> [(&'static str, usize); 17] {
+pub fn list_row_sizes(id: &AuditRowId, record: &ListRecord) -> [(&'static str, usize); 26] {
     let principal = record.proved_principal.get();
     let [proved_kind, proved_team, proved_groups] = principal_sizes(principal);
     let listed_tools = Value::Array(record.tools.iter().cloned().map(Value::String).collect());
+    let [
+        pod,
+        digest,
+        issuer,
+        key_id,
+        session,
+        turn,
+        execution,
+        epoch,
+        egress,
+    ] = delegation_sizes(principal, record.delegation.as_ref(), None);
     [
         ("id", id.as_str().len()),
         ("deployment", record.deployment.as_str().len()),
@@ -225,6 +306,15 @@ pub fn list_row_sizes(id: &AuditRowId, record: &ListRecord) -> [(&'static str, u
         ("kind", kind(RowKind::List).len()),
         ("listed_tools", json_bytes(&listed_tools)),
         ("listed_omitted", INTEGER_BYTES),
+        pod,
+        digest,
+        issuer,
+        key_id,
+        session,
+        turn,
+        execution,
+        epoch,
+        egress,
     ]
 }
 

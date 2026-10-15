@@ -189,6 +189,7 @@ fn call(registry: &Registry, caller: &CallerContext, name: &str, args: Value) ->
             tool: name.into(),
             resources,
             key: None,
+            currency: gateway_core::Currency::NotAsked,
         },
     )
     .verdict()

@@ -91,9 +91,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use gateway_core::audit::{self, Answer, AuditRowId, Begun, RequestMetadata, RowStart};
 use gateway_core::{
-    ApprovedTool, CallContext, CallerContext, Classification, Connector, Decision, DeclaredFrom,
-    IDENTITY_FAILURE, IdempotencyKey, MAX_IDEMPOTENCY_KEY, Principal, Proved, RequestedTool,
-    Resources, Reuse, SurfaceName, ToolUseId, VendorReference, decide, list_tools,
+    ApprovedTool, CallContext, CallerContext, Classification, Connector, Currency, Decision,
+    DeclaredFrom, IDENTITY_FAILURE, IdempotencyKey, MAX_IDEMPOTENCY_KEY, Principal, Proved,
+    RequestedTool, Resources, Reuse, SurfaceName, ToolUseId, VendorReference, decide, list_tools,
 };
 use gateway_identity::{Clock, Verification};
 use gateway_mcp::{
@@ -650,6 +650,9 @@ impl RequestPath {
             tool: requested,
             resources,
             key,
+            // Nothing asks a control plane yet: the Otto adapter's resolver client comes with
+            // its wiring (#22). No profile in a registry requires currency until then.
+            currency: Currency::NotAsked,
         };
         let decided = Instant::now();
         let decision = decide(snapshot, &context);

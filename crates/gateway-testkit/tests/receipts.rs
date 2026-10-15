@@ -42,6 +42,7 @@ fn propose(
         tool: RequestedTool::new(DRAFT_TOOL),
         resources: FixtureConnector::resources_of(DRAFT_TOOL, &arguments),
         key: Some(key.clone()),
+        currency: gateway_core::Currency::NotAsked,
     };
     block_on(audit::begin(
         store,

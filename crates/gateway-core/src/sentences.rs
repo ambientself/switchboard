@@ -52,6 +52,22 @@ const DELEGATION_TEAM_MISMATCH: &str = "The delegation was issued for team `{del
 /// A delegation was presented by a user, who has no team.
 const DELEGATION_WITHOUT_TEAM: &str = "The delegation was issued for team `{delegated_team}`, but the caller is user `{subject}` from issuer `{issuer}`, who belongs to no team. Only a workload of the team a delegation was issued for may present it.";
 
+/// The delegation did not verify (decisions 0009 and 0012). One fixed sentence whatever
+/// failed, with no placeholder, so a caller cannot learn which check its delegation failed.
+/// Otto's gateway's sentence for a bad turn grant, as the conformance suite records it
+/// (`grantDenial` in `conformance/harness_test.go`), with the capital letter and full stop
+/// every sentence here has.
+const DELEGATION_UNVERIFIED: &str =
+    "This gateway requires a verifiable turn grant on every call, and this call's did not verify.";
+
+/// The control plane says the call's turn is not current: superseded, ended or revoked
+/// (decision 0012, "Currency").
+const NOT_CURRENT: &str = "Tool `{tool}` is classified `{classification}`, so a call to it is allowed only while the control plane that issued this call's delegation says its turn is current. It says the turn is no longer current, so the call was refused and nothing ran. Do not retry it under this delegation.";
+
+/// Whether the call's turn is current could not be confirmed, or was not asked (decision 0012,
+/// "Currency").
+const CURRENCY_UNCONFIRMED: &str = "Tool `{tool}` is classified `{classification}`, so a call to it is allowed only while the control plane that issued this call's delegation says its turn is current. That could not be confirmed, so the call was refused and nothing ran. Try again shortly.";
+
 /// The tool is destructive. Its own sentence, because no profile can change the answer.
 const DESTRUCTIVE: &str = "Tool `{tool}` is classified `destructive`, and destructive tools are denied in every profile. Ask a person to make this change.";
 
@@ -126,7 +142,7 @@ pub const MAX_RENDERED: usize = 128;
 
 /// Every complete-sentence template, for the tests that check them all.
 #[cfg(test)]
-const SENTENCES: [&str; 26] = [
+const SENTENCES: [&str; 29] = [
     PROFILE_UNKNOWN,
     TOOL_NOT_AVAILABLE,
     INVALID_TOOL_NAME,
@@ -135,6 +151,9 @@ const SENTENCES: [&str; 26] = [
     DELEGATION_MISSING,
     DELEGATION_TEAM_MISMATCH,
     DELEGATION_WITHOUT_TEAM,
+    DELEGATION_UNVERIFIED,
+    NOT_CURRENT,
+    CURRENCY_UNCONFIRMED,
     DESTRUCTIVE,
     DIRECT_WRITE,
     CLASSIFICATION_NOT_PERMITTED,
@@ -217,6 +236,27 @@ pub(crate) fn render(reason: &Reason) -> String {
                 ("delegated_team", Text(delegated_team.as_str())),
                 ("subject", Text(principal.subject.as_str())),
                 ("issuer", Text(principal.issuer.as_str())),
+            ],
+        ),
+        Reason::DelegationUnverified { .. } => fill(DELEGATION_UNVERIFIED, &[]),
+        Reason::NotCurrent {
+            tool,
+            classification,
+        } => fill(
+            NOT_CURRENT,
+            &[
+                ("tool", Text(tool.as_str())),
+                ("classification", Text(classification.as_str())),
+            ],
+        ),
+        Reason::CurrencyUnconfirmed {
+            tool,
+            classification,
+        } => fill(
+            CURRENCY_UNCONFIRMED,
+            &[
+                ("tool", Text(tool.as_str())),
+                ("classification", Text(classification.as_str())),
             ],
         ),
         Reason::ClassificationNotPermitted {
@@ -476,6 +516,21 @@ mod tests {
             !IDENTITY_FAILURE.contains('{'),
             "the opaque sentence must not vary"
         );
+    }
+
+    /// An unverified delegation reads one fixed sentence, Otto's for a bad grant, whatever check
+    /// it failed: the failure is recorded on the row and never told to the caller.
+    #[test]
+    fn an_unverified_delegation_reads_one_sentence_naming_no_failure() {
+        assert_eq!(
+            DELEGATION_UNVERIFIED,
+            "This gateway requires a verifiable turn grant on every call, and this call's did not verify."
+        );
+        for failure in crate::DelegationFailure::ALL {
+            let sentence = render(&Reason::DelegationUnverified { failure });
+            assert_eq!(sentence, DELEGATION_UNVERIFIED, "{failure}");
+            assert!(!sentence.contains(failure.as_str()), "{failure}");
+        }
     }
 
     /// The most bytes a template renders to: its own text, and each value at its longest, the

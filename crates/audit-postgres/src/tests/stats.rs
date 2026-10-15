@@ -136,6 +136,7 @@ async fn a_begin_refusing_a_value_counts_one_value_refused() {
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
         tool: RequestedTool::new(call.tool),
         key: None,
+        currency: gateway_core::Currency::NotAsked,
     };
     let metadata = RequestMetadata {
         tool_use_id: Some(ToolUseId::new("toolu_\u{0}x")),
@@ -205,6 +206,7 @@ async fn the_latency_counts_equal_the_begins_and_finishes_and_success_counts_not
             .unwrap(),
         tool: RequestedTool::new(denied.tool),
         key: None,
+        currency: gateway_core::Currency::NotAsked,
     };
     let decision = decide(&fixture.policy, &context);
     let begun = audit::begin(

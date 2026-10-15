@@ -20,7 +20,7 @@ use gateway_testkit::{
 use serde_json::{Value, json};
 use tokio_postgres::{Client, NoTls};
 
-use super::{GATEWAY_ROLE, TestDatabase};
+use super::{DELEGATION_COLUMNS, DelegationRead, GATEWAY_ROLE, TestDatabase};
 use crate::columns::{BeginRow, FinishRow, ListRow, allowance_ms};
 use crate::{
     Budgets, FinishCounts, MAX_BEGUN_ROW_BYTES, MAX_OUTCOME_SENTENCE_BYTES, MAX_ROW_BYTES,
@@ -78,6 +78,7 @@ pub(super) async fn through_core(
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
         tool: RequestedTool::new(call.tool),
         key: None,
+        currency: gateway_core::Currency::NotAsked,
     };
     let decision = decide(&fixture.policy, &context);
     let begun = audit::begin(
@@ -109,19 +110,23 @@ pub(super) async fn through_core(
 pub(super) async fn read_back(admin: &Client, row: &AuditRowId) -> AuditRecord {
     let row = admin
         .query_one(
-            "SELECT tool_use_id, deployment, surface, profile, tool, connector, classification,
+            &format!(
+                "SELECT tool_use_id, deployment, surface, profile, tool, connector, classification,
                     decision, reason, sentence, policy_revision,
                     proved_issuer, proved_subject, proved_kind, proved_team, proved_groups,
                     proved_delegation_team, claimed_acting_person, claimed_team,
                     outcome, outcome_sentence, error_kind, latency_ms, resources,
                     resources_omitted, instance, kind, allowance_ms,
-                    deadline = begun_at + allowance_ms * interval '1 millisecond' AS on_time
-             FROM switchboard_audit.call_rows WHERE id = ($1::text)::uuid",
+                    deadline = begun_at + allowance_ms * interval '1 millisecond' AS on_time,
+                    {DELEGATION_COLUMNS}
+             FROM switchboard_audit.call_rows WHERE id = ($1::text)::uuid"
+            ),
             &[&row.as_str()],
         )
         .await
         .unwrap();
     let text = |column: &str| row.get::<_, Option<String>>(column);
+    let read = DelegationRead::of(&row);
     let mut principal = json!({
         "id": {"issuer": text("proved_issuer"), "subject": text("proved_subject")},
         "kind": text("proved_kind"),
@@ -129,6 +134,9 @@ pub(super) async fn read_back(admin: &Client, row: &AuditRowId) -> AuditRecord {
     match text("proved_kind").as_deref() {
         Some("workload") => principal["team"] = json!(text("proved_team")),
         _ => principal["groups"] = json!(row.get::<_, Option<Vec<String>>>("proved_groups")),
+    }
+    if let Some(pod) = &read.pod {
+        principal["pod"] = json!(pod);
     }
     let completion = text("outcome").map(|outcome| {
         let mut completion = json!({
@@ -171,6 +179,9 @@ pub(super) async fn read_back(admin: &Client, row: &AuditRowId) -> AuditRecord {
         "proved_delegation_team": text("proved_delegation_team"),
         "claimed_acting_person": text("claimed_acting_person"),
         "claimed_team": text("claimed_team"),
+        "delegation": read.delegation,
+        "delegation_failure": read.failure,
+        "currency": read.currency,
         "completion": completion,
     }))
     .unwrap()
@@ -371,6 +382,7 @@ async fn a_nul_in_a_value_refuses_the_record_and_writes_no_row() {
             caller: fixture.caller_context(call.caller, call.surface).unwrap(),
             tool: RequestedTool::new(call.tool),
             key: None,
+            currency: gateway_core::Currency::NotAsked,
         };
         let decision = decide(&fixture.policy, &context);
         let failure = audit::begin(&store, row_start(), decision, call.arguments, metadata)
@@ -714,6 +726,7 @@ fn decided(fixture: &Fixture, call: &Call) -> gateway_core::Decision {
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
         tool: RequestedTool::new(call.tool),
         key: None,
+        currency: gateway_core::Currency::NotAsked,
     };
     decide(&fixture.policy, &context)
 }
@@ -856,6 +869,7 @@ pub(super) async fn begun_row(store: &PgAuditStore, fixture: &Fixture) -> AuditR
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
         tool: RequestedTool::new(call.tool),
         key: None,
+        currency: gateway_core::Currency::NotAsked,
     };
     let decision = decide(&fixture.policy, &context);
     match audit::begin(store, row_start(), decision, call.arguments, call.metadata)
@@ -1108,6 +1122,7 @@ async fn a_store_that_cannot_reach_its_database_refuses_the_call() {
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
         tool: RequestedTool::new(call.tool),
         key: None,
+        currency: gateway_core::Currency::NotAsked,
     };
     let decision = decide(&fixture.policy, &context);
     let failure = audit::begin(&store, row_start(), decision, call.arguments, call.metadata)
@@ -1124,19 +1139,29 @@ async fn a_store_that_cannot_reach_its_database_refuses_the_call() {
 async fn read_back_list(admin: &Client, row: &AuditRowId) -> ListRecord {
     let row = admin
         .query_one(
-            "SELECT instance, deployment, surface, profile, policy_revision,
+            &format!(
+                "SELECT instance, deployment, surface, profile, policy_revision,
                     proved_issuer, proved_subject, proved_kind, proved_team, proved_groups,
                     proved_delegation_team, claimed_acting_person, claimed_team,
                     listed_tools, listed_omitted, kind,
                     begun_at > now() - interval '1 minute' AS begun_now,
                     deadline IS NULL AND allowance_ms IS NULL AND outcome IS NULL
-                        AND finished_at IS NULL AS never_open
-             FROM switchboard_audit.call_rows WHERE id = ($1::text)::uuid",
+                        AND finished_at IS NULL AS never_open,
+                    {DELEGATION_COLUMNS}
+             FROM switchboard_audit.call_rows WHERE id = ($1::text)::uuid"
+            ),
             &[&row.as_str()],
         )
         .await
         .unwrap();
     let text = |column: &str| row.get::<_, Option<String>>(column);
+    let read = DelegationRead::of(&row);
+    assert_eq!(read.failure, Value::Null, "a list row records a failure");
+    assert_eq!(
+        read.currency,
+        Value::Null,
+        "a list row records a currency answer"
+    );
     assert_eq!(text("kind").as_deref(), Some("list"));
     assert!(row.get::<_, bool>("begun_now"));
     assert!(row.get::<_, bool>("never_open"));
@@ -1148,6 +1173,9 @@ async fn read_back_list(admin: &Client, row: &AuditRowId) -> ListRecord {
         Some("workload") => principal["team"] = json!(text("proved_team")),
         _ => principal["groups"] = json!(row.get::<_, Option<Vec<String>>>("proved_groups")),
     }
+    if let Some(pod) = &read.pod {
+        principal["pod"] = json!(pod);
+    }
     serde_json::from_value(json!({
         "instance": text("instance"),
         "deployment": text("deployment"),
@@ -1158,6 +1186,7 @@ async fn read_back_list(admin: &Client, row: &AuditRowId) -> ListRecord {
         "proved_delegation_team": text("proved_delegation_team"),
         "claimed_acting_person": text("claimed_acting_person"),
         "claimed_team": text("claimed_team"),
+        "delegation": read.delegation,
         "tools": row.get::<_, Value>("listed_tools"),
         "tools_omitted": row.get::<_, i64>("listed_omitted"),
     }))

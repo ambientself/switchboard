@@ -62,17 +62,20 @@ use crate::classification::Classification;
 pub use crate::connector::ErrorKind;
 use crate::connector::{BoxFuture, Connector, ToolCall, ToolOutcome};
 use crate::decision::{
-    CallContext, CallerContext, Decision, Reason, ReasonKind, ResourceProblem, Verdict,
+    CallContext, CallerContext, CurrencyAnswer, Decision, Reason, ReasonKind, ResourceProblem,
+    Verdict,
 };
 use crate::names::{
-    ConnectorName, DeploymentName, InstanceName, Person, PolicyRevision, ProfileName, SurfaceName,
-    TeamId, ToolUseId,
+    ConnectorName, DelegationIssuer, DeploymentName, ExecutionId, InstanceName, KeyId, Person,
+    PolicyRevision, ProfileName, SessionId, SurfaceName, TeamId, ToolUseId, TurnId,
 };
 use crate::policy::{
     ApprovedTool, ConnectorEntry, CredentialMode, PolicySnapshot, Resource, Resources,
 };
-use crate::principal::Principal;
-use crate::proof::{Claimed, WasProved};
+use crate::principal::{
+    Delegation, DelegationDigest, DelegationFailure, Egress, PresentedDelegation, Principal,
+};
+use crate::proof::{Claimed, Proved, WasProved};
 use crate::receipt::{
     ArgumentDigest, KeyScope, ReceiptRequest, Reservation, Reuse, VendorReference,
 };
@@ -160,6 +163,84 @@ pub fn credential_identity(
 ) -> Option<CredentialIdentity> {
     let tool = decision.tool()?;
     snapshot.entry(&tool.connector).map(CredentialIdentity::of)
+}
+
+/// A verified delegation as a row records it (decision 0012): what identifies it, beside the
+/// team and the person, which the row holds in its proved and claimed columns. The issuer, key,
+/// session, turn and execution are escaped and capped at 128 characters, like the surface.
+///
+/// One query over these finds a delegation used from more than one pod or deployment: the
+/// digest, with the row's proved pod and deployment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedDelegation {
+    /// The SHA-256 of the delegation as presented.
+    pub digest: DelegationDigest,
+    /// The issuer whose key verified it.
+    pub issuer: DelegationIssuer,
+    /// The key it verified under.
+    pub key_id: KeyId,
+    /// The session it was issued in.
+    pub session: SessionId,
+    /// The turn it was issued for.
+    pub turn: TurnId,
+    /// The execution the turn belongs to.
+    pub execution: ExecutionId,
+    /// The fencing epoch of the control plane that issued it.
+    pub epoch: u64,
+    /// The turn's egress setting, when the delegation carries one.
+    pub egress: Option<Egress>,
+}
+
+impl RecordedDelegation {
+    /// What a row records of `delegation`.
+    pub fn of(delegation: &Proved<Delegation>) -> Self {
+        let delegation = delegation.get();
+        let safe = |value: &str| sentences::escape(value, sentences::MAX_RENDERED);
+        Self {
+            digest: delegation.digest,
+            issuer: DelegationIssuer::new(safe(delegation.issuer.as_str())),
+            key_id: KeyId::new(safe(delegation.key_id.as_str())),
+            session: SessionId::new(safe(delegation.session.as_str())),
+            turn: TurnId::new(safe(delegation.turn.as_str())),
+            execution: ExecutionId::new(safe(delegation.execution.as_str())),
+            epoch: delegation.epoch,
+            egress: delegation.egress,
+        }
+    }
+}
+
+/// A delegation that did not verify, as its row records it (decisions 0009 and 0012): which
+/// check it failed and, when its signature verified, its digest. Nothing from its claims.
+/// Recorded only on a call row denied at check 3.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedFailure {
+    /// Which check failed.
+    pub failure: DelegationFailure,
+    /// The delegation's digest: set only for a failure that
+    /// [follows its signature](DelegationFailure::follows_signature).
+    pub digest: Option<DelegationDigest>,
+}
+
+/// What a row records of the delegation a request carried: the verified delegation's columns,
+/// or the failure's, or neither when there was none.
+fn recorded_delegation(
+    delegation: Option<&PresentedDelegation>,
+) -> (Option<RecordedDelegation>, Option<RecordedFailure>) {
+    match delegation {
+        None => (None, None),
+        Some(PresentedDelegation::Verified(delegation)) => {
+            (Some(RecordedDelegation::of(delegation)), None)
+        }
+        Some(PresentedDelegation::Unverified(unverified)) => (
+            None,
+            Some(RecordedFailure {
+                failure: unverified.failure(),
+                digest: unverified.digest().copied(),
+            }),
+        ),
+    }
 }
 
 /// Allow or deny, as the audit record's decision column holds it.
@@ -293,6 +374,20 @@ pub struct AuditRecord {
     pub claimed_acting_person: Option<Claimed<Person>>,
     /// A team the caller stated, for example in a header.
     pub claimed_team: Option<Claimed<TeamId>>,
+    /// What identifies the verified delegation the call carried (decision 0012). `None`
+    /// without one, and for a delegation that did not verify. The proved pod is in
+    /// `proved_principal`.
+    #[serde(default)]
+    pub delegation: Option<RecordedDelegation>,
+    /// Which check the delegation the call carried failed, and its digest if its signature
+    /// verified, when it did not verify. Set only on a row denied at check 3, and never beside
+    /// anything from the delegation's claims.
+    #[serde(default)]
+    pub delegation_failure: Option<RecordedFailure>,
+    /// What the control plane answered when asked whether the call's turn is current (decision
+    /// 0012). `None` when it was not asked.
+    #[serde(default)]
+    pub currency: Option<CurrencyAnswer>,
     /// The configured identity of the connector entry of the tool the call names, recorded at
     /// begin, as [`RowStart::credential`] gives it: see [`CredentialIdentity`]. Recorded for a
     /// denial too, as the connector is. `None` when the call names no tool the surface serves,
@@ -332,6 +427,11 @@ pub struct ListRecord {
     pub claimed_acting_person: Option<Claimed<Person>>,
     /// A team the caller stated, for example in a header.
     pub claimed_team: Option<Claimed<TeamId>>,
+    /// What identifies the verified delegation the request carried (decision 0012). `None`
+    /// without one. A delegation that did not verify is not recorded on a list row: its every
+    /// tool fails check 3, so the list is empty.
+    #[serde(default)]
+    pub delegation: Option<RecordedDelegation>,
     /// The names of the tools the answer lists, in the order it lists them: the first
     /// [`MAX_RECORDED_TOOLS`], each escaped and capped at 128 characters.
     pub tools: Vec<String>,
@@ -719,6 +819,11 @@ pub async fn begin(
         call_deadline_ms,
         credential,
     } = start;
+    let (delegation, delegation_failure) = recorded_delegation(call.caller.delegation.as_ref());
+    // A failure is recorded only on the row check 3 denied for it. A call denied earlier, at
+    // the profile, surface or tool, is recorded as that denial alone (decision 0012).
+    let delegation_failure =
+        delegation_failure.filter(|_| reason == Some(ReasonKind::DelegationUnverified));
     let record = AuditRecord {
         kind: RowKind::Call,
         instance: InstanceName::new(sentences::escape(
@@ -743,17 +848,12 @@ pub async fn begin(
         sentence,
         policy_revision,
         proved_principal: call.caller.principal.clone().into(),
-        proved_delegation_team: call
-            .caller
-            .delegation
-            .as_ref()
-            .map(|delegation| delegation.team().into()),
-        claimed_acting_person: call
-            .caller
-            .delegation
-            .as_ref()
-            .map(|delegation| delegation.acting_person()),
+        proved_delegation_team: verified(&call.caller).map(|delegation| delegation.team().into()),
+        claimed_acting_person: verified(&call.caller).map(Proved::acting_person),
         claimed_team: metadata.claimed_team,
+        delegation,
+        delegation_failure,
+        currency: call.currency.answer(),
         credential: tool.and(credential),
         completion: None,
     };
@@ -831,15 +931,10 @@ pub async fn listed(
         profile: caller.profile.clone(),
         policy_revision,
         proved_principal: caller.principal.clone().into(),
-        proved_delegation_team: caller
-            .delegation
-            .as_ref()
-            .map(|delegation| delegation.team().into()),
-        claimed_acting_person: caller
-            .delegation
-            .as_ref()
-            .map(|delegation| delegation.acting_person()),
+        proved_delegation_team: verified(caller).map(|delegation| delegation.team().into()),
+        claimed_acting_person: verified(caller).map(Proved::acting_person),
         claimed_team,
+        delegation: verified(caller).map(RecordedDelegation::of),
         tools: tools
             .iter()
             .take(MAX_RECORDED_TOOLS)
@@ -855,6 +950,15 @@ pub async fn listed(
         row,
         tools: tools.into_iter().cloned().collect(),
     })
+}
+
+/// The caller's delegation, if it verified. Only a verified delegation's team, person and
+/// identifying fields reach a row.
+fn verified(caller: &CallerContext) -> Option<&Proved<Delegation>> {
+    caller
+        .delegation
+        .as_ref()
+        .and_then(PresentedDelegation::verified)
 }
 
 /// The resources as a row records them, and how many distinct ones were left out. See
@@ -916,11 +1020,7 @@ fn receipt_request(
     };
     let scope = KeyScope {
         principal: call.caller.principal.get().id.clone(),
-        delegation: call
-            .caller
-            .delegation
-            .as_ref()
-            .and_then(|delegation| delegation.get().key_scope.clone()),
+        delegation: verified(&call.caller).map(|delegation| delegation.get().key_scope()),
     };
     Ok(ReceiptRequest::new(
         scope,

@@ -1,6 +1,7 @@
 //! Helpers shared by the integration tests. Each test file uses a different subset.
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::future::{Future, ready as now};
 use std::marker::PhantomData;
@@ -14,8 +15,8 @@ use gateway_core::audit::{
 };
 use gateway_core::receipt::{EstablishedBy, ReceiptRequest, Reservation, may_move};
 use gateway_core::{
-    AuditRecord, AuditStore, BoxFuture, IdempotencyKey, Provable, Proved, Receipt, ReceiptState,
-    Reuse, ToolName, Verifier,
+    AuditRecord, AuditStore, BoxFuture, Claimed, Delegation, DelegationDigest, IdempotencyKey,
+    PresentedDelegation, Provable, Proved, Receipt, ReceiptState, Reuse, ToolName, Verifier,
 };
 
 /// A stand-in verifier that accepts its fixture as given.
@@ -39,6 +40,28 @@ pub fn proved<T: Provable + Clone>(fact: &T) -> Proved<T> {
     match Proved::verify(&FixtureVerifier(PhantomData), fact) {
         Ok(proved) => proved,
         Err(never) => match never {},
+    }
+}
+
+/// `delegation`, as a fixture verifier proves it, presented with a call.
+pub fn presented(delegation: &Delegation) -> PresentedDelegation {
+    PresentedDelegation::Verified(proved(delegation))
+}
+
+/// A delegation for `team` listing `tools`, issued for one turn by a test issuer.
+pub fn delegation(team: &str, tools: impl IntoIterator<Item = ToolName>) -> Delegation {
+    Delegation {
+        acting_person: Claimed::new("requester@example.test".into()),
+        team: team.into(),
+        tools: tools.into_iter().collect::<BTreeSet<_>>(),
+        issuer: "otto-test".into(),
+        digest: DelegationDigest::of(b"a grant"),
+        key_id: "key-1".into(),
+        session: "session-1".into(),
+        turn: "turn-1".into(),
+        execution: "execution-1".into(),
+        epoch: 7,
+        egress: None,
     }
 }
 

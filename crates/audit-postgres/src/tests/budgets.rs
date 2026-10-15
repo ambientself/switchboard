@@ -92,6 +92,7 @@ pub(super) fn decide_read(fixture: &Fixture, call: &Call) -> gateway_core::Decis
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
         tool: RequestedTool::new(call.tool),
         key: None,
+        currency: gateway_core::Currency::NotAsked,
     };
     decide(&fixture.policy, &context)
 }
