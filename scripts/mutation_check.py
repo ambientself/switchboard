@@ -1693,6 +1693,60 @@ mutate("otto-mapping-unmapped-kept", "a name the mapping lacks is kept when it i
        ".filter_map(|name| self.get(name).cloned())",
        ".filter_map(|name| self.get(name).cloned().or_else(|| ToolName::parse(name).ok()))")
 
+# The resolver client (decisions 0003 and 0012, #22): the one-second budget enforced by the
+# client, no cache, a bounded answer, the version and the echo checked, and every failure read
+# as unconfirmed. tests/resolver.rs, against the fake resolver, catches these.
+OR = OTTO_SRC + "resolver.rs"
+OR_STORE = "        self.signals.record(result, started.elapsed());\n"
+mutate("otto-resolver-budget-not-applied", "the client waits for an answer however long it takes", OR,
+       "        let result = match tokio::time::timeout(BUDGET, self.exchange(question)).await {",
+       "        let result = match Ok::<_, ()>(self.exchange(question).await) {")
+mutate("otto-resolver-budget-two-seconds", "the budget is two seconds", OR,
+       "pub const BUDGET: Duration = Duration::from_secs(1);", "pub const BUDGET: Duration = Duration::from_secs(2);")
+mutate("otto-resolver-unknown-version-read", "an answer of another version is read as this one", OR,
+       "    if versioned.version != VERSION {", "    if false {")
+mutate("otto-resolver-echo-not-compared", "an answer is read whatever question it echoes", OR,
+       "    if !answer.echoes(question, request_id) {", "    if false {")
+mutate("otto-resolver-echo-request-id-not-compared", "an answer to an earlier asking of the question is read", OR,
+       "            && self.request_id == request_id\n", "")
+mutate("otto-resolver-echo-epoch-not-compared", "an answer for another epoch is read", OR,
+       "            && self.epoch == question.epoch\n", "")
+mutate_all(
+    "otto-resolver-answer-cached",
+    "the last answer is kept and given again for the same question",
+    (OR, "    signals: Arc<Signals>,\n}\n",
+     "    signals: Arc<Signals>,\n    cached: std::sync::Mutex<Option<(CurrencyQuestion, Answer)>>,\n}\n"),
+    (OR, "            signals: Arc::new(Signals::default()),\n",
+     "            signals: Arc::new(Signals::default()),\n            cached: std::sync::Mutex::new(None),\n"),
+    (OR, "        let started = Instant::now();\n",
+     "        if let Some((cached, answer)) = self.cached.lock().ok().and_then(|cached| cached.clone())\n"
+     "            && cached == *question\n        {\n            return Ok(answer);\n        }\n"
+     "        let started = Instant::now();\n"),
+    (OR, OR_STORE,
+     "        if let (Ok(answer), Ok(mut cached)) = (result, self.cached.lock()) {\n"
+     "            *cached = Some((question.clone(), answer));\n        }\n" + OR_STORE),
+)
+mutate("otto-resolver-error-read-as-current", "a failure is read as current", OR,
+       "        Err(_) => CurrencyAnswer::Unconfirmed,", "        Err(_) => CurrencyAnswer::Current,")
+mutate("otto-resolver-status-unchecked", "an answer under an error status is read", OR,
+       "        if status != StatusCode::OK {", "        if false {")
+OR_DECLARED = "    if declared_length(response.headers()).is_some_and(|length| length > MAX_ANSWER_BYTES as u64) {"
+OR_STREAMED = "            if received.len() + data.len() > MAX_ANSWER_BYTES {"
+mutate_all(
+    "otto-resolver-bound-removed",
+    "an answer of any size is read",
+    (OR, OR_DECLARED, "    if false {"),
+    (OR, OR_STREAMED, "            if false {"),
+)
+mutate("otto-resolver-streamed-bound-removed", "an answer with no declared length is read whatever its size", OR,
+       OR_STREAMED, "            if false {")
+mutate("otto-resolver-bound-one-short", "an answer exactly at the cap is refused", OR,
+       OR_STREAMED, OR_STREAMED.replace(" > MAX", " >= MAX"))
+mutate("otto-resolver-unknown-members-accepted", "an answer with a member the format lacks is read", OR,
+       "#[serde(deny_unknown_fields)]\nstruct WireAnswer {", "struct WireAnswer {")
+mutate("otto-resolver-plain-http-anywhere", "the client asks over plain http to an address that is not loopback", OR,
+       ".is_ok_and(|address| address.is_loopback())", ".is_ok_and(|_| true)")
+
 # --- The testkit's fakes: each failure switch ----------------------------------------------
 
 A = TESTKIT_SRC + "audit.rs"
@@ -6139,6 +6193,8 @@ READERS: list[tuple[str, frozenset[str]]] = [
     ("conformance/", frozenset({"gateway-testkit", "gateway-otto"})),
     # gateway-otto/tests/format_doc.rs checks the format's constants and example.
     ("docs/turn-grant-format.md", frozenset({"gateway-otto"})),
+    # gateway-otto/tests/resolver_doc.rs checks the resolver interface's constants and example.
+    ("docs/resolver-interface.md", frozenset({"gateway-otto"})),
     # demo-checks/tests/manifests.rs compares the demo registries with the registry crate's own.
     ("crates/gateway-registry/demo/", frozenset({"demo-checks"})),
     # mock-docs-server/tests/dependencies.rs includes the identity crate's manifest.
