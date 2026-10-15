@@ -848,12 +848,12 @@ mutate("row-completion-fields-public", "a store's finish can be called for any r
        "pub struct RowCompletion {\n    row: AuditRowId,\n    completion: Completion,\n    reference: Option<VendorReference>,",
        "pub struct RowCompletion {\n    pub row: AuditRowId,\n    pub completion: Completion,\n    pub reference: Option<VendorReference>,")
 mutate("tool-call-constructor-public", "a connector can be called around the audited path", SRC + "connector.rs",
-       "    pub(crate) fn new(call: CallContext", "    pub fn new(call: CallContext")
+       "    pub(crate) fn new(\n        call: CallContext,", "    pub fn new(\n        call: CallContext,")
 mutate("connector-run-without-call", "a connector runs without being handed the call", SRC + "connector.rs",
        "    fn run(&self, call: ToolCall) -> BoxFuture<'_, ToolOutcome>;", "    fn run(&self) -> BoxFuture<'_, ToolOutcome>;", breaks_build=True)
 mutate("run-drops-arguments", "the connector is not given the call's arguments", SRC + "audit.rs",
-       "    let outcome = connector.run(ToolCall::new(call, tool, arguments)).await;",
-       "    let outcome = connector.run(ToolCall::new(call, tool, serde_json::Value::Null)).await;")
+       "        .run(ToolCall::new(call, tool, arguments, granted))\n        .await;",
+       "        .run(ToolCall::new(call, tool, serde_json::Value::Null, granted))\n        .await;")
 mutate(
     "guard-for-denied-tool",
     "begin hands out a guard for a denial whose tool the surface serves",
@@ -1017,8 +1017,8 @@ mutate("core-side-effect-cancelled", "a side effect is cancelled when its caller
        "    if guard.tool.classification != Classification::Read {\n        return run(connector, guard).await;\n    }\n",
        "")
 mutate("core-run-unless-drops-arguments", "a read run through run_unless is not given the call's arguments", SRC + "audit.rs",
-       "    let mut running = connector.run(ToolCall::new(call, tool, arguments));",
-       "    let mut running = connector.run(ToolCall::new(call, tool, serde_json::Value::Null));")
+       "    let mut running = connector.run(ToolCall::new(call, tool, arguments, granted));",
+       "    let mut running = connector.run(ToolCall::new(call, tool, serde_json::Value::Null, granted));")
 mutate("core-read-not-cancelled-mid-run", "a read whose caller goes while it runs is not cancelled", SRC + "audit.rs",
        "        gone.as_mut().poll(context).map(|()| cancelled())\n",
        "        Poll::Pending\n")
@@ -2364,9 +2364,9 @@ mutate("gw-boot-duplicate-connector-accepted", "a connector registered twice kee
        "            return Err(BootError::DuplicateConnector(name));\n        }\n",
        "        ));\n        connectors.insert(name, registered);\n")
 mutate("gw-boot-registry-duplicate-connector-accepted", "a proxied connector registered twice keeps the last one", BOOT,
-       "        };\n        if connectors.insert(name.clone(), registered).is_some() {\n"
+       "                .unwrap_or(DEFAULT_DEADLINE),\n        };\n        if connectors.insert(name.clone(), registered).is_some() {\n"
        "            return Err(BootError::DuplicateConnector(name));\n        }\n",
-       "        };\n        connectors.insert(name, registered);\n")
+       "                .unwrap_or(DEFAULT_DEADLINE),\n        };\n        connectors.insert(name, registered);\n")
 
 # Profile selection: the rules, and the checks on them at boot.
 mutate("gw-selector-first-group-only", "only the user's first group selects a profile", SELECTOR,
@@ -3089,8 +3089,8 @@ mutate("gw-in-process-result-ceiling-unchecked", "a built-in connector's result 
        "        Some(bytes) if bytes == 0 => {\n"
        "            return Err(DeploymentError::ConnectorResultBytesOutOfRange {\n")
 mutate("gw-in-process-wired-ceiling-unchecked", "a connector in the gateway's own process wired past the ceilings boots", BOOT,
-       "        if !limits.within_ceilings() {\n",
-       "        if false {\n")
+       "    if !bound.within_ceilings() {\n",
+       "    if false {\n")
 
 
 # --- gateway: stale policy -----------------------------------------------------------------
@@ -3775,9 +3775,18 @@ mutate("registry-name-outside-system", "a tool may be named after any system", R
        "    if !under_system(&name, &server.system) {", "    if false {")
 mutate("registry-name-nothing-after-system", "a tool, or a reach check's tool, may be named `{system}__` alone", RR,
        "        .is_some_and(|rest| !rest.is_empty())\n}", "        .is_some()\n}")
-mutate("registry-approved-at-offset", "an approval time may have no offset", RR, "    if at.offset.is_none() {", "    if false {")
+mutate("registry-approved-at-offset", "an approval time may have no offset", RR,
+       "    // In TOML only an offset date-time has an offset, and it always has a date and a time.\n"
+       "    let at = tool.approved_at;\n    if at.offset.is_none() {",
+       "    // In TOML only an offset date-time has an offset, and it always has a date and a time.\n"
+       "    let at = tool.approved_at;\n    if false {")
 mutate("registry-hash-unchecked", "a definition changed after approval loads", RR,
-       "    if computed != tool.definition_sha256 {", "    if false {")
+       "    if computed != tool.definition_sha256 {\n        return Err(RegistryError::DefinitionChanged {\n"
+       "            tool: name,\n            recorded: tool.definition_sha256,\n            computed,\n"
+       "        });\n    }\n    let computed = binding_sha256(server);",
+       "    if false {\n        return Err(RegistryError::DefinitionChanged {\n"
+       "            tool: name,\n            recorded: tool.definition_sha256,\n            computed,\n"
+       "        });\n    }\n    let computed = binding_sha256(server);")
 mutate("registry-hash-ignores-title", "the approval hash does not cover the title", RD,
        '        definition.insert("title".into(), Value::String(title.into()));', "        let _ = title;")
 # The binding (#11, #51, decision 0013): recomputed from the tool's server entry and compared,
@@ -3847,7 +3856,7 @@ mutate("registry-identity-host-keeps-port", "the host compared with the identity
 mutate("registry-revision-plus-accepted", "a registry revision may take a withdrawal's derived form", RR,
        "    if file.revision.contains('+') {", "    if false {")
 mutate("registry-schema-type-unchecked", "an input schema need not be an object schema", RR,
-       '    if tool.input_schema.get("type") != Some(&Value::String("object".into())) {', "    if false {")
+       '    if schema.get("type") != Some(&Value::String("object".into())) {', "    if false {")
 mutate("registry-schema-keywords-unchecked", "a schema may use keywords the argument check does not follow", RA,
        "            annotation if ANNOTATIONS.contains(&annotation) => true,", "            _ => true,")
 mutate("registry-schema-properties-unwalked", "keywords inside a property are not looked for", RA,
@@ -3860,15 +3869,20 @@ mutate("registry-schema-properties-not-object", "`properties` may be something o
 mutate("registry-schema-node-not-schema", "a property or items may be something other than a schema", RA,
        "        _ => return Err(SchemaProblem::Malformed { at: at.clone() }),", "        _ => return Ok(()),")
 mutate("registry-adapter-without-sources", "a tool may read its resources from no argument", RR,
-       "            if sources.is_empty() {\n                return Err(RegistryError::AdapterWithoutSources(name));",
-       "            if false {\n                return Err(RegistryError::AdapterWithoutSources(name));")
+       "    if sources.is_empty() {\n        return Err(RegistryError::AdapterWithoutSources(name.clone()));",
+       "    if false {\n        return Err(RegistryError::AdapterWithoutSources(name.clone()));")
 mutate("registry-adapter-argument-undeclared", "an adapter may read an argument the schema does not declare", RR,
-       "properties.and_then(|p| p.get(&source.from_argument)) else {",
-       'properties.and_then(|p| p.get(&source.from_argument)).or(tool.input_schema.get("type")) else {')
+       "            .and_then(|p| p.get(argument))\n",
+       '            .and_then(|p| p.get(argument))\n            .or(schema.get("type"))\n')
 mutate("registry-adapter-argument-not-string", "an adapter may read an argument not typed as a string", RR,
-       '                if property.get("type") != Some(&Value::String("string".into())) {', "                if false {")
+       "            Some(false) => {\n                return Err(RegistryError::AdapterArgumentNotString {\n"
+       "                    tool: name.clone(),\n                    argument: source.from_argument,\n"
+       "                });\n            }\n            Some(true) => {}\n",
+       "            Some(_) => {}\n")
 mutate("registry-read-only-not-derived", "every definition is shown as read-only", RR,
-       "            read_only: tool.classification == gateway_core::Classification::Read,", "            read_only: true,")
+       "            read_only: tool.classification == gateway_core::Classification::Read,\n        },\n"
+       "        route: Route {\n            server: tool.server,",
+       "            read_only: true,\n        },\n        route: Route {\n            server: tool.server,")
 mutate("registry-declaration-no-resources", "a tool with an adapter is approved as naming no resources", RA,
        "        if self.sources.is_empty() {\n            ResourceDeclaration::NoResources", "        if true {\n            ResourceDeclaration::NoResources")
 mutate("registry-rule-unknown-profile", "a rule may name a profile that is not defined", RR,
@@ -3877,9 +3891,11 @@ mutate("registry-duplicate-rule", "two rules may cover the same principals", RR,
        "        if !covered.insert((rule.issuer.clone(), principal.clone())) {",
        "        if false && !covered.insert((rule.issuer.clone(), principal.clone())) {")
 mutate("adapter-missing-argument-skipped", "a missing argument drops its resource and keeps the others", RA,
-       "                _ => return Resources::Named(Vec::new()),", "                _ => continue,")
+       "            let Some(value) = text(&source.from_argument) else {\n                return Resources::Named(Vec::new());",
+       "            let Some(value) = text(&source.from_argument) else {\n                continue;")
 mutate("adapter-empty-identifier-accepted", "the empty string names a resource", RA,
-       "Some(Value::String(identifier)) if !identifier.is_empty() => {", "Some(Value::String(identifier)) => {")
+       "            Some(Value::String(text)) if !text.is_empty() => Some(text.as_str()),",
+       "            Some(Value::String(text)) => Some(text.as_str()),")
 mutate("adapter-not-an-object-accepted", "arguments that are not an object pass the check", RA,
        "        if !arguments.is_object() {", "        if false {")
 mutate("adapter-closed-without-properties-accepted", "a closed object without properties admits arguments", RA,
@@ -4010,8 +4026,8 @@ mutate("schema-required-repeat-loads", "a `required` list may name one property 
 mutate("schema-repeat-pointer-is-schema", "a repeated name is reported at the schema, not at its list", RA,
        '            "type" => names_types(value) && unique(value, &here)?,', '            "type" => names_types(value) && unique(value, at)?,')
 mutate("registry-schema-boolean-root-loads", "a root input schema of `true` or `false` loads", RR,
-       '    if tool.input_schema.get("type") != Some(&Value::String("object".into())) {',
-       '    if tool.input_schema.is_object() && tool.input_schema.get("type") != Some(&Value::String("object".into())) {')
+       '    if schema.get("type") != Some(&Value::String("object".into())) {',
+       '    if schema.is_object() && schema.get("type") != Some(&Value::String("object".into())) {')
 
 
 # --- audit-postgres ------------------------------------------------------------------------
@@ -5769,8 +5785,9 @@ mutate("gw-boot-registry-server-unconnected", "a registry server with no connect
 # (gw-boot-narrowing-config-path-skipped, beside the receipt-store gate's).
 mutate("gw-boot-narrowing-accepted", "boot::check_registry and a reload serve an entry narrowed per call or to the limit", BOOT,
        "    narrowing_gate(policy.snapshot())?;\n", "")
-mutate("gw-boot-narrowing-call-accepted", "an entry narrowed per call passes the narrowing gate", BOOT,
-       "        .find(|entry| entry.narrowing != Narrowing::None)", "        .find(|entry| entry.narrowing == Narrowing::Limit)")
+mutate("gw-boot-narrowing-call-accepted", "a proxied entry narrowed per call passes the narrowing gate", BOOT,
+       "        .find(|entry| entry.kind == EntryKind::Proxied && entry.narrowing != Narrowing::None)",
+       "        .find(|entry| entry.kind == EntryKind::Proxied && entry.narrowing == Narrowing::Limit)")
 mutate("gw-boot-registry-rule-issuer-unchecked", "a registry rule may name an untrusted issuer", BOOT,
        "            if !configured.contains(&rule.issuer) {", "            if false {")
 mutate("gw-boot-registry-reserved-profile", "a registry may define the reserved profile", BOOT,
@@ -6040,8 +6057,8 @@ RELEASE_BUILD_LINE = "    cargo build --release --locked -p gateway --bin switch
 mutate("release-build-test-support", "the image's switchboard is built with test-support", DOCKERFILE,
        RELEASE_BUILD_LINE, "    cargo build --release --locked -p gateway --bin switchboard --features gateway/test-support; \\\n")
 mutate("release-build-test-support-default", "test-support is a default feature of the gateway", "crates/gateway/Cargo.toml",
-       '[features]\ntest-support = ["connector-proxy/test-support"]\n',
-       '[features]\ndefault = ["test-support"]\ntest-support = ["connector-proxy/test-support"]\n')
+       '[features]\ntest-support = ["connector-github/loopback", "connector-proxy/test-support"]\n',
+       '[features]\ndefault = ["test-support"]\ntest-support = ["connector-github/loopback", "connector-proxy/test-support"]\n')
 mutate("release-build-workspace", "the image's switchboard is built with the workspace, taking its features", DOCKERFILE,
        RELEASE_BUILD_LINE, "    cargo build --release --locked --workspace --bins; \\\n")
 
@@ -6409,6 +6426,90 @@ mutate("custodian-socket-mode-open-accepted", "a socket mode giving others acces
 mutate("custodian-fake-jwt-unchecked", "the fake GitHub accepts any App JWT", KC + "fake.rs",
        "    if !bearer(&headers).is_some_and(|jwt| jwt_valid(&shared, jwt)) {",
        "    if bearer(&headers).is_none() {")
+
+# --- connector-github ----------------------------------------------------------------------
+# The GitHub connector refuses another organization before any request, asks the key custodian for
+# every token, narrowed as its entry says and with the revision its call was decided under, keeps
+# tokens out of what the caller reads, bounds and tags each result; and the gateway wires it from
+# the deployment file, behind its bound and quotas, and checks each approval against it (#12).
+# crates/gateway/tests/github.rs and github_logs.rs catch these, and the registry's built_in.rs
+# its loader's.
+
+GH = "crates/connector-github/src/"
+GHC = GH + "connector.rs"
+GHT = GH + "tools.rs"
+mutate("github-organization-check-removed", "a call naming another organization is sent", GHC,
+       "        if parsed.owner() != self.organization {", "        if false {")
+mutate("github-token-not-narrowed", "the token is asked for with no repositories, which GitHub reads as all", GHC,
+       "            repositories,\n            permissions: entry.permissions.clone(),",
+       "            repositories: Vec::new(),\n            permissions: entry.permissions.clone(),")
+mutate("github-limit-not-held-to-the-organization", "a token is asked for the limit's repositories of other organizations too", GHC,
+       "                    .filter(|identifier| identifier.starts_with(&prefix))", "")
+mutate("github-custodian-bypassed", "GitHub is sent a token the connector made up, not the custodian's", GHC,
+       "        self.read(&parsed, token.expose()).await", "        self.read(&parsed, request.team.as_str()).await")
+mutate("github-credential-in-error", "a vendor error names the token it was read with", GHC,
+       '                format!("GitHub answered HTTP {}", status.as_u16()),',
+       '                format!("GitHub answered HTTP {} to {token}", status.as_u16()),')
+mutate("github-file-bound-removed", "a file's text is not cut at 256 KiB", GHT,
+       "            let (kept, cut) = bounded(text, MAX_FILE_TEXT_BYTES);",
+       "            let (kept, cut) = (text, false);")
+mutate("github-comment-bound-removed", "every comment GitHub sends is kept", GHT,
+       "        .take(MAX_COMMENTS)\n", "")
+mutate("github-evidence-tag-dropped", "a result is not tagged as untrusted external evidence", GHT,
+       '        "trust": "untrusted-external",\n', "")
+mutate("github-revision-not-sent", "a token request carries no revision", GHC,
+       "            revision: call.policy_revision().clone(),",
+       '            revision: gateway_core::PolicyRevision::new(""),')
+mutate("core-caller-limit-not-carried", "an allowed call's decision carries no limit to narrow its token to",
+       "crates/gateway-core/src/decision.rs",
+       "                .is_some_and(|entry| entry.narrowing == Narrowing::Limit) =>",
+       "                .is_some_and(|entry| entry.narrowing == Narrowing::Limit && false) =>")
+mutate("registry-qualifier-ignored", "a qualified resource is named by its own argument alone",
+       "crates/gateway-registry/src/adapter.rs",
+       '                    Some(qualifier) => format!("{qualifier}/{value}"),',
+       "                    Some(_) => value.to_owned(),")
+mutate("registry-built-in-hash-unchecked", "a built-in tool's definition changed after approval loads",
+       "crates/gateway-registry/src/registry.rs",
+       "    if computed != tool.definition_sha256 {\n        return Err(RegistryError::DefinitionChanged {\n"
+       "            tool: name,\n            recorded: tool.definition_sha256,\n            computed,\n"
+       "        });\n    }\n    if binding != tool.binding_sha256 {",
+       "    if false {\n        return Err(RegistryError::DefinitionChanged {\n"
+       "            tool: name,\n            recorded: tool.definition_sha256,\n            computed,\n"
+       "        });\n    }\n    if binding != tool.binding_sha256 {")
+mutate("registry-built-in-binding-unchecked", "a built-in tool's approval loads after its entry changed",
+       "crates/gateway-registry/src/registry.rs",
+       "    if binding != tool.binding_sha256 {", "    if false {")
+mutate("registry-built-in-tool-unlisted-accepted", "a built-in tool loads on an entry that does not list it",
+       "crates/gateway-registry/src/registry.rs",
+       "    if !entry.tools.contains(&name) {", "    if false {")
+mutate("gateway-built-in-connector-unbounded", "a built-in connector runs without the in-process bound or quotas",
+       "crates/gateway/src/boot.rs",
+       "            connector: Arc::new(Bounded::new(\n                name.clone(),\n                connector,\n"
+       "                limits,\n                quotas,\n                in_process.clone(),\n            )),",
+       "            connector,")
+mutate("gateway-built-in-definition-unchecked", "a built-in approval of another definition than its connector's is served",
+       "crates/gateway/src/boot.rs",
+       "        if basis.built_in_definitions.get(tool) != approved {", "        if false {")
+mutate("gateway-narrowing-gate-refuses-built-in", "a built-in entry narrowed to the limit is refused as if proxied",
+       "crates/gateway/src/boot.rs",
+       "        .find(|entry| entry.kind == EntryKind::Proxied && entry.narrowing != Narrowing::None)",
+       "        .find(|entry| entry.narrowing != Narrowing::None)")
+mutate("gateway-wired-names-not-bounded", "[connectors.<name>] for a GitHub entry refuses the start as unknown",
+       "crates/gateway/src/start.rs",
+       "    in_process_bounds(&deployment.connectors, &github_entries)?;",
+       "    in_process_bounds(&deployment.connectors, &BTreeSet::new())?;")
+mutate("gateway-connector-limits-dropped", "the deployment file's [connectors.<name>] does not reach the bound",
+       "crates/gateway/src/start.rs",
+       "            wiring = wiring.in_process_limits(name.clone(), *limits);", "            let _ = limits;")
+mutate("gateway-github-quotas-dropped", "the deployment file's [limits] quotas do not reach the GitHub connector",
+       "crates/gateway/src/start.rs",
+       "    .quotas(deployment.limits.quotas);", ";")
+mutate("gateway-reload-connectors-uncompared", "a reload that changes a built-in entry under a new revision is served",
+       "crates/gateway/src/reload.rs",
+       "        if registry.connectors() != self.basis.registry.connectors() {", "        if false {")
+mutate("gateway-connectors-outside-the-policy", "an entry changed under the same revision is not a changed policy",
+       "crates/gateway/src/policy.rs",
+       "            connectors: registry.connectors().clone(),", "            connectors: BTreeMap::new(),")
 
 # --- Which tests can see a mutation ----------------------------------------------------------
 #
