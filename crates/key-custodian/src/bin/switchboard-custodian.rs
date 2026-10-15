@@ -4,8 +4,9 @@
 //! switchboard-custodian --config=FILE
 //! ```
 //!
-//! Reads the configuration file (see [`key_custodian::start`]), the App's private key and the
-//! registry file, binds the socket and serves token requests until interrupted or terminated.
+//! Reads the configuration file (see [`key_custodian::start`](mod@key_custodian::start)), the
+//! App's private key and the registry file, binds the socket and serves token requests until
+//! interrupted or terminated.
 //! The record, one JSON line per request, goes to standard output; logs go to standard error
 //! as JSON lines, and a refusal to start to standard error as plain text as well.
 //!

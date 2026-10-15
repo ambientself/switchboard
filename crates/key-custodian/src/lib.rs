@@ -9,7 +9,7 @@
 //! limits each team's rate, asks GitHub for a token narrowed to exactly what was asked for,
 //! limits the token's lifetime, and keeps its own record.
 //!
-//! - [`start`] reads the configuration, the key and the registry file, and serves the socket
+//! - [`start()`] reads the configuration, the key and the registry file, and serves the socket
 //!   ([`server`]). The binary is `switchboard-custodian`.
 //! - [`CustodianClient`] is the client. It is in this crate so that the GitHub connector can
 //!   depend on it; nothing in the client reads the key.
