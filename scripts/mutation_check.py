@@ -3671,7 +3671,7 @@ RD = REGISTRY + "src/definition.rs"
 
 for struct in ["RegistryFile", "ServerFile", "CredentialFile", "ReachTestFile", "ProbeFile", "ReachCheckFile",
                "ToolFile", "SourceFile", "SurfaceFile", "PrincipalIdFile", "ProfileFile", "RuleFile", "LimitsFile",
-               "ResourceFile"]:
+               "ResourceFile", "ConnectorFile"]:
     mutate(f"registry-unknown-field-{struct}", f"{struct} ignores fields it does not know", RF,
            f"#[serde(deny_unknown_fields)]\npub(crate) struct {struct} {{", f"pub(crate) struct {struct} {{")
 mutate("registry-currency-required-by-default", "a profile in a registry file requires currency whether or not it says so", RR,
@@ -3861,6 +3861,27 @@ mutate("registry-links-testkit", "the registry, and so the gateway, links the te
 mutate("registry-as-reach-still-refused", "a tool declared as its entry's reach is refused at load", RR,
        "        ResourcesFile::AsReach => (Vec::new(), Some(DeclaredFrom::Reach)),",
        "        ResourcesFile::AsReach => return Err(RegistryError::AdapterWithoutSources(name)),")
+
+# Built-in connector entries: each states a permission set and the tools it serves, for the key
+# custodian (#12).
+RB = REGISTRY + "src/builtin.rs"
+mutate("registry-connector-name-of-a-server", "a built-in entry may have a server's name", RB,
+       "        if servers.contains_key(&entry.name) || checked.contains_key(&entry.name) {",
+       "        if checked.contains_key(&entry.name) {")
+mutate("registry-connector-system-of-a-server", "a built-in entry may share a server's system", RB,
+       "            .find(|server| server.system == entry.system)", "            .find(|_| false)")
+mutate("registry-connector-without-permissions", "a built-in entry may state no permission", RB,
+       "        if entry.permissions.is_empty() {", "        if false {")
+mutate("registry-connector-permission-name-unchecked", "a built-in entry's permission names are not checked", RB,
+       "        if let Some(bad) = entry.permissions.keys().find(|name| !permission_name(name)) {",
+       "        if let Some(bad) = entry.permissions.keys().find(|_| false) {")
+mutate("registry-connector-without-tools", "a built-in entry may serve no tool", RB,
+       "        if entry.tools.is_empty() {", "        if false {")
+mutate("registry-connector-serves-proxied-tool", "a built-in entry may list a proxied tool", RB,
+       "            if proxied_tools.contains(tool) {", "            if false {")
+mutate("registry-connector-tool-on-two-entries", "a tool may be served by two built-in entries", RB,
+       "            if let Some(first) = served.insert(tool.clone(), entry.name.clone()) {",
+       "            if let Some(first) = served.insert(tool.clone(), entry.name.clone()).filter(|_| false) {")
 
 # --- gateway-registry: schema validation ---------------------------------------------------
 #
@@ -6266,6 +6287,62 @@ mutate("issuer-keys-provider-installed", "the TLS client reads the process defau
        "        .with_safe_default_protocol_versions()\n"
        "        .map_err(|_| SourceError::Tls(issuer.clone()))?\n",
        "    let _ = provider;\n    let mut config = ClientConfig::builder()\n")
+
+# --- key-custodian -------------------------------------------------------------------------
+# The custodian holds the GitHub App key, serves one UID, checks each token request against its own
+# copy of policy at the request's revision, limits each team's rate, narrows each token exactly,
+# limits its lifetime, and records every request without the token (#12).
+
+KC = "crates/key-custodian/src/"
+KS = KC + "server.rs"
+KP = KC + "policy.rs"
+KG = KC + "github.rs"
+KT = KC + "start.rs"
+mutate("custodian-peer-check-removed", "a peer of any UID is served", KS,
+       "        let answer = if uid != self.peer_uid {", "        let answer = if false {")
+mutate("custodian-repositories-not-narrowed", "GitHub is asked for a token without the repositories, so for all of them", KG,
+       '            "repositories": names,\n', "")
+mutate("custodian-widened-token-handed-out", "a token GitHub issued broader than asked is handed out", KG,
+       "        if let Some(widened) = widened {", "        if let Some(widened) = widened.filter(|_| false) {")
+mutate("custodian-permission-check-removed", "a request may ask for any permission", KP,
+       "            if stated.get(permission).is_none_or(|allowed| level > allowed) {",
+       "            if stated.get(permission).is_none_or(|allowed| level > allowed) && false {")
+mutate("custodian-permission-level-ignored", "a request may ask for a permission above its stated level", KP,
+       "            if stated.get(permission).is_none_or(|allowed| level > allowed) {",
+       "            if stated.get(permission).is_none() {")
+mutate("custodian-500-bound-removed", "a request may name more than 500 repositories", KP,
+       "        if request.repositories.len() > MAX_REPOSITORIES {", "        if false {")
+mutate("custodian-rate-limit-removed", "a team's requests are not limited", KS,
+       "        if !self.rate.take(&request.team, Instant::now()) {", "        if false {")
+mutate("custodian-token-logged", "the record line of an issued token holds the token", KS,
+       "                line.expires_at = Some(expires_at);\n",
+       "                line.expires_at = Some(expires_at);\n                line.tool = Some(issued.token.expose());\n")
+mutate("custodian-revision-ignored", "a request decided under another revision is checked as if current", KP,
+       "        if request.revision != self.revision {", "        if false {")
+mutate("custodian-outside-limit-accepted", "a repository outside the team's limit may be asked for", KP,
+       "            if !limit.contains(repository) {", "            if false {")
+mutate("custodian-other-account-accepted", "a repository on another account may be asked for", KP,
+       "            if owner != account {", "            if false {")
+mutate("custodian-no-repositories-accepted", "a request may name no repository, which GitHub reads as all", KP,
+       "        if request.repositories.is_empty() {", "        if false {")
+mutate("custodian-no-permissions-accepted", "a request may name no permission, which GitHub reads as all", KP,
+       "        if request.permissions.is_empty() {", "        if false {")
+mutate("custodian-malformed-accepted", "a malformed request is checked as if well formed", KS,
+       "        if let Some(problem) = request.malformed() {", "        if let Some(problem) = None::<String> {")
+mutate("custodian-lifetime-not-capped", "a token is handed out until GitHub's expiry, not its lifetime", KS,
+       "                let expires_at = issued.expires_at.min(now + self.lifetime.as_secs());",
+       "                let expires_at = issued.expires_at.min(now + 3600);")
+mutate("custodian-not-revoked-at-lifetime", "a token is not revoked when its lifetime ends", KS,
+       "                    self.clone().revoke_at(issued.token.clone(), expires_at);",
+       "                    let _ = &issued.token;")
+mutate("custodian-key-file-open-accepted", "a key file its group or others can read is accepted", KT,
+       "    if mode & 0o077 != 0 {", "    if false {")
+mutate("custodian-socket-mode-open-accepted", "a socket mode giving others access is accepted", KT,
+       "        if self.socket_mode & 0o007 != 0 || self.socket_mode > 0o777 {",
+       "        if self.socket_mode > 0o777 {")
+mutate("custodian-fake-jwt-unchecked", "the fake GitHub accepts any App JWT", KC + "fake.rs",
+       "    if !bearer(&headers).is_some_and(|jwt| jwt_valid(&shared, jwt)) {",
+       "    if bearer(&headers).is_none() {")
 
 # --- Which tests can see a mutation ----------------------------------------------------------
 #
