@@ -16,8 +16,9 @@
 //!   grant's [`GrantDigest`]: nothing from the claims.
 //! - [`resolver`] is the client for Otto's resolver interface (decision 0003) and its currency
 //!   question (decision 0012), with a budget of one second, no cache, a bounded answer, and
-//!   every failure unconfirmed. The interface is proposed in `docs/resolver-interface.md`. It
-//!   is not on the request path yet either.
+//!   every failure unconfirmed. The interface is proposed in `docs/resolver-interface.md`. The
+//!   gateway asks it before deciding a side-effecting call under a profile that requires
+//!   currency.
 //! - `minter`, with the `test-support` feature, signs grants for tests, and `fake` serves a
 //!   fake resolver.
 

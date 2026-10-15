@@ -69,7 +69,23 @@ impl Server {
         Self::start_from(Timeouts::default(), configure).await
     }
 
+    /// [`start_configured`](Self::start_configured), with the wiring changed by `wire` too.
+    pub async fn start_wired(
+        configure: impl FnOnce(&mut Value),
+        wire: impl FnOnce(Wiring) -> Wiring,
+    ) -> Self {
+        Self::start_from_wired(Timeouts::default(), configure, wire).await
+    }
+
     async fn start_from(timeouts: Timeouts, configure: impl FnOnce(&mut Value)) -> Self {
+        Self::start_from_wired(timeouts, configure, |wiring| wiring).await
+    }
+
+    async fn start_from_wired(
+        timeouts: Timeouts,
+        configure: impl FnOnce(&mut Value),
+        wire: impl FnOnce(Wiring) -> Wiring,
+    ) -> Self {
         let fixture = Fixture::new().unwrap();
         let credentials = Arc::new(FakeCredentialSource::new());
         let connector = Arc::new(FixtureConnector::new(credentials.clone()));
@@ -85,7 +101,7 @@ impl Server {
             wiring = wiring.audit_store(store.clone());
         }
         let config: Config = serde_json::from_value(config_value).unwrap();
-        let gates = boot::check(config, wiring).unwrap();
+        let gates = boot::check(config, wire(wiring)).unwrap();
         let grant_signals = gates.grant_signals();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

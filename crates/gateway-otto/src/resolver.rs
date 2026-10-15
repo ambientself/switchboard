@@ -12,7 +12,8 @@
 //!
 //! - **A budget of one second** ([`BUDGET`]) over the whole exchange: reading the token,
 //!   connecting, the TLS handshake, the response head and the last byte of the body. It is
-//!   fixed by decision 0012, so it is not configured.
+//!   fixed by decision 0012, so it is not configured. The token is read on the runtime's
+//!   blocking pool, so a read that blocks cannot hold the question past the budget.
 //! - **A cap on the answer**, [`MAX_ANSWER_BYTES`], enforced from the declared length if there
 //!   is one and otherwise as the body arrives, so an oversized answer is never read in full.
 //! - **No cache.** Every question is sent, and every answer is read from its own response.
@@ -455,7 +456,7 @@ impl HttpResolver {
     async fn exchange(&self, question: &CurrencyQuestion) -> Result<Answer, ResolverFailure> {
         // Read on every question, never kept: the file may have been rotated since the last.
         let authorization = match &self.token_file {
-            Some(path) => Some(bearer(path).map_err(|_| ResolverFailure::Token)?),
+            Some(path) => Some(read_token(path.clone()).await?),
             None => None,
         };
         let request_id = request_id()?;
@@ -666,6 +667,18 @@ fn trusted(path: &Path) -> Result<RootCertStore, CaFault> {
         return Err(CaFault::NoCertificate);
     }
     Ok(roots)
+}
+
+/// The token in `path`, read on a thread of the runtime's blocking pool rather than the thread
+/// asking. A read that blocks, such as of a FIFO no writer has opened or of a file system that
+/// has stopped answering, then holds that pool thread and not a runtime thread, so the budget
+/// still ends the question: it is unconfirmed at the budget, and the read is left to finish on
+/// its own (#213).
+async fn read_token(path: PathBuf) -> Result<HeaderValue, ResolverFailure> {
+    tokio::task::spawn_blocking(move || bearer(&path))
+        .await
+        .map_err(|_| ResolverFailure::Token)?
+        .map_err(|_| ResolverFailure::Token)
 }
 
 /// The token in `path` as an `Authorization: Bearer` value, marked sensitive. Whitespace around

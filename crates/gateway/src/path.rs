@@ -32,8 +32,9 @@
 //!   sentence and lists nothing. The answer names the row in its `_meta`, unless audit is
 //!   disabled.
 //! - `tools/call` reads the call's resources through the adapter registered for the approved
-//!   tool's connector, decides, writes the row, runs the tool if allowed, completes the row and
-//!   answers. A denial is answered with the sentence the row holds. The answer names the row
+//!   tool's connector, asks Otto's resolver whether the call's turn is current when decision
+//!   0012 says to ([`crate::currency`]), decides, writes the row, runs the tool if allowed,
+//!   completes the row and answers. `tools/list` never asks. A denial is answered with the sentence the row holds. The answer names the row
 //!   it wrote, in the result's `_meta` or in `error.data` (decision 0009), so a person can
 //!   quote it; see [`gateway_mcp::render_with_row`]. It names none when begin failed or audit
 //!   is disabled, because then no row was written under that identifier.
@@ -91,15 +92,17 @@ use std::time::{Duration, Instant, SystemTime};
 
 use gateway_core::audit::{self, Answer, AuditRowId, Begun, RequestMetadata, RowStart};
 use gateway_core::{
-    ApprovedTool, CallContext, CallerContext, Classification, Connector, Currency, Decision,
-    DeclaredFrom, IDENTITY_FAILURE, IdempotencyKey, MAX_IDEMPOTENCY_KEY, Principal, Proved,
-    RequestedTool, Resources, Reuse, SurfaceName, ToolUseId, VendorReference, decide, list_tools,
+    ApprovedTool, CallContext, CallerContext, Classification, Connector, Currency, CurrencyAnswer,
+    Decision, DeclaredFrom, IDENTITY_FAILURE, IdempotencyKey, MAX_IDEMPOTENCY_KEY, PolicySnapshot,
+    Principal, Proved, RequestedTool, Resources, Reuse, SurfaceName, ToolUseId, VendorReference,
+    decide, list_tools,
 };
 use gateway_identity::{Clock, Verification};
 use gateway_mcp::{
     Call, CarriedKey, HttpResponse, IDEMPOTENCY_KEY_HEADER, IDEMPOTENCY_KEY_META, Inbound,
     Rejection, Reply, Request, ServerInfo, ToolCall, ToolEntry,
 };
+use gateway_otto::Resolver;
 use http::header::AUTHORIZATION;
 use http::{HeaderMap, Method};
 use serde_json::Value;
@@ -108,6 +111,7 @@ use uuid::Uuid;
 
 use crate::boot::{DEFAULT_CALL_DEADLINE, GateState, Gates, Reads, Results};
 use crate::catalog::ToolDefinition;
+use crate::currency;
 use crate::grants::{GrantRequest, PresentedGrant};
 use crate::policy::ServedPolicy;
 use crate::proxied::{CheckedArguments, registry_resources};
@@ -650,14 +654,15 @@ impl RequestPath {
             key_header.honoured(declares_header),
             tool_use_id.as_ref(),
         );
+        let asking = Instant::now();
+        let currency = self.currency(snapshot, &caller, &requested).await;
+        let currency_us = micros(asking.elapsed());
         let context = CallContext {
             caller,
             tool: requested,
             resources,
             key,
-            // Nothing asks a control plane yet: the Otto adapter's resolver client comes with
-            // its wiring (#22). No profile in a registry requires currency until then.
-            currency: Currency::NotAsked,
+            currency,
         };
         let decided = Instant::now();
         let decision = decide(snapshot, &context);
@@ -697,6 +702,8 @@ impl RequestPath {
                 tracing::info!(
                     row = refusal.row().as_str(),
                     reason = ?refusal.reason().kind(),
+                    currency = currency.answer().map(CurrencyAnswer::as_str),
+                    currency_us,
                     decide_us,
                     begin_us,
                     "denied a tool call"
@@ -802,6 +809,8 @@ impl RequestPath {
             %tool,
             outcome = outcome_name(finished.answer()),
             latency_ms,
+            currency = currency.answer().map(CurrencyAnswer::as_str),
+            currency_us,
             decide_us,
             begin_us,
             run_us,
@@ -817,6 +826,32 @@ impl RequestPath {
             Answer::AuditFailed { sentence } => self.audit_failed(sentence),
         };
         (reply, named)
+    }
+
+    /// Decision 0012's currency question for a call of `requested` from `caller`, decided from
+    /// `snapshot`: asked once of Otto's resolver when [`currency::question`] gives one, and
+    /// otherwise not asked. Every failure of the resolver is unconfirmed, at most its budget of
+    /// one second after asking. Nothing is cached.
+    async fn currency(
+        &self,
+        snapshot: &PolicySnapshot,
+        caller: &CallerContext,
+        requested: &RequestedTool,
+    ) -> Currency {
+        let Some(question) = currency::question(snapshot, caller, requested) else {
+            return Currency::NotAsked;
+        };
+        let Some(resolver) = self.inner.gates.resolver() else {
+            // The boot gates and every reload refuse a profile requiring currency with no
+            // resolver, so this is a fault in the gateway. The call is denied as unconfirmed.
+            tracing::error!(
+                profile = %caller.profile,
+                "a call needs its turn's currency, but no resolver is configured"
+            );
+            return Currency::NotAsked;
+        };
+        let answer = resolver.currency(&question).await;
+        Currency::Asked(answer)
     }
 
     /// The row to name in the answer: `row`, unless audit is disabled. The disabled store

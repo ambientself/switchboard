@@ -828,3 +828,46 @@ fn the_grants_table_is_refused_as_it_loads() {
     let issuer = &no_end.grants.enforce.unwrap().issuers[0];
     assert_eq!(issuer.previous_key.as_ref().unwrap().retires_at, None);
 }
+
+const RESOLVER: &str = r#"[resolver]
+url = "https://otto-resolver.otto.svc:8443"
+ca_file = "otto-resolver-ca.pem"
+token_file = "/var/run/secrets/otto-resolver/token"
+"#;
+
+/// Writes a deployment file whose audit is disabled and whose `[resolver]` table is `resolver`
+/// among `files`, and loads it.
+fn with_resolver(files: &Files, resolver: &str) -> Result<gateway::Deployment, DeploymentError> {
+    files.write(
+        "gateway.toml",
+        &deployment_file(&format!("[audit]\nmode = \"disabled\"\n\n{resolver}\n")),
+    );
+    files.load_with(&[])
+}
+
+/// The `[resolver]` table names Otto's resolver (decision 0012, "Currency"): its URL, and its
+/// CA and token files from the deployment file's directory. Loading reads neither file, and
+/// the URL is never printed. Left out, there is no resolver; a field it does not know is
+/// refused.
+#[test]
+fn the_resolver_table_reads_its_files_from_the_deployment_files_directory() {
+    let written = files("resolver");
+    let loaded = with_resolver(&written, RESOLVER).unwrap();
+    let resolver = loaded.resolver.clone().expect("a resolver");
+    assert_eq!(resolver.url, "https://otto-resolver.otto.svc:8443");
+    assert_eq!(resolver.ca_file, Some(written.path("otto-resolver-ca.pem")));
+    assert_eq!(
+        resolver.token_file.as_deref(),
+        Some(Path::new("/var/run/secrets/otto-resolver/token"))
+    );
+    assert!(!format!("{loaded:?}").contains("otto-resolver.otto.svc"));
+
+    assert_eq!(files("resolver-left-out").load().resolver, None);
+    let unknown = with_resolver(
+        &files("resolver-unknown"),
+        &RESOLVER.replace("[resolver]\n", "[resolver]\ncache_seconds = 5\n"),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(unknown.contains("cache_seconds"), "{unknown}");
+}

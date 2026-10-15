@@ -15,7 +15,8 @@ use gateway_core::{
 };
 use gateway_otto::fake::{FakeReply, FakeResolver, Member};
 use gateway_otto::resolver::{
-    Answer, BUDGET, CaFault, MAX_ANSWER_BYTES, ResolverConfigError, ResolverCounts, TokenFault,
+    Answer, BUDGET, CaFault, MAX_ANSWER_BYTES, MAX_TOKEN_BYTES, ResolverConfigError,
+    ResolverCounts, TokenFault,
 };
 use gateway_otto::{CurrencyQuestion, HttpResolver, Resolver, ResolverConfig, ResolverFailure};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
@@ -518,6 +519,63 @@ async fn over_tls_the_token_is_sent_and_read_again_for_each_question() {
     std::fs::write(&token, "").unwrap();
     assert_eq!(ask(&resolver).await, Err(ResolverFailure::Token));
     assert_eq!(fake.received().len(), 2);
+}
+
+/// A token file whose read blocks, here a FIFO no writer has opened, does not hold the question
+/// past the budget: it is unconfirmed at the budget, as a timeout, and nothing is sent (#213).
+/// The read is made on the blocking pool; made on the thread asking, it would hold the budget's
+/// own timer, and the question would end only when the stall did.
+#[tokio::test]
+async fn a_token_read_that_blocks_is_unconfirmed_at_the_budget() {
+    let scratch = Scratch::new("fifo");
+    let ca = TestCa::new();
+    let fake = FakeResolver::start_tls(
+        ca.server_config(&["127.0.0.1"]),
+        FakeReply::Answer(Answer::Current),
+    )
+    .await
+    .unwrap();
+    // A file at first: the client reads it when it is built.
+    let token = scratch.write("token", "first-token\n");
+    let resolver = HttpResolver::new(&ResolverConfig {
+        url: fake.url(),
+        ca_file: Some(ca.file(&scratch)),
+        token_file: Some(token.clone()),
+    })
+    .unwrap();
+    let unblock = stall(&token);
+    let started = Instant::now();
+    let asked = ask(&resolver).await;
+    let took = started.elapsed();
+    unblock.join().unwrap();
+    assert_eq!(asked, Err(ResolverFailure::Timeout), "after {took:?}");
+    assert!(took >= BUDGET, "gave up after {took:?}");
+    assert!(took < BUDGET + SLACK, "took {took:?}");
+    assert!(fake.received().is_empty());
+    assert_eq!(resolver.counts().timeouts(), 1);
+}
+
+/// Replaces the file at `path` with a FIFO no writer has opened, so reading it blocks, and
+/// starts a thread that opens it for writing once a question should long have ended, and
+/// writes more than a token may hold. That lets the stalled read finish, refused as too large,
+/// so the runtime can shut down; with the read on the thread asking, it is also what ends the
+/// question, late. The read ends on the bytes, not on the writer closing: a reader whose open
+/// returns only as the writer closes may wait on for a writer.
+fn stall(path: &std::path::Path) -> std::thread::JoinHandle<()> {
+    use std::io::Write;
+
+    std::fs::remove_file(path).unwrap();
+    let made = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(made.success(), "mkfifo failed: {made}");
+    let path = path.to_owned();
+    std::thread::spawn(move || {
+        std::thread::sleep(BUDGET + SLACK);
+        let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let _ = writer.write_all(&[b't'; 2 * MAX_TOKEN_BYTES as usize]);
+    })
 }
 
 #[tokio::test]

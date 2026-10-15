@@ -85,6 +85,16 @@
 //!   configured key, written only when a key is configured. A request with the grant header
 //!   more than once counts as `malformed`.
 //!
+//! - With Otto's resolver configured, from its client's counts (decision 0012, "Currency"):
+//!   `switchboard_resolver_answers_total{answer}`, each question by its answer, `answer` one of
+//!   `current`, `superseded`, `ended`, `revoked` and `unconfirmed`, every failure counted as
+//!   `unconfirmed`; `switchboard_resolver_failures_total{kind}`, each failure by its kind, one
+//!   of `token`, `not_sent`, `timeout`, `unreachable`, `status`, `too_large`, `broken_off`,
+//!   `malformed`, `unknown_version` and `other_question`; and
+//!   `switchboard_resolver_question_seconds`, a histogram of how long each question took,
+//!   failures included, with the audit store's buckets. Each answer and kind is written from
+//!   zero.
+//!
 //! - With an issuer whose keys are fetched from a keys URL, from [`KeyAges`]:
 //!   `switchboard_issuer_keys_age_seconds{issuer}`, the seconds since that issuer's keys were
 //!   last fetched and put in force (see [`crate::keys`]). `issuer` is the issuer as the
@@ -133,7 +143,9 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::response::Response;
 use axum::routing::get;
-use gateway_core::{ConnectorName, Issuer};
+use gateway_core::{ConnectorName, CurrencyAnswer, Issuer};
+use gateway_otto::resolver::ResolverCounts;
+use gateway_otto::{HttpResolver, ResolverFailure};
 use http::HeaderValue;
 use http::header::CONTENT_TYPE;
 use hyper::server::conn::http1;
@@ -173,6 +185,7 @@ pub struct Metrics {
     drift: Option<DriftSignals>,
     reconciliation: Option<ReconcileSignals>,
     grants: Option<GrantSignals>,
+    resolver: Option<Arc<HttpResolver>>,
 }
 
 impl std::fmt::Debug for Metrics {
@@ -186,6 +199,7 @@ impl std::fmt::Debug for Metrics {
             .field("drift", &self.drift)
             .field("reconciliation", &self.reconciliation)
             .field("grants", &self.grants)
+            .field("resolver", &self.resolver.is_some())
             .finish()
     }
 }
@@ -221,7 +235,15 @@ impl Metrics {
             drift: None,
             reconciliation: None,
             grants: None,
+            resolver: None,
         }
+    }
+
+    /// The same metrics, with what Otto's resolver client counts, which
+    /// [`Gates::resolver`](crate::Gates::resolver) gives when one is configured.
+    pub fn with_resolver(mut self, resolver: Arc<HttpResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
     }
 
     /// The same metrics, with what the turn-grant gate counts, which
@@ -282,6 +304,9 @@ impl Metrics {
         issuer_key_signals(&mut text, &self.issuer_keys.ages());
         if let Some(grants) = &self.grants {
             grant_signals(&mut text, &grants.counts());
+        }
+        if let Some(resolver) = &self.resolver {
+            resolver_signals(&mut text, &resolver.counts());
         }
         if let Some(audit) = &self.audit {
             let open = *audit.open.lock().unwrap_or_else(PoisonError::into_inner);
@@ -705,6 +730,44 @@ fn grant_signals(text: &mut Text, counts: &GrantCounts) {
     }
 }
 
+fn resolver_signals(text: &mut Text, counts: &ResolverCounts) {
+    text.family(
+        "switchboard_resolver_answers_total",
+        "counter",
+        "Questions to Otto's resolver about a turn's currency, by answer (decision 0012). Every \
+         failure is unconfirmed, and denies the call it was asked for.",
+    );
+    for answer in CurrencyAnswer::ALL {
+        text.sample(
+            "switchboard_resolver_answers_total",
+            &[("answer", answer.as_str())],
+            counts.answered(answer),
+        );
+    }
+    text.family(
+        "switchboard_resolver_failures_total",
+        "counter",
+        "Questions to Otto's resolver that had no answer, by why: each is unconfirmed.",
+    );
+    for kind in ResolverFailure::LABELS {
+        text.sample(
+            "switchboard_resolver_failures_total",
+            &[("kind", kind)],
+            counts.failed(kind),
+        );
+    }
+    text.histogram(
+        "switchboard_resolver_question_seconds",
+        "How long each question to Otto's resolver took, failures included; none takes much \
+         longer than its budget of one second.",
+        &LatencyHistogram {
+            buckets: counts.latency_buckets,
+            count: counts.latency_count,
+            sum: counts.latency_sum,
+        },
+    );
+}
+
 fn audit_signals(text: &mut Text, signals: &AuditSignals) {
     let stats = &signals.stats;
     let failures = &stats.begin_failures;
@@ -961,6 +1024,51 @@ mod tests {
 
     fn lines(text: &str) -> Vec<&str> {
         text.lines().filter(|line| !line.starts_with('#')).collect()
+    }
+
+    /// The resolver client buckets its latencies by bounds of its own, which the metrics write
+    /// as the audit store's: they must be the same bounds.
+    #[test]
+    fn the_resolvers_latency_bounds_are_the_audit_stores() {
+        assert_eq!(gateway_otto::resolver::LATENCY_BOUNDS_MS, LATENCY_BOUNDS_MS);
+        assert_eq!(gateway_otto::resolver::LATENCY_BUCKETS, LATENCY_BUCKETS);
+    }
+
+    /// The resolver's counts are written with every answer and kind of failure from zero, and
+    /// its latencies as a histogram.
+    #[test]
+    fn the_resolvers_counts_are_written() {
+        let mut latency_buckets = [0; LATENCY_BUCKETS];
+        latency_buckets[1] = 2;
+        latency_buckets[7] = 1;
+        let counts = ResolverCounts {
+            answers: [2, 0, 0, 0, 1],
+            failures: [0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+            latency_buckets,
+            latency_count: 3,
+            latency_sum: Duration::from_millis(1_016),
+        };
+        let mut text = Text::default();
+        resolver_signals(&mut text, &counts);
+        let lines = lines(&text.0);
+        for expected in [
+            "switchboard_resolver_answers_total{answer=\"current\"} 2",
+            "switchboard_resolver_answers_total{answer=\"revoked\"} 0",
+            "switchboard_resolver_answers_total{answer=\"unconfirmed\"} 1",
+            "switchboard_resolver_failures_total{kind=\"timeout\"} 1",
+            "switchboard_resolver_failures_total{kind=\"other_question\"} 0",
+            "switchboard_resolver_question_seconds_bucket{le=\"0.01\"} 2",
+            "switchboard_resolver_question_seconds_bucket{le=\"1\"} 3",
+            "switchboard_resolver_question_seconds_bucket{le=\"+Inf\"} 3",
+            "switchboard_resolver_question_seconds_sum 1.016",
+            "switchboard_resolver_question_seconds_count 3",
+        ] {
+            assert!(lines.contains(&expected), "{expected} not in {lines:#?}");
+        }
+        assert!(
+            text.0
+                .contains("# TYPE switchboard_resolver_question_seconds histogram\n")
+        );
     }
 
     #[test]

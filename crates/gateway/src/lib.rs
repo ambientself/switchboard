@@ -18,7 +18,9 @@
 //!   of audit.
 //! - [`RequestPath`] is design section 6's request path over the [`Gates`]: identity, the MCP
 //!   adapter, profile selection, the decision, the audit row and the connector, from a
-//!   request's method, headers and body to its HTTP response.
+//!   request's method, headers and body to its HTTP response. Turn grants are verified on it
+//!   ([`grants`]), and a side-effecting call under a profile that requires currency asks Otto's
+//!   resolver whether its turn is current ([`currency`]).
 //! - [`serve`] is the HTTP endpoint, `POST /mcp/{surface}`, over a listener and the [`Gates`]:
 //!   the host and origin checks, the body limit, time limits on a request's head and body, and
 //!   a task per answer, so a client that disconnects cannot cut a tool call off from its audit
@@ -73,6 +75,7 @@ pub mod boot;
 pub mod bulkhead;
 mod catalog;
 mod config;
+pub mod currency;
 pub mod deployment;
 pub mod drift;
 pub mod grants;
@@ -100,6 +103,7 @@ pub use catalog::{CatalogError, ToolCatalog, ToolDefinition};
 pub use config::{
     Algorithm, AuditSection, Config, HttpSection, IdentitySection, IssuerEntry, IssuerKindEntry,
 };
+pub use currency::ResolverSection;
 pub use deployment::{
     AuditChoice, DEFAULT_MAX_AGE, DEFAULT_MAX_IN_FLIGHT, DEFAULT_PER_SERVER_IN_FLIGHT,
     DEFAULT_PER_TEAM_PER_SERVER_IN_FLIGHT, Deployment, DeploymentError, KeysUrl, Limits,

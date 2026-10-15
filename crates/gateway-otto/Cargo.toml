@@ -32,15 +32,16 @@ serde_json = "1"
 # The key ID and the grant's digest.
 sha2 = "0.10"
 thiserror = "2"
-# The resolver's budget. The fake resolver adds a listener.
-tokio = { version = "1", features = ["time"] }
+# The resolver's budget, and the blocking pool its token file is read on. The fake resolver
+# adds a listener.
+tokio = { version = "1", features = ["rt", "time"] }
 # Only for the fake resolver's TLS listener.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
 
 # `test-support` adds the test minter, which signs grants with keys it generates, and the fake
 # resolver, a local HTTP server. The gateway's own build never turns it on.
 [features]
-test-support = ["dep:tokio-rustls", "tokio/io-util", "tokio/net", "tokio/rt"]
+test-support = ["dep:tokio-rustls", "tokio/io-util", "tokio/net"]
 
 [dev-dependencies]
 gateway-otto = { path = ".", features = ["test-support"] }

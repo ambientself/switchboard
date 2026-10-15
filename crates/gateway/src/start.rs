@@ -48,6 +48,12 @@
 //!
 //! It logs a boot line for the caps on calls in flight, and one for each server's bounds.
 //!
+//! When the deployment file has a `[resolver]` table, it builds the client for Otto's resolver
+//! interface from it, before connecting to anything, and refuses to start if the client
+//! refuses the table: a URL it cannot use, or a CA or token file that cannot be read. The boot
+//! gates then refuse a profile that requires currency without one ([`crate::currency`]). It
+//! logs a boot line saying whether a resolver is configured.
+//!
 //! Last, before it returns, it runs the drift pass's first pass ([`crate::drift`]): it reads
 //! every proxied server's tool list, each within its call deadline, and withdraws each approved
 //! tool the server no longer serves as approved. The binary binds its listener only after, so a
@@ -72,6 +78,8 @@ use connector_proxy::{
 };
 use gateway_core::{ConnectorName, CredentialMode, InstanceName, Issuer};
 use gateway_identity::Clock;
+use gateway_otto::HttpResolver;
+use gateway_otto::resolver::ResolverConfigError;
 use gateway_registry::{Destination, Registry, RegistryError};
 use issuer_keys::{FetchError, FetchOptions, KeySource, SourceError, SourceFiles};
 use thiserror::Error;
@@ -230,6 +238,9 @@ pub enum StartError {
     /// A boot gate refused.
     #[error(transparent)]
     Boot(#[from] BootError),
+    /// The `[resolver]` table names a resolver the client cannot use.
+    #[error(transparent)]
+    Resolver(#[from] ResolverConfigError),
 }
 
 /// A gateway that passed every check, ready to serve.
@@ -371,6 +382,11 @@ async fn prepare_with(
         Wiring::new(clock),
     )?;
     let mut wiring = wiring.instance(instance.clone());
+    // Otto's resolver, before a key is fetched or the audit store connected: its URL is
+    // checked, and its files read, as the client is built.
+    if let Some(section) = &deployment.resolver {
+        wiring = wiring.resolver(Arc::new(HttpResolver::new(&section.config())?));
+    }
 
     let mut identity = deployment.identity;
     let fetched = fetch_keys(&deployment.keys_urls, &mut identity).await?;
@@ -460,6 +476,24 @@ async fn prepare_with(
             event = "boot",
             grants = "disabled",
             "turn-grant checking is disabled"
+        ),
+    }
+    match &deployment.resolver {
+        Some(section) => tracing::info!(
+            event = "boot",
+            resolver = "configured",
+            resolver_ca_file = section
+                .ca_file
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            resolver_token_file = section.token_file.is_some(),
+            "a side-effecting call under a profile that requires currency asks Otto's resolver \
+             whether its turn is current, within one second"
+        ),
+        None => tracing::info!(
+            event = "boot",
+            resolver = "none",
+            "no resolver: the deployment file has no [resolver], and no profile requires currency"
         ),
     }
     let limits = deployment.limits;
@@ -1350,6 +1384,7 @@ mod tests {
             audit,
             audit_pools: PoolSizes::default(),
             grants: Default::default(),
+            resolver: None,
             metrics: None,
             limits: Limits::default(),
             servers: BTreeMap::new(),
@@ -1529,6 +1564,41 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
         assert!(
             matches!(refused, StartError::Boot(BootError::GrantOptOut)),
+            "{refused}"
+        );
+        assert_eq!(counted.connections(), 0, "something was connected to first");
+    }
+
+    /// Decision 0012, "Currency": a `[resolver]` table the client refuses, here plain `http` to
+    /// an address that is not loopback, refuses to start before a key is fetched or the audit
+    /// store connected. Started as a development build, which reaches the registry's server on
+    /// loopback.
+    #[tokio::test]
+    async fn a_resolver_the_client_refuses_is_refused_before_anything_is_connected() {
+        let counted = Counted::start().await;
+        let text = crate::boot::tests::registry_text("read", true, "r1");
+        let directory =
+            std::env::temp_dir().join(format!("switchboard-start-resolver-{}", std::process::id()));
+        let mut started = deployment(&directory, &text, &counted, false, false);
+        started.resolver = Some(crate::currency::ResolverSection {
+            url: "http://10.0.0.1:8080".into(),
+            ..Default::default()
+        });
+        let refused = prepare_with(
+            started,
+            InstanceName::new("start-test"),
+            Arc::new(gateway_identity::SystemClock),
+            true,
+        )
+        .await
+        .err()
+        .unwrap();
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(
+            matches!(
+                refused,
+                StartError::Resolver(ResolverConfigError::PlainHttp)
+            ),
             "{refused}"
         );
         assert_eq!(counted.connections(), 0, "something was connected to first");

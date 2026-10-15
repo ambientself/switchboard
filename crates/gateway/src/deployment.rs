@@ -63,6 +63,11 @@
 //! key_file = "otto-prod-previous.pem"
 //! retires_at = 2026-11-01T00:00:00Z
 //!
+//! [resolver]                  # optional while no profile requires currency
+//! url = "https://otto-resolver.otto.svc:8443"
+//! ca_file = "otto-resolver-ca.pem"                # needed for https; the only CAs trusted
+//! token_file = "/var/run/secrets/otto-resolver/token"  # read again for every question
+//!
 //! [metrics]                   # optional; left out, nothing serves metrics
 //! listen = "0.0.0.0:9090"
 //!
@@ -155,6 +160,19 @@
 //!   when it reloads, if a tool not classified `read` is served on a surface whose allowlist
 //!   admits a team that a rule gives a profile requiring a delegation while an issuer does not
 //!   require `pod`.
+//! - **Otto's resolver** (decision 0012, "Currency") is the `[resolver]` table (see
+//!   [`crate::currency`]): the base URL of Otto's resolver interface (`docs/resolver-interface.md`),
+//!   `ca_file`, the PEM bundle of the only CAs its certificate may chain to, and `token_file`,
+//!   the bearer token the gateway presents, a projected ServiceAccount token whose audience is
+//!   the resolver. The URL is `https`, which needs `ca_file`, or plain `http` to a loopback
+//!   address, which takes neither file; a URL with a user name, a password or a query is
+//!   refused. Both files are read when the gateway starts, and the token again for every
+//!   question, so a token the kubelet rotates in place is the one sent. A call is asked about
+//!   only when it is a `tools/call` of a tool not classified `read`, under a profile that
+//!   requires currency, with a verified turn grant; every question has one second, and one
+//!   that fails denies the call. The table is optional while no profile a rule selects requires
+//!   currency; the gateway refuses to start without it once one does, and refuses a registry
+//!   version that makes one do so while it runs.
 //! - **Credentials** map each registry server's credential reference to the file holding it.
 //!   Every server's reference must be here, and nothing else may be.
 //! - **Metrics** are served in Prometheus text at `GET /metrics` on a listener of their own
@@ -216,7 +234,7 @@
 //! Every table refuses fields it does not know. Only `listen`, `registry.max_age_seconds`, the
 //! audit pools, the limits, each server's bounds, the drift interval and the reconciliation
 //! settings have defaults, so a gateway not told where to listen is reachable from its own
-//! machine only. `[metrics]`, `[grants]`, each
+//! machine only. `[metrics]`, `[grants]`, `[resolver]`, each
 //! server's CA file and the reach settings may be left out, each under the rules above. Any
 //! other missing field is an error, and so is a field that does not belong to the chosen mode
 //! or kind, such as `subjects_file` on a user issuer.
@@ -235,6 +253,7 @@ use thiserror::Error;
 use crate::config::{
     Algorithm, AuditSection, HttpSection, IdentitySection, IssuerEntry, IssuerKindEntry,
 };
+use crate::currency::ResolverSection;
 use crate::drift::{DriftError, DriftSection};
 use crate::grants::{GrantsFile, GrantsFileError, GrantsSection};
 use crate::keys::{DEFAULT_KEYS_REFRESH, MIN_KEYS_REFRESH};
@@ -302,6 +321,9 @@ pub struct DeploymentFile {
     /// Whether and how turn grants are verified, if the table is given.
     #[serde(default)]
     pub grants: Option<GrantsFile>,
+    /// Otto's resolver interface, if the table is given.
+    #[serde(default)]
+    pub resolver: Option<ResolverSection>,
     /// Where metrics are served, if anywhere.
     #[serde(default)]
     pub metrics: Option<MetricsSection>,
@@ -740,6 +762,9 @@ pub struct Deployment {
     /// The turn-grant gate, with each issuer's key files and the tool mapping read. Checking on
     /// with no issuer when the file has no `[grants]` table.
     pub grants: GrantsSection,
+    /// Otto's resolver interface, with its files from the deployment file's directory, or
+    /// `None` when the file has no `[resolver]` table.
+    pub resolver: Option<ResolverSection>,
     /// Where metrics are served, or `None` for nowhere.
     pub metrics: Option<SocketAddr>,
     /// The caps on calls in flight.
@@ -771,6 +796,7 @@ impl std::fmt::Debug for Deployment {
             .field("audit", &self.audit)
             .field("audit_pools", &self.audit_pools)
             .field("grants", &self.grants)
+            .field("resolver", &self.resolver)
             .field("metrics", &self.metrics)
             .field("limits", &self.limits)
             .field("servers", &self.servers)
@@ -958,6 +984,7 @@ impl Deployment {
             audit,
             audit_pools,
             grants,
+            resolver: file.resolver.map(|resolver| resolver.relative_to(base)),
             metrics: file.metrics.map(|metrics| metrics.listen),
             limits,
             servers,
