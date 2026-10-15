@@ -505,7 +505,8 @@ bad turn grant, as the conformance suite records it, with a capital and a full s
 gateway requires a verifiable turn grant on every call, and this call's did not verify." The
 failure is recorded on the row and never told to the caller, and is not a reason kind. A
 delegation that verified and names another team is still denied naming both teams. The core
-does this; the gateway builds no delegation until the Otto adapter is wired in (#22).
+does this; the gateway builds the delegation from the turn grant a request carries (#22,
+section 7).
 
 **A profile can require a current control plane,** with `requires_currency = true`. It is false
 unless a policy says so, in the JSON configuration and in the registry file alike, so no policy
@@ -516,13 +517,21 @@ and before check 6, allows a call of a tool not classified `read` only if the an
 That covers every such tool, `propose` and any `write` tool an exception lets past check 5, not
 `propose` alone. Superseded, ended and revoked are denied as `not_current`; unconfirmed, and not
 asked, as `currency_unconfirmed`; each kind has its sentence. `tools/list` skips the check, as
-it skips check 6. Nothing asks a control plane yet: the gateway decides every call as not asked,
-and no registry sets the profile setting, until the Otto adapter's wiring (#22). The client that
-will ask is built, in `gateway-otto`, against the interface proposed to Otto's owners in
-[resolver-interface.md](resolver-interface.md): one `POST` per question, never cached, within a
-budget of one second the client enforces, and every failure (no answer in time, an error, an
-unknown version, an answer that does not echo the question, an answer over 64 KiB or out of the
-format) read as unconfirmed.
+it skips check 6. The gateway asks Otto's resolver, through the client in `gateway-otto`,
+against the interface proposed to Otto's owners in [resolver-interface.md](resolver-interface.md)
+(#22). It asks for a `tools/call` of a tool that the snapshot the call is decided from serves on
+the call's surface and does not classify `read`, under a profile that requires currency, with a
+verified delegation; and for nothing else. A read, a call under a profile that does not require
+currency, and a call with no delegation or one that did not verify, which check 3 denies
+first, are decided as not asked, and so is every `tools/list`. Each call that asks is one
+`POST`, never cached, within a budget of one second the client enforces, and every failure (no
+answer in time, an error, an unknown version, an answer that does not echo the question, an
+answer over 64 KiB or out of the format) is read as unconfirmed. So reads keep working while
+the resolver is down, and every side effect under such a profile is denied. The gateway only
+builds the question from the delegation and passes the answer to the decision, which the row
+records. An example of the profile for Otto's sandboxes, which sets `requires_currency`, and of
+the one for Otto's control-plane surface, which does not, is in
+[examples/otto-profiles.toml](examples/otto-profiles.toml); neither demo serves them.
 
 **A profile can declare that its callers set the `Idempotency-Key` header per request,** with
 `idempotency_key_header = true`. It is false unless a policy says so, in the JSON
@@ -934,7 +943,11 @@ columns ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). Grant veri
 failures are counted by kind: version, unknown key, retired key, encoding, signature, malformed,
 expired, not yet valid, lifetime over the ceiling, wrong audience and wrong pod. Also counted:
 accepted grants by key ID, which shows a rotation's progress, currency answers by result, and
-the resolver's latency and timeouts. Each audience or pod failure is investigated, because an
+the resolver's latency and timeouts. The resolver's are exported on the metrics listener as
+`switchboard_resolver_answers_total{answer}`, every failure counted as `unconfirmed`,
+`switchboard_resolver_failures_total{kind}`, one kind for each way a question fails, `timeout`
+among them, and the histogram `switchboard_resolver_question_seconds`, with the audit store's
+buckets (#22). Each audience or pod failure is investigated, because an
 honest sandbox under a correct configuration never produces one. Lifetime failures are to alert
 on a rate, because honest sandboxes produce them, once the on-call rotation sets the rate and
 who is told. Until then nothing pages, and the gateway's maintainers review the counts as part
@@ -1245,6 +1258,18 @@ snapshot loader's rule 2 refuses every proxied tool not classified `read`, a reg
 reach the pod gate, as it cannot reach the receipt-store gate; its tests run on in-process
 snapshots.
 
+Currency needs a resolver ([decision 0012](decisions/0012-what-a-turn-grant-binds.md),
+"Currency"). The deployment file's `[resolver]` table names Otto's resolver interface: its URL,
+the CA bundle its certificate must chain to, and the projected ServiceAccount token the gateway
+presents. The gateway refuses to start if the client refuses the table (a URL that is not
+`https`, or plain `http` to anything but loopback; a user name, password or query in it; a CA
+or token file that cannot be read, or one beside plain `http`), before it fetches a key or
+connects to the audit store. It refuses to start, too, if a profile a selector rule names
+requires currency and no resolver is configured, since every side effect under it would be
+denied as unconfirmed; and it refuses a registry version that makes one do so while it runs,
+keeping the running one. With no profile requiring currency the table may be left out, as it
+is in both demos. These are built (#22).
+
 ## 13. Connectors and proxied servers
 
 A connector lists its tools with their classifications and runs a call given a verified
@@ -1552,8 +1577,8 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   Migration 0010 adds them, additive, with the shape constraints section 11 lists; the boot
   check covers them, and the contract suite runs them and their refusals on both stores. Rows
   written before it hold NULL in each, which means not recorded. The gateway fills the
-  delegation's columns from the grants it verifies (#22); nothing fills the currency answer
-  until it asks Otto's resolver. Not built: with #12, a column for the exception that allowed a call, since the row's
+  delegation's columns from the grants it verifies, and the currency answer from Otto's
+  resolver when it asks (#22). Not built: with #12, a column for the exception that allowed a call, since the row's
   shape constraint rightly allows no reason on an allowed row.
 - Rows of kind `list`, written complete, with a list form of the record in the core: built in
   the core and the stores, and wired into `tools/list` (#40). The core's `listed` writes a
@@ -2118,13 +2143,13 @@ before and after the network policy; the kind claim holds only while the evidenc
   at boot only; the team and surface levers are also pulled on a running gateway, each by a new
   registry file that stops a grant the gateway had just accepted within the freshness bound
   (one-second polls in the test, which allows three seconds).
-- Built, in `gateway-otto`, not yet wired into the request path: the client for Otto's resolver
-  interface. Its wire format is proposed to Otto's owners in
+- Built, in `gateway-otto`: the client for Otto's resolver interface. Its wire format is proposed to Otto's owners in
   [resolver-interface.md](resolver-interface.md), marked a proposal until they agree. A
   `Resolver` trait asks the currency question for a turn's session, execution, turn and epoch;
   the HTTP client sends one `POST` per question with a fresh request ID, keeps no answer, and
-  gives up at the one-second budget, which it enforces itself over the whole exchange (except
-  that a token read which blocks the thread can overrun it, #213). It
+  gives up at the one-second budget, which it enforces itself over the whole exchange, the
+  token's read included, which is made on the blocking pool so a read that blocks cannot
+  overrun it (#213). It
   follows no redirect and reads no proxy, trusts only the CA bundle the deployment names,
   sends a projected ServiceAccount token read again for each question and only over TLS, and
   refuses plain `http` except to a loopback address. It reads at most 64 KiB, from the
@@ -2135,11 +2160,21 @@ before and after the network policy; the kind claim holds only while the evidenc
   and the latency of every question are counted, for the gateway to export (section 11). A
   fake resolver behind `test-support` answers each state, hangs before or during its answer,
   fails, and answers with another version or another question's echo; the tests use each.
-- Not built yet: asking the resolver on the request path, its deployment-file table and boot
-  gate, and exporting its counts. The gateway decides every call with currency not asked, and
-  no policy sets `requires_currency`. No deployment configures a grant issuer, and no demo
-  profile requires a delegation, so the demos' calls, which carry no grant, are decided as
-  before.
+- Built in the gateway (#22): the currency question on the request path (section 8), the
+  deployment file's `[resolver]` table and the currency gate at boot and at snapshot load
+  (section 12), and the resolver's counts on the metrics listener (section 11). Otto's two
+  profiles are an example, in [examples/otto-profiles.toml](examples/otto-profiles.toml), and
+  the tests' fixtures. The tests drive the HTTP endpoint with the test minter and the fake
+  resolver over loopback, under those profiles: each answer against a read, never asked and
+  allowed, and against a proposal, allowed only when current; no answer within the budget, an
+  error, an unknown version and an answer to another question, each denied as unconfirmed with
+  the row recording it; the resolver down, with reads served; a turn marked revoked, whose next
+  side effect is denied; two calls asking twice; a current proposal running and reserving its
+  receipt; a grant that does not verify, or none, denied at check 3 without asking; a list,
+  and a call under the control-plane profile, never asking; and a token read stalled on a FIFO,
+  with the call still answered within the budget. No deployment configures a grant issuer or a
+  resolver, and no demo profile requires a delegation or currency, so the demos' calls are
+  decided as before.
 
 - Built in the core (#22): the delegation in the call context is absent, present and verified,
   or present and unverified. An unverified one carries its failure kind, from the core's closed
@@ -2158,7 +2193,7 @@ before and after the network policy; the kind claim holds only while the evidenc
   world's call is current. A new one: under a profile that requires currency, a call of a tool
   not classified `read` is never allowed unless current. The row fields: built (#10 and #56,
   above).
-- Not built: currency on the request path (above).
+- Currency on the request path: built (#22, above).
 
 **#26, the HTTP path.**
 
