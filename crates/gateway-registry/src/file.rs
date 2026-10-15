@@ -15,6 +15,7 @@ use gateway_core::{
 use serde::Deserialize;
 use toml::value::Datetime;
 
+use crate::builtin::Access;
 use crate::registry::{Destination, ProbeResult};
 
 /// The whole file.
@@ -28,6 +29,20 @@ pub(crate) struct RegistryFile {
     pub profiles: Vec<ProfileFile>,
     pub profile_rules: Vec<RuleFile>,
     pub limits: LimitsFile,
+    /// Built-in connector entries. Absent is none, so a file written before they existed keeps
+    /// its meaning.
+    #[serde(default)]
+    pub connectors: Vec<ConnectorFile>,
+}
+
+/// A built-in connector's entry: see [`crate::BuiltInEntry`].
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConnectorFile {
+    pub name: ConnectorName,
+    pub system: String,
+    pub permissions: BTreeMap<String, Access>,
+    pub tools: BTreeSet<ToolName>,
 }
 
 #[derive(Debug, Deserialize)]

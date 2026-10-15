@@ -10,7 +10,9 @@
 //! - an [`ArgumentAdapter`] per approved tool, which names the resources a call reaches and
 //!   checks a call's arguments against the approved schema;
 //! - a [`Route`] and an [`Approval`] per tool, the [`Server`] records, and the
-//!   [`ProfileRules`].
+//!   [`ProfileRules`];
+//! - a [`BuiltInEntry`] per built-in connector entry, which states the vendor permissions its
+//!   credential may be asked for. Only the key custodian reads them yet.
 //!
 //! A file that is wrong in any way the loader can see is refused whole, with a
 //! [`RegistryError`] that names the first problem. Nothing is half-loaded.
@@ -29,12 +31,14 @@
 #![forbid(unsafe_code)]
 
 mod adapter;
+mod builtin;
 mod definition;
 mod file;
 mod registry;
 mod selection;
 
 pub use adapter::{ArgumentAdapter, ArgumentError, JsonPointer, ResourceSource};
+pub use builtin::{Access, BuiltInEntry};
 pub use definition::{
     Approval, Route, SCHEMA_DIALECT, ToolDefinition, binding_sha256, definition_sha256,
 };
