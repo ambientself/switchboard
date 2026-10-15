@@ -6139,6 +6139,8 @@ READERS: list[tuple[str, frozenset[str]]] = [
     ("conformance/", frozenset({"gateway-testkit", "gateway-otto"})),
     # gateway-otto/tests/format_doc.rs checks the format's constants and example.
     ("docs/turn-grant-format.md", frozenset({"gateway-otto"})),
+    # gateway-otto/tests/resolver_doc.rs checks the resolver interface's constants and example.
+    ("docs/resolver-interface.md", frozenset({"gateway-otto"})),
     # demo-checks/tests/manifests.rs compares the demo registries with the registry crate's own.
     ("crates/gateway-registry/demo/", frozenset({"demo-checks"})),
     # mock-docs-server/tests/dependencies.rs includes the identity crate's manifest.
