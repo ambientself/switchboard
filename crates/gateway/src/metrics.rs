@@ -77,6 +77,14 @@
 //!     `switchboard_audit_pool_connections_max{pool}`, `pool` one of `begin`, `finish` and
 //!     `open_rows`, the open-row poll's pool of its own.
 //!
+//! - With the turn-grant gate, from its [`GrantSignals`] (decision 0012, design section 11):
+//!   `switchboard_grant_failures_total{kind}`, the grants refused, `kind` one of the eleven
+//!   checks (`version`, `unknown_key`, `retired_key`, `encoding`, `signature`, `malformed`,
+//!   `wrong_audience`, `not_yet_valid`, `expired`, `lifetime` and `wrong_pod`), each written
+//!   from zero; and `switchboard_grants_accepted_total{key_id}`, the grants verified under each
+//!   configured key, written only when a key is configured. A request with the grant header
+//!   more than once counts as `malformed`.
+//!
 //! - With an issuer whose keys are fetched from a keys URL, from [`KeyAges`]:
 //!   `switchboard_issuer_keys_age_seconds{issuer}`, the seconds since that issuer's keys were
 //!   last fetched and put in force (see [`crate::keys`]). `issuer` is the issuer as the
@@ -137,6 +145,7 @@ use tokio::task::JoinHandle;
 
 use crate::bulkhead::{ProxiedSignals, ServerCounts};
 use crate::drift::{DriftCounts, DriftSignals};
+use crate::grants::{GrantCounts, GrantSignals};
 use crate::keys::KeyAges;
 use crate::reconcile::{ReconcileCounts, ReconcileSignals};
 use crate::reload::Freshness;
@@ -163,6 +172,7 @@ pub struct Metrics {
     proxied: ProxiedSignals,
     drift: Option<DriftSignals>,
     reconciliation: Option<ReconcileSignals>,
+    grants: Option<GrantSignals>,
 }
 
 impl std::fmt::Debug for Metrics {
@@ -175,6 +185,7 @@ impl std::fmt::Debug for Metrics {
             .field("proxied", &self.proxied)
             .field("drift", &self.drift)
             .field("reconciliation", &self.reconciliation)
+            .field("grants", &self.grants)
             .finish()
     }
 }
@@ -209,7 +220,15 @@ impl Metrics {
             proxied: ProxiedSignals::default(),
             drift: None,
             reconciliation: None,
+            grants: None,
         }
+    }
+
+    /// The same metrics, with what the turn-grant gate counts, which
+    /// [`Gates::grant_signals`](crate::Gates::grant_signals) gives.
+    pub fn with_grants(mut self, grants: GrantSignals) -> Self {
+        self.grants = Some(grants);
+        self
     }
 
     /// The same metrics, with the drift pass's counts, which
@@ -261,6 +280,9 @@ impl Metrics {
             policy_signals(&mut text, freshness);
         }
         issuer_key_signals(&mut text, &self.issuer_keys.ages());
+        if let Some(grants) = &self.grants {
+            grant_signals(&mut text, &grants.counts());
+        }
         if let Some(audit) = &self.audit {
             let open = *audit.open.lock().unwrap_or_else(PoisonError::into_inner);
             let unknown = *audit.unknown.lock().unwrap_or_else(PoisonError::into_inner);
@@ -646,6 +668,39 @@ fn issuer_key_signals(text: &mut Text, ages: &[(Issuer, Duration)]) {
             "switchboard_issuer_keys_age_seconds",
             &[("issuer", issuer.as_str())],
             age.as_secs_f64(),
+        );
+    }
+}
+
+fn grant_signals(text: &mut Text, counts: &GrantCounts) {
+    text.family(
+        "switchboard_grant_failures_total",
+        "counter",
+        "Turn grants refused, by the check they failed (decision 0012). Each wrong_audience or \
+         wrong_pod is to be investigated; expired, not_yet_valid and lifetime are to alert on a \
+         rate, and are not logged one by one.",
+    );
+    for (kind, count) in &counts.failures {
+        text.sample(
+            "switchboard_grant_failures_total",
+            &[("kind", kind.as_str())],
+            count,
+        );
+    }
+    if counts.accepted.is_empty() {
+        return;
+    }
+    text.family(
+        "switchboard_grants_accepted_total",
+        "counter",
+        "Turn grants verified, by the ID of the key they verified under, which shows a key \
+         rotation's progress.",
+    );
+    for (key_id, count) in &counts.accepted {
+        text.sample(
+            "switchboard_grants_accepted_total",
+            &[("key_id", key_id.as_str())],
+            count,
         );
     }
 }

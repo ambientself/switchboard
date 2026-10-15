@@ -75,6 +75,7 @@ mod catalog;
 mod config;
 pub mod deployment;
 pub mod drift;
+pub mod grants;
 pub mod keys;
 pub mod metrics;
 pub mod path;
@@ -109,6 +110,9 @@ pub use drift::{
     MIN_DRIFT_INTERVAL, PROBE_NOT_SHOWN_EVENT, ProbeCredentialError, ProbeCredentials,
     REACH_FAILED_EVENT, REACH_HELD_EVENT, REACH_MISMATCH_EVENT, SERVER_OPEN_EVENT, Withdrawals,
     probe_credentials, withdrawn_revision,
+};
+pub use grants::{
+    GRANT_HEADER, GRANT_REFUSED_EVENT, GrantChecking, GrantCounts, GrantSignals, GrantsSection,
 };
 pub use keys::{
     DEFAULT_KEYS_REFRESH, KeyRefresher, MIN_KEYS_REFRESH, REFRESH_FAILED_EVENT, REFRESHED_EVENT,

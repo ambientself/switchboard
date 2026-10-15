@@ -13,6 +13,7 @@ use gateway_identity::{DEFAULT_GROUPS_CLAIM, IssuerConfig, IssuerKind, SigningAl
 use serde::Deserialize;
 
 use crate::catalog::ToolDefinition;
+use crate::grants::GrantsSection;
 use crate::selector::SelectorRules;
 
 /// Everything a deployment configures.
@@ -28,6 +29,11 @@ pub struct Config {
     /// Whether audit is explicitly disabled. Absent, like `identity`, so boot can say why.
     #[serde(default)]
     pub audit: AuditSection,
+    /// Whether and how turn grants are verified (decision 0012). Absent is checking on with no
+    /// grant issuer, which the boot gates allow while no profile a rule gives workloads requires
+    /// a delegation.
+    #[serde(default)]
+    pub grants: GrantsSection,
     /// What the HTTP endpoint accepts.
     pub http: HttpSection,
     /// The policy snapshot: approved tools, surfaces, profiles and resource limits.

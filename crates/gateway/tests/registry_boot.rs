@@ -47,6 +47,7 @@ fn parts(files: &Files, disabled: bool) -> (Settings, Registry) {
             disabled,
             postgres: false,
         },
+        grants: Default::default(),
         http: deployment.http,
         max_age: None,
         read_at: Instant::now(),

@@ -77,6 +77,7 @@ impl Stale {
                 disabled: false,
                 postgres: false,
             },
+            grants: Default::default(),
             http: deployment.http,
             max_age: Some(MAX_AGE),
             read_at: Instant::now(),

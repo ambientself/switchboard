@@ -49,15 +49,20 @@ use std::time::{Duration, Instant};
 use connector_proxy::DEFAULT_DEADLINE;
 use gateway_core::{
     AuditStore, Classification, Connector, ConnectorName, DeploymentName, InstanceName, Issuer,
-    Lookup, Narrowing, PolicySnapshot, ProfileName, ReceiptQueue, SnapshotError, ToolName,
+    Lookup, Narrowing, PolicySnapshot, ProfileName, ReceiptQueue, SnapshotError, TeamId, ToolName,
 };
 use gateway_identity::{Clock, ConfigError, Identity, IdentityConfig};
+use gateway_otto::KeyConfigError;
 use gateway_registry::{Registry, RulePrincipal};
 use thiserror::Error;
 
 use crate::audit::DisabledAuditStore;
 use crate::catalog::{CatalogError, ToolCatalog};
-use crate::config::{AuditSection, Config, HttpSection, IdentitySection};
+use crate::config::{AuditSection, Config, HttpSection, IdentitySection, IssuerKindEntry};
+use crate::grants::{
+    GrantChecking, GrantGateError, GrantPolicyError, GrantSignals, GrantsSection,
+    WorkloadSelection, issuer_gate, pod_gate,
+};
 use crate::policy::{LivePolicy, ServedPolicy};
 use crate::reconcile::{ReconcileSettings, Reconciler};
 use crate::reload::{Freshness, Reloader};
@@ -127,6 +132,23 @@ pub enum BootError {
          every call, so configure an audit store"
     )]
     AuditOptOut,
+    /// Turn-grant checking is disabled in a release build (decision 0012, "Keys").
+    #[error(
+        "turn-grant checking is disabled, which only a development build allows: the release \
+         build verifies every turn grant, so configure the grant issuers, or leave `[grants]` \
+         out while no profile requires a delegation"
+    )]
+    GrantOptOut,
+    /// Turn-grant checking is both enforced and disabled.
+    #[error("turn-grant checking is both enforced and disabled; choose one")]
+    GrantContradiction,
+    /// The turn-grant keys were refused.
+    #[error(transparent)]
+    GrantKeys(#[from] KeyConfigError),
+    /// The grant configuration and the policy cannot serve together (decision 0012, "Keys").
+    /// Boxed: its refusal names a tool, a surface, a team, a profile and an issuer.
+    #[error(transparent)]
+    GrantPolicy(Box<GrantPolicyError>),
     /// No host is allowed, so every request would be refused.
     #[error("`http.allowed_hosts` is empty")]
     NoAllowedHosts,
@@ -207,6 +229,12 @@ pub enum BootError {
     NarrowingNotBuilt(ConnectorName),
 }
 
+impl From<GrantPolicyError> for BootError {
+    fn from(error: GrantPolicyError) -> Self {
+        BootError::GrantPolicy(Box::new(error))
+    }
+}
+
 /// The parts of a deployment's configuration that are not its policy, for [`check_registry`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
@@ -216,6 +244,8 @@ pub struct Settings {
     pub identity: IdentitySection,
     /// Whether audit is explicitly disabled.
     pub audit: AuditSection,
+    /// Whether and how turn grants are verified.
+    pub grants: GrantsSection,
     /// What the HTTP endpoint accepts.
     pub http: HttpSection,
     /// How long after the registry file was last read the policy is stale (decision 0013,
@@ -379,6 +409,7 @@ pub struct Gates {
     identity_state: GateState,
     audit_store: Arc<dyn AuditStore>,
     audit_state: GateState,
+    grants: GrantChecking,
     http: HttpSection,
     policy: Arc<LivePolicy>,
     connectors: BTreeMap<ConnectorName, Registered>,
@@ -389,13 +420,16 @@ pub struct Gates {
 /// What the gateway was started with that a policy reload cannot change: the issuers, which
 /// profile rules must name, and the registry's servers and routes, which the connectors were
 /// built for. And, for the receipt-store gate, whether this build is exempt from it, which only
-/// a development build is, and whether a receipt store is configured.
+/// a development build is, and whether a receipt store is configured. And the grant issuers,
+/// which are read at boot only, for the pod gate.
 pub(crate) struct Basis {
     pub(crate) issuers: Option<Issuers>,
     pub(crate) registry: Registry,
     pub(crate) connectors: BTreeSet<ConnectorName>,
     pub(crate) receipt_exempt: bool,
     pub(crate) receipt_store: bool,
+    /// Each configured grant issuer, and whether its grants must carry `pod`.
+    pub(crate) grant_issuers: Vec<(String, bool)>,
 }
 
 impl fmt::Debug for Gates {
@@ -450,6 +484,16 @@ impl Gates {
     /// Whether audit is on or disabled.
     pub fn audit_state(&self) -> GateState {
         self.audit_state
+    }
+
+    /// The turn-grant gate: whether grants are verified, and the verifier.
+    pub fn grants(&self) -> &GrantChecking {
+        &self.grants
+    }
+
+    /// What the turn-grant gate counts, for the metrics.
+    pub fn grant_signals(&self) -> GrantSignals {
+        self.grants.signals().clone()
     }
 
     /// The `Host` values served.
@@ -558,6 +602,7 @@ fn check_with(config: Config, wiring: Wiring, development: bool) -> Result<Gates
     let receipt_store = receipt_store_configured(&config.identity, &config.audit);
     let (identity, identity_state) = identity_gate(config.identity, clock.clone(), development)?;
     let (audit_store, audit_state) = audit_gate(&config.audit, audit_store, development)?;
+    let grants = grant_gate(config.grants, &config.deployment, development)?;
     if config.http.allowed_hosts.is_empty() {
         return Err(BootError::NoAllowedHosts);
     }
@@ -614,7 +659,13 @@ fn check_with(config: Config, wiring: Wiring, development: bool) -> Result<Gates
         return Err(BootError::UnknownProfile(unknown.clone()));
     }
 
+    let policy = ServedPolicy::from_config(snapshot, catalog, selector);
+    let selections = covered_teams(policy.workload_selections(), issuers.as_ref());
+    issuer_gate(policy.snapshot(), &selections, &grants)?;
+    pod_gate(policy.snapshot(), &selections, grants.issuers())?;
+
     warn_disabled(&config.deployment, identity_state, audit_state);
+    warn_grants_disabled(&config.deployment, grants.state());
     Ok(Gates {
         deployment: config.deployment,
         instance,
@@ -623,10 +674,9 @@ fn check_with(config: Config, wiring: Wiring, development: bool) -> Result<Gates
         identity_state,
         audit_store,
         audit_state,
+        grants,
         http: config.http,
-        policy: Arc::new(LivePolicy::new(ServedPolicy::from_config(
-            snapshot, catalog, selector,
-        ))),
+        policy: Arc::new(LivePolicy::new(policy)),
         connectors,
         lookups,
         // No file is read again, so the policy never goes stale.
@@ -690,6 +740,7 @@ pub(crate) fn check_registry_with(
     let receipt_store = receipt_store_configured(&settings.identity, &settings.audit);
     let (identity, identity_state) = identity_gate(settings.identity, clock.clone(), development)?;
     let (audit_store, audit_state) = audit_gate(&settings.audit, audit_store, development)?;
+    let grants = grant_gate(settings.grants, &settings.deployment, development)?;
     if settings.http.allowed_hosts.is_empty() {
         return Err(BootError::NoAllowedHosts);
     }
@@ -717,10 +768,15 @@ pub(crate) fn check_registry_with(
         connectors: connectors.keys().cloned().collect(),
         receipt_exempt: development,
         receipt_store,
+        grant_issuers: grants.issuers().to_vec(),
     };
     check_registry_policy(&basis.registry, &live.current(), &basis)?;
+    let served = live.current();
+    let selections = covered_teams(served.workload_selections(), basis.issuers.as_ref());
+    issuer_gate(served.snapshot(), &selections, &grants)?;
 
     warn_disabled(&settings.deployment, identity_state, audit_state);
+    warn_grants_disabled(&settings.deployment, grants.state());
     let freshness = Freshness::new(settings.max_age, settings.read_at);
     let reloader = Reloader::new(live.clone(), basis, freshness.clone());
     let gates = Gates {
@@ -731,6 +787,7 @@ pub(crate) fn check_registry_with(
         identity_state,
         audit_store,
         audit_state,
+        grants,
         http: settings.http,
         policy: live,
         connectors,
@@ -743,8 +800,9 @@ pub(crate) fn check_registry_with(
 /// The gates a registry's policy must pass, at boot and on every reload: the
 /// [receipt-store gate](receipt_gate); the [narrowing gate](narrowing_gate); every approved
 /// tool's server has a connector; with identity enforced, every rule names a configured issuer
-/// of its kind; the snapshot does not define [`NO_PROFILE`]; and every profile a rule names
-/// exists.
+/// of its kind; the snapshot does not define [`NO_PROFILE`]; every profile a rule names exists;
+/// and the [pod gate](pod_gate), with the rules beside the snapshot and the grant issuers the
+/// gateway started with.
 pub(crate) fn check_registry_policy(
     registry: &Registry,
     policy: &ServedPolicy,
@@ -788,6 +846,8 @@ pub(crate) fn check_registry_policy(
     {
         return Err(BootError::UnknownProfile(unknown));
     }
+    let selections = covered_teams(policy.workload_selections(), basis.issuers.as_ref());
+    pod_gate(policy.snapshot(), &selections, &basis.grant_issuers)?;
     Ok(())
 }
 
@@ -868,13 +928,15 @@ fn warn_disabled(deployment: &DeploymentName, identity: GateState, audit: GateSt
 
 /// The refusals that need only the configuration and the registry's snapshot, which
 /// [`start::prepare`](crate::start::prepare) runs as soon as the registry loads, before it
-/// reads a credential, fetches a key or connects to the audit store: the identity and audit
-/// opt-outs outside a development build (decision 0014, section 4), then the
+/// reads a credential, fetches a key or connects to the audit store: the identity, audit and
+/// turn-grant opt-outs outside a development build (decisions 0014, section 4, and 0012,
+/// "Keys"), then the
 /// [narrowing gate](narrowing_gate) and the [receipt-store gate](receipt_gate). The boot gates
 /// run each again.
 pub(crate) fn before_connecting(
     identity: &IdentitySection,
     audit: &AuditSection,
+    grants: &GrantsSection,
     snapshot: &PolicySnapshot,
     development: bool,
 ) -> Result<(), BootError> {
@@ -883,6 +945,9 @@ pub(crate) fn before_connecting(
     }
     if audit.disabled {
         opt_out(BootError::AuditOptOut, development)?;
+    }
+    if grants.disabled {
+        opt_out(BootError::GrantOptOut, development)?;
     }
     narrowing_gate(snapshot)?;
     receipt_gate(
@@ -947,6 +1012,8 @@ fn audit_gate(
 pub(crate) struct Issuers {
     workloads: BTreeSet<Issuer>,
     users: BTreeSet<Issuer>,
+    /// Each workload issuer's teams, from its team manifest.
+    teams: BTreeMap<Issuer, BTreeSet<TeamId>>,
 }
 
 fn configured_issuers(section: &IdentitySection) -> Option<Issuers> {
@@ -954,6 +1021,15 @@ fn configured_issuers(section: &IdentitySection) -> Option<Issuers> {
     let (workloads, users): (Vec<_>, Vec<_>) =
         entries.iter().partition(|entry| entry.is_workload());
     Some(Issuers {
+        teams: workloads
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                IssuerKindEntry::Workload { subjects } => {
+                    Some((entry.issuer.clone(), subjects.values().cloned().collect()))
+                }
+                IssuerKindEntry::User { .. } => None,
+            })
+            .collect(),
         workloads: workloads
             .into_iter()
             .map(|entry| entry.issuer.clone())
@@ -963,6 +1039,52 @@ fn configured_issuers(section: &IdentitySection) -> Option<Issuers> {
             .map(|entry| entry.issuer.clone())
             .collect(),
     })
+}
+
+/// `selections` with each rule that covers every team its issuer vouches for narrowed to the
+/// teams in that issuer's manifest. Without the manifests, with identity disabled, such a rule
+/// is taken to cover every team.
+fn covered_teams(
+    selections: Vec<WorkloadSelection>,
+    issuers: Option<&Issuers>,
+) -> Vec<WorkloadSelection> {
+    selections
+        .into_iter()
+        .map(|mut selection| {
+            if selection.teams.is_none()
+                && let Some(teams) =
+                    issuers.and_then(|issuers| issuers.teams.get(&selection.issuer))
+            {
+                selection.teams = Some(teams.clone());
+            }
+            selection
+        })
+        .collect()
+}
+
+/// The turn-grant gate (decision 0012, "Keys"): enforced with the configured issuers, enforced
+/// with none, or, in a development build only, disabled. Both is refused.
+fn grant_gate(
+    section: GrantsSection,
+    deployment: &DeploymentName,
+    development: bool,
+) -> Result<GrantChecking, BootError> {
+    GrantChecking::new(section, deployment, development).map_err(|error| match error {
+        GrantGateError::Keys(error) => BootError::GrantKeys(error),
+        GrantGateError::Contradiction => BootError::GrantContradiction,
+        GrantGateError::OptOut => BootError::GrantOptOut,
+    })
+}
+
+/// Logs a warning when turn-grant checking is turned off.
+fn warn_grants_disabled(deployment: &DeploymentName, grants: GateState) {
+    if grants == GateState::Disabled {
+        tracing::warn!(
+            %deployment,
+            "turn-grant checking is disabled: grants are not read, so a profile that requires a \
+             delegation denies every call"
+        );
+    }
 }
 
 fn rules_name_configured_issuers(
@@ -1181,6 +1303,7 @@ principals = "any_in_teams_and_groups"
             registry,
             receipt_exempt: false,
             receipt_store: false,
+            grant_issuers: Vec::new(),
         }
     }
 
@@ -1321,11 +1444,23 @@ principals = "any_in_teams_and_groups"
     fn before_connecting_runs_the_receipt_gate_with_what_the_deployment_configures() {
         let propose = in_process(Classification::Propose, true);
         let (identity, audit) = configured(true, true, true);
-        let started = before_connecting(&identity, &audit, &propose, false);
+        let started = before_connecting(
+            &identity,
+            &audit,
+            &GrantsSection::default(),
+            &propose,
+            false,
+        );
         assert!(started.is_ok(), "{started:?}");
         let (identity, audit) = configured(true, true, false);
         refused_as(
-            before_connecting(&identity, &audit, &propose, false),
+            before_connecting(
+                &identity,
+                &audit,
+                &GrantsSection::default(),
+                &propose,
+                false,
+            ),
             Classification::Propose,
         );
     }
@@ -1522,7 +1657,13 @@ principals = "any_in_teams_and_groups"
                     ..release_basis(registry.clone())
                 };
                 let checked = check_registry_policy(&registry, &policy, &basis);
-                let before = before_connecting(&identity, &audit, registry.snapshot(), exempt);
+                let before = before_connecting(
+                    &identity,
+                    &audit,
+                    &GrantsSection::default(),
+                    registry.snapshot(),
+                    exempt,
+                );
                 if narrowing == Narrowing::None {
                     assert!(checked.is_ok(), "{checked:?}");
                     assert!(before.is_ok(), "{before:?}");
@@ -1532,5 +1673,142 @@ principals = "any_in_teams_and_groups"
                 }
             }
         }
+    }
+
+    /// An in-process policy whose `docs` surface serves one tool of `classification` to team A,
+    /// whose workloads of `https://cluster.example.test` get the profile `sandbox`, which
+    /// requires a delegation, at `revision`.
+    fn requiring_policy(classification: Classification, revision: &str) -> ServedPolicy {
+        let name = ToolName::parse("docs__list_documents").unwrap();
+        let snapshot = PolicySnapshot::new(SnapshotData {
+            revision: revision.into(),
+            tools: vec![ApprovedTool {
+                name: name.clone(),
+                classification,
+                connector: "mock-docs".into(),
+                resources: ResourceDeclaration::NoResources,
+                declared_from: None,
+                settlement: (classification != Classification::Read)
+                    .then_some(gateway_core::Settlement::Person),
+            }],
+            surfaces: vec![Surface {
+                name: "docs".into(),
+                tools: [name.clone()].into(),
+                teams: ["team-a".into()].into(),
+                groups: BTreeSet::new(),
+                principals: PrincipalRestriction::AnyInTeamsAndGroups,
+            }],
+            profiles: vec![gateway_core::Profile {
+                name: "sandbox".into(),
+                classifications: [Classification::Read, Classification::Propose].into(),
+                requires_delegation: true,
+                requires_currency: false,
+                idempotency_key_header: false,
+            }],
+            limits: Default::default(),
+            entries: Vec::new(),
+        })
+        .unwrap();
+        let catalog = ToolCatalog::new(vec![ToolDefinition {
+            name,
+            title: None,
+            description: "Lists the documents.".into(),
+            input_schema: json!({"type": "object"}),
+        }])
+        .unwrap();
+        let selector = ProfileSelector::new(SelectorRules {
+            workloads: vec![crate::selector::WorkloadRule {
+                issuer: "https://cluster.example.test".into(),
+                team: "team-a".into(),
+                profile: "sandbox".into(),
+            }],
+            users: Vec::new(),
+        })
+        .unwrap();
+        ServedPolicy::from_config(snapshot, catalog, selector)
+    }
+
+    /// A development basis, so the receipt-store gate passes, with one grant issuer that
+    /// requires `pod` or does not.
+    fn grant_basis(registry: Registry, require_pod: bool) -> Basis {
+        Basis {
+            receipt_exempt: true,
+            grant_issuers: vec![("otto-test".into(), require_pod)],
+            ..release_basis(registry)
+        }
+    }
+
+    /// The pod gate (decision 0012, "Keys") runs wherever a registry's policy is checked, at
+    /// boot and on every reload: a `propose` or `write` tool served to a team whose profile
+    /// requires a delegation is refused while a grant issuer does not require `pod`. Requiring
+    /// it passes, and so does a read tool, and so does no grant issuer at all.
+    #[test]
+    fn the_pod_gate_runs_on_every_registry_policy() {
+        let registry = registry("read", true);
+        for classification in [Classification::Propose, Classification::Write] {
+            let policy = requiring_policy(classification, "r2");
+            let refused =
+                check_registry_policy(&registry, &policy, &grant_basis(registry.clone(), false));
+            match refused.map_err(|error| match error {
+                BootError::GrantPolicy(policy) => Ok(*policy),
+                other => Err(other),
+            }) {
+                Err(Ok(GrantPolicyError::PodNotRequired {
+                    tool,
+                    team,
+                    grant_issuer,
+                    ..
+                })) => {
+                    assert_eq!(tool.as_str(), "docs__list_documents");
+                    assert_eq!(team.as_str(), "team-a");
+                    assert_eq!(grant_issuer, "otto-test");
+                }
+                other => panic!("{classification}: expected the pod gate, got {other:?}"),
+            }
+            let bound =
+                check_registry_policy(&registry, &policy, &grant_basis(registry.clone(), true));
+            assert!(bound.is_ok(), "{classification}: {bound:?}");
+            let basis = Basis {
+                receipt_exempt: true,
+                ..release_basis(registry.clone())
+            };
+            let no_issuer = check_registry_policy(&registry, &policy, &basis);
+            assert!(no_issuer.is_ok(), "{classification}: {no_issuer:?}");
+        }
+        let read = requiring_policy(Classification::Read, "r2");
+        let checked =
+            check_registry_policy(&registry, &read, &grant_basis(registry.clone(), false));
+        assert!(checked.is_ok(), "{checked:?}");
+    }
+
+    /// A version that breaks the pod gate is refused when it is loaded, and the running policy
+    /// is kept; one that keeps it is served.
+    #[test]
+    fn a_reload_that_breaks_the_pod_gate_keeps_the_running_policy() {
+        let registry = registry("read", true);
+        let live = Arc::new(LivePolicy::new(requiring_policy(
+            Classification::Read,
+            "r1",
+        )));
+        let reloader = Reloader::new(
+            live.clone(),
+            grant_basis(registry.clone(), false),
+            Freshness::new(None, Instant::now()),
+        );
+        let refused =
+            reloader.apply_policy(&registry, requiring_policy(Classification::Propose, "r2"));
+        assert!(
+            matches!(
+                &refused,
+                Err(crate::reload::ReloadError::Boot(BootError::GrantPolicy(policy)))
+                    if matches!(**policy, GrantPolicyError::PodNotRequired { .. })
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(live.current().revision().as_str(), "r1");
+
+        let served = reloader.apply_policy(&registry, requiring_policy(Classification::Read, "r3"));
+        assert!(served.is_ok(), "{served:?}");
+        assert_eq!(live.current().revision().as_str(), "r3");
     }
 }

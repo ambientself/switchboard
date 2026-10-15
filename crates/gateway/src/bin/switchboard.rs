@@ -186,12 +186,13 @@ async fn serve(config: PathBuf) -> ExitCode {
     let proxied = prepared.proxied.clone();
     let drift = prepared.drift.signals();
     let reconciliation = prepared.reconciler.as_ref().map(Reconciler::signals);
+    let grants = prepared.gates.grant_signals();
     let metrics = metrics_listener.map(|listener| {
         let metrics = Metrics::new(telemetry.clone(), prepared.store.clone())
             .with_issuer_keys(prepared.keys.ages());
         let metrics = metrics.with_policy(freshness);
         let metrics = metrics.with_proxied(proxied);
-        let metrics = metrics.with_drift(drift);
+        let metrics = metrics.with_drift(drift).with_grants(grants);
         let metrics = match reconciliation {
             Some(signals) => metrics.with_reconciliation(signals),
             None => metrics,

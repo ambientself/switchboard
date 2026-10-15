@@ -49,6 +49,20 @@
 //! begin_pool_size = 16        # 16 if left out; 1 to 64
 //! finish_pool_size = 4        # 4 if left out; 1 to 64
 //!
+//! [grants]                    # optional while no profile requires a delegation
+//! mode = "enforce"            # or "disabled" (test-support builds only), alone in the table
+//! tool_mapping_file = "otto-tools.json"
+//!
+//! [[grants.issuers]]
+//! name = "otto-prod"
+//! key_file = "otto-prod.pem"
+//! require_pod = false
+//! require_egress = false
+//!
+//! [grants.issuers.previous]   # optional: the key being rotated away from
+//! key_file = "otto-prod-previous.pem"
+//! retires_at = 2026-11-01T00:00:00Z
+//!
 //! [metrics]                   # optional; left out, nothing serves metrics
 //! listen = "0.0.0.0:9090"
 //!
@@ -122,6 +136,25 @@
 //!   open-row query's pool is always one connection. So an instance opens at most begin plus
 //!   finish plus 1 connections to the audit database, 21 at the defaults, and the database's
 //!   `max_connections` must hold that for every replica, plus the migrate job and readers.
+//! - **Turn grants** (decision 0012) are checked against the `[grants]` table (see
+//!   [`crate::grants`]). Each issuer names the file holding its current Ed25519 public key in
+//!   PEM, and may name the key it is rotating away from, with `retires_at`, an absolute instant
+//!   (a TOML date and time with an offset): from then on that key's grants are refused, however
+//!   recently the gateway started. `require_pod` and `require_egress` say whether the issuer's
+//!   grants must carry `pod`, which must then equal the pod UID the caller's token proves, and
+//!   `egress`. `tool_mapping_file` is one JSON object of Otto's bare tool names to this
+//!   gateway's, one to one. Keys are read at boot only, so changing one is a restart: one
+//!   rollout. The gateway refuses to start on each refusal of the key configuration (no
+//!   issuer, a name empty or repeated, a key file holding private key material or not one
+//!   public key, a key of small order, a key repeated or under two issuers, a previous key with
+//!   no `retires_at`), and on a mapping that is not one to one. Left out, grant checking is on
+//!   and no issuer is configured, so a grant a request carries is refused as from an unknown
+//!   key; the gateway then refuses to start if a profile a rule gives workloads requires a
+//!   delegation. `mode = "disabled"` stops grants being read at all, and only a development
+//!   build starts with it. The gateway also refuses to start, and refuses a registry version
+//!   when it reloads, if a tool not classified `read` is served on a surface whose allowlist
+//!   admits a team that a rule gives a profile requiring a delegation while an issuer does not
+//!   require `pod`.
 //! - **Credentials** map each registry server's credential reference to the file holding it.
 //!   Every server's reference must be here, and nothing else may be.
 //! - **Metrics** are served in Prometheus text at `GET /metrics` on a listener of their own
@@ -183,7 +216,7 @@
 //! Every table refuses fields it does not know. Only `listen`, `registry.max_age_seconds`, the
 //! audit pools, the limits, each server's bounds, the drift interval and the reconciliation
 //! settings have defaults, so a gateway not told where to listen is reachable from its own
-//! machine only. `[metrics]`, each
+//! machine only. `[metrics]`, `[grants]`, each
 //! server's CA file and the reach settings may be left out, each under the rules above. Any
 //! other missing field is an error, and so is a field that does not belong to the chosen mode
 //! or kind, such as `subjects_file` on a user issuer.
@@ -203,6 +236,7 @@ use crate::config::{
     Algorithm, AuditSection, HttpSection, IdentitySection, IssuerEntry, IssuerKindEntry,
 };
 use crate::drift::{DriftError, DriftSection};
+use crate::grants::{GrantsFile, GrantsFileError, GrantsSection};
 use crate::keys::{DEFAULT_KEYS_REFRESH, MIN_KEYS_REFRESH};
 use crate::reach::ReachSettings;
 use crate::reconcile::{ReconcileSettings, ReconcileSettingsError, ReconciliationSection};
@@ -265,6 +299,9 @@ pub struct DeploymentFile {
     pub identity: IdentityFile,
     /// Where audit rows go.
     pub audit: AuditFile,
+    /// Whether and how turn grants are verified, if the table is given.
+    #[serde(default)]
+    pub grants: Option<GrantsFile>,
     /// Where metrics are served, if anywhere.
     #[serde(default)]
     pub metrics: Option<MetricsSection>,
@@ -657,6 +694,9 @@ pub enum DeploymentError {
     /// A reconciliation setting is out of range.
     #[error(transparent)]
     Reconciliation(#[from] ReconcileSettingsError),
+    /// A file the `[grants]` table names could not be read, or was refused.
+    #[error(transparent)]
+    Grants(#[from] GrantsFileError),
     /// The metrics listener would take the MCP listener's port.
     #[error(
         "`metrics.listen` ({metrics}) takes the port the gateway listens on for MCP ({listen}); \
@@ -697,6 +737,9 @@ pub struct Deployment {
     /// The sizes of the audit store's begin and finish pools: the defaults unless the file
     /// sets them, and the defaults when audit is disabled.
     pub audit_pools: PoolSizes,
+    /// The turn-grant gate, with each issuer's key files and the tool mapping read. Checking on
+    /// with no issuer when the file has no `[grants]` table.
+    pub grants: GrantsSection,
     /// Where metrics are served, or `None` for nowhere.
     pub metrics: Option<SocketAddr>,
     /// The caps on calls in flight.
@@ -727,6 +770,7 @@ impl std::fmt::Debug for Deployment {
             .field("registry_file", &self.registry_file)
             .field("audit", &self.audit)
             .field("audit_pools", &self.audit_pools)
+            .field("grants", &self.grants)
             .field("metrics", &self.metrics)
             .field("limits", &self.limits)
             .field("servers", &self.servers)
@@ -898,6 +942,10 @@ impl Deployment {
                 }
             }
         };
+        let grants = match file.grants {
+            Some(grants) => grants.section(base)?,
+            None => GrantsSection::default(),
+        };
         Ok(Self {
             deployment: file.deployment,
             listen: file.listen,
@@ -909,6 +957,7 @@ impl Deployment {
             keys_urls,
             audit,
             audit_pools,
+            grants,
             metrics: file.metrics.map(|metrics| metrics.listen),
             limits,
             servers,

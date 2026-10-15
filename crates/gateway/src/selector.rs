@@ -137,6 +137,15 @@ impl ProfileSelector {
         selected.unwrap_or_else(|| ProfileName::new(NO_PROFILE))
     }
 
+    /// Each rule for workloads: its issuer, its team and the profile it gives.
+    pub(crate) fn workload_rules(&self) -> impl Iterator<Item = (&Issuer, &TeamId, &ProfileName)> {
+        self.workloads.iter().flat_map(|(issuer, teams)| {
+            teams
+                .iter()
+                .map(move |(team, profile)| (issuer, team, profile))
+        })
+    }
+
     /// Every profile a rule names.
     pub fn profiles(&self) -> BTreeSet<&ProfileName> {
         let workloads = self.workloads.values().flat_map(BTreeMap::values);
