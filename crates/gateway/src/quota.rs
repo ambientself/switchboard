@@ -309,15 +309,21 @@ mod tests {
     #[test]
     fn a_team_token_is_given_back_when_the_servers_quota_refuses() {
         let now = Instant::now();
-        let quotas = Quotas::starting(quotas((60, 1), (60, 1)), now);
+        // A team's bucket gains a token a minute, the server's one a second.
+        let quotas = Quotas::starting(quotas((60, 1), (1, 1)), now);
         let a = TeamId::new("team-a");
         let b = TeamId::new("team-b");
         // Team b uses the server's one token.
         assert_eq!(quotas.take_at(Some(&b), now), Ok(()));
         assert_eq!(quotas.take_at(Some(&a), now), Err(QuotaScope::Server));
-        // A second later the server has a token again, and team a still has its own.
+        // A second later the server has a token again, and team a still has its own, which
+        // it could not have gained back by then.
         let later = now + Duration::from_secs(1);
         assert_eq!(quotas.take_at(Some(&a), later), Ok(()));
+        assert_eq!(
+            quotas.take_at(Some(&a), later + Duration::from_secs(1)),
+            Err(QuotaScope::Team)
+        );
     }
 
     #[test]
