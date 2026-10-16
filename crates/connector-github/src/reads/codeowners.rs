@@ -54,9 +54,10 @@ fn uncommented(line: &str) -> &str {
 
 /// Whether `pattern` matches `path`, its segments.
 ///
-/// Neither this nor [`glob`] recurses or backtracks: the work is at most the pattern's length
-/// times the path's, and the stack does not grow with either, so a hostile CODEOWNERS file
-/// cannot hold a worker or overflow its stack.
+/// Neither this nor [`glob`] recurses. This does not backtrack, and [`glob`] backs up only to
+/// just after the last `*` in a segment, so the work is at most the pattern's length times the
+/// path's, and the stack does not grow with either: a hostile CODEOWNERS file cannot hold a
+/// worker or overflow its stack.
 fn matches(pattern: &str, path: &[&str]) -> bool {
     let mut directory_only = pattern.ends_with('/');
     let trimmed = pattern.trim_end_matches('/');

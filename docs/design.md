@@ -1445,10 +1445,11 @@ The five newer reads keep the bounds and behavior docs/otto-baseline.md records:
   `pull_request_template.md` in `.github`, the root or `docs`. `AGENTS.md` is served only
   when CODEOWNERS (the first of `.github/CODEOWNERS`, `CODEOWNERS` and `docs/CODEOWNERS`) gives
   it an owner, by the last line whose pattern matches it; otherwise it is not read at all.
-  The matching neither recurses nor backtracks, so a hostile CODEOWNERS file costs work in
-  proportion to its length and cannot overflow a worker's stack. Served, it is quoted between two markers that carry a token made for the call from the
-  operating system's random source, so a marker in the file cannot close the quote. Each text
-  is cut at 64 KiB, said to be cut.
+  The matching does not recurse, and backs up only to just after the last `*` in a segment,
+  so a hostile CODEOWNERS file costs work in proportion to its length and cannot overflow a
+  worker's stack. Served, it is quoted between two markers that carry a token made for the
+  call from the operating system's random source, so a marker in the file cannot close the
+  quote. Each text is cut at 64 KiB, said to be cut.
 
 Each newer read asks for its own permission set, every permission at `read`, as Otto's gateway
 does: `actions`, `checks`, `pull_requests` and `statuses` for checks; `actions` for a job log;
