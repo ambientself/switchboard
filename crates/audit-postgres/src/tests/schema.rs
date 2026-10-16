@@ -143,7 +143,7 @@ async fn migrating_again_applies_nothing() {
         .iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(recorded, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(recorded, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
 }
 
 #[tokio::test]
@@ -184,7 +184,7 @@ async fn two_migrators_at_once_take_turns() {
         applied.sort_unstable();
         assert_eq!(
             applied,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
             "each migration is applied once"
         );
     }
@@ -378,6 +378,8 @@ async fn the_gateway_holds_exactly_its_column_grants() {
         ("UPDATE", "latency_ms"),
         ("UPDATE", "outcome"),
         ("UPDATE", "outcome_sentence"),
+        ("UPDATE", "resources"),
+        ("UPDATE", "resources_omitted"),
     ]
     .iter()
     .map(|(privilege, column)| ((*privilege).to_owned(), (*column).to_owned()))
@@ -540,6 +542,7 @@ async fn the_gateway_cannot_read_who_called_or_delete() {
         "proved_subject",
         "claimed_team",
         "tool",
+        "resources",
         "begun_at",
         "instance",
         "allowance_ms",
@@ -639,6 +642,95 @@ async fn a_completion_writes_nothing_else_even_for_the_owner() {
         .await
         .unwrap_err();
     assert!(message(&error).contains("has no outcome"), "{error}");
+}
+
+/// Migration 0011: a completion may write what a tool that checks its own scope reached in
+/// place of the `unknown` its row was begun with, as a list, and nothing else of the resources,
+/// whoever writes. Not without a completion, not after one, not on a row begun with named
+/// resources or a reach, and not as anything but a list. The gateway's role writes them but
+/// cannot read them back.
+#[tokio::test]
+async fn a_completion_replaces_only_unknown_resources_with_what_was_reached() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let owner = db.connect_as(OWNER_ROLE).await;
+    let gateway = db.connect_as(GATEWAY_ROLE).await;
+    let reached = r#"'[{"system": "github", "kind": "repository", "identifier": "o/r"}]'::jsonb"#;
+    let unknown = insert(&[("resources", r#"'"unknown"'::jsonb"#)]);
+
+    let id = insert_row(&gateway, &unknown).await;
+    let error = gateway
+        .execute(
+            &format!(
+                "UPDATE switchboard_audit.call_rows SET resources = {reached}
+                 WHERE id = '{id}'"
+            ),
+            &[],
+        )
+        .await
+        .unwrap_err();
+    assert!(message(&error).contains("has no outcome"), "{error}");
+    for not_a_list in [r#"'{"reach": "github-read"}'::jsonb"#, "'[]'::jsonb"] {
+        let other = insert_row(&gateway, &unknown).await;
+        let set = format!("outcome = 'ok', resources = {not_a_list}, resources_omitted = 0");
+        let written = complete_with(&gateway, &other, &set).await;
+        // An empty list is what a tool that reached nothing reports; a reach is refused.
+        assert_eq!(
+            written.is_ok(),
+            not_a_list == "'[]'::jsonb",
+            "{not_a_list}: {written:?}"
+        );
+    }
+    let set = format!("outcome = 'ok', resources = {reached}, resources_omitted = 2");
+    assert_eq!(complete_with(&gateway, &id, &set).await.unwrap(), 1);
+    let (resources, omitted): (serde_json::Value, i64) = owner
+        .query_one(
+            &format!(
+                "SELECT resources, resources_omitted FROM switchboard_audit.call_rows
+                 WHERE id = '{id}'"
+            ),
+            &[],
+        )
+        .await
+        .map(|row| (row.get(0), row.get(1)))
+        .unwrap();
+    assert_eq!(
+        resources,
+        serde_json::json!([{"system": "github", "kind": "repository", "identifier": "o/r"}])
+    );
+    assert_eq!(omitted, 2);
+    let error = complete_with(&gateway, &id, "outcome = 'ok', resources = '[]'::jsonb")
+        .await
+        .unwrap_err();
+    assert!(message(&error).contains("is already complete"), "{error}");
+    let error = gateway
+        .query(
+            &format!("SELECT resources FROM switchboard_audit.call_rows WHERE id = '{id}'"),
+            &[],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(&error), Some(INSUFFICIENT_PRIVILEGE));
+
+    let reach = insert(&[("resources", r#"'{"reach": "github-read"}'::jsonb"#)]);
+    for (client, begun) in [
+        (&gateway, insert(&[])),
+        (&owner, insert(&[])),
+        (&gateway, reach),
+    ] {
+        let named = insert_row(client, &begun).await;
+        for set in [
+            format!("outcome = 'ok', resources = {reached}"),
+            "outcome = 'ok', resources_omitted = 1".to_owned(),
+        ] {
+            let error = complete_with(client, &named, &set).await.unwrap_err();
+            assert!(
+                message(&error).contains("was not begun with unknown resources"),
+                "{set}: {error}"
+            );
+        }
+    }
 }
 
 /// Whether a row's begin time is the last minute's, and whether its completion time is its
@@ -914,7 +1006,7 @@ async fn the_deadline_migration_keeps_the_rows_already_written() {
 
     assert_eq!(
         migrate(&mut owner).await.unwrap(),
-        vec![3, 4, 5, 6, 7, 8, 9, 10]
+        vec![3, 4, 5, 6, 7, 8, 9, 10, 11]
     );
     for (id, due) in [
         (&open, "begun_at"),
@@ -1560,7 +1652,7 @@ async fn the_error_kind_migration_marks_the_errors_already_written() {
     let denial = insert_row(&owner, &denied()).await;
     let before = rows_without_error_kind(&owner).await;
 
-    assert_eq!(migrate(&mut owner).await.unwrap(), vec![6, 7, 8, 9, 10]);
+    assert_eq!(migrate(&mut owner).await.unwrap(), vec![6, 7, 8, 9, 10, 11]);
     assert_eq!(rows_without_error_kind(&owner).await, before);
     for (id, kind) in [
         (&failed, Some("before-0006")),
@@ -1780,7 +1872,7 @@ async fn the_reach_and_credential_migration_keeps_the_rows_already_written() {
         before.push(row.get::<_, Option<serde_json::Value>>(0));
     }
 
-    assert_eq!(migrate(&mut owner).await.unwrap(), vec![7, 8, 9, 10]);
+    assert_eq!(migrate(&mut owner).await.unwrap(), vec![7, 8, 9, 10, 11]);
     for (id, resources) in [&named, &unknown, &listed].into_iter().zip(before) {
         let row = owner.query_one(&read(id), &[]).await.unwrap();
         assert_eq!(
@@ -2079,7 +2171,7 @@ async fn the_delegation_migration_keeps_the_rows_already_written() {
         before.push(row.get::<_, serde_json::Value>(0));
     }
 
-    assert_eq!(migrate(&mut owner).await.unwrap(), vec![10]);
+    assert_eq!(migrate(&mut owner).await.unwrap(), vec![10, 11]);
     for (id, before) in rows.iter().zip(before) {
         let row = owner.query_one(&compared, &[id]).await.unwrap();
         assert_eq!(row.get::<_, serde_json::Value>(0), before, "{id}");

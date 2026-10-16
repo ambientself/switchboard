@@ -589,7 +589,7 @@ async fn the_receipts_migration_keeps_the_rows_already_written() {
     )
     .await;
 
-    assert_eq!(migrate(&mut owner).await.unwrap(), vec![8, 9, 10]);
+    assert_eq!(migrate(&mut owner).await.unwrap(), vec![8, 9, 10, 11]);
     let after = values(
         &owner,
         &format!(

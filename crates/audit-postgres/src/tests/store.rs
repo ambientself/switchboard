@@ -23,8 +23,8 @@ use tokio_postgres::{Client, NoTls};
 use super::{DELEGATION_COLUMNS, DelegationRead, GATEWAY_ROLE, TestDatabase};
 use crate::columns::{BeginRow, FinishRow, ListRow, allowance_ms};
 use crate::{
-    Budgets, FinishCounts, MAX_BEGUN_ROW_BYTES, MAX_OUTCOME_SENTENCE_BYTES, MAX_ROW_BYTES,
-    PgAuditError, PgAuditStore, PoolSizes,
+    Budgets, FinishCounts, MAX_BEGUN_ROW_BYTES, MAX_OUTCOME_SENTENCE_BYTES, MAX_REACHED_BYTES,
+    MAX_ROW_BYTES, PgAuditError, PgAuditStore, PoolSizes,
 };
 
 /// One call, as a test describes it.
@@ -622,6 +622,56 @@ async fn the_largest_row_finished_with_the_longest_completion_is_within_the_boun
     // The row as written, every column the table holds, is what the store counted.
     let written = written_bytes(&admin, &row).await;
     assert_eq!(written, begun + finished);
+    assert!(written <= MAX_ROW_BYTES, "{written}");
+}
+
+/// Decision 0011 and decision 0014, section 7: the largest row a tool that checks its own scope
+/// can begin, its `unknown` resources counted as the longest reach, finished with the longest
+/// reach and the longest completion finish writes, is written and reads back whole, and the
+/// row as the table holds it is at most 512 KiB.
+#[tokio::test]
+async fn the_largest_self_scoped_row_finished_with_the_longest_reach_is_within_the_bound() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let store = db.store(PoolSizes::default());
+    let admin = db.admin().await;
+
+    let largest = crate::columns::largest_self_scoped_record(MAX_BEGUN_ROW_BYTES);
+    let row = row_start().row;
+    store.begin(&row, &largest).await.unwrap();
+    let unknown = "\"unknown\"".len();
+    assert_eq!(
+        written_bytes(&admin, &row).await,
+        MAX_BEGUN_ROW_BYTES - MAX_REACHED_BYTES + unknown
+    );
+
+    let refused = completion(
+        Outcome::Refused {
+            sentence: "s".repeat(MAX_OUTCOME_SENTENCE_BYTES),
+        },
+        u64::from(u32::MAX),
+    );
+    let reach = crate::columns::largest_reach();
+    store
+        .finish_with_reference(&row, &refused, None, Some(&reach))
+        .await
+        .unwrap();
+    let read = read_back(&admin, &row).await;
+    assert!(
+        read == AuditRecord {
+            credential: None,
+            resources: RecordedResources::Named(reach.resources.clone()),
+            resources_omitted: reach.omitted,
+            completion: Some(refused.clone()),
+            ..largest.clone()
+        }
+    );
+    // The row as written, every column the table holds, is begin's bound, the reach now in the
+    // room it counted, and the completion.
+    let finished = "refused".len() + MAX_OUTCOME_SENTENCE_BYTES + 8;
+    let written = written_bytes(&admin, &row).await;
+    assert_eq!(written, MAX_BEGUN_ROW_BYTES + finished);
     assert!(written <= MAX_ROW_BYTES, "{written}");
 }
 

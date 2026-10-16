@@ -11,11 +11,13 @@
 //!
 //! A row is counted as the bytes of every value the store writes: a text value as its UTF-8, a
 //! text array as its elements', a JSON value as its JSON text, and an integer as 8 bytes, a
-//! list row's kind `list`, which its statement writes itself, included.
+//! list row's kind `list`, which its statement writes itself, included. An allowed call's
+//! `unknown` resources are counted as [`MAX_REACHED_BYTES`], since finish may write what its
+//! tool reached in their place.
 
 use gateway_core::audit::{
-    AuditRecord, AuditRowId, DecisionKind, ListRecord, RecordedDelegation, RecordedFailure,
-    RecordedResources, RowKind, StoreError,
+    AuditRecord, AuditRowId, DecisionKind, ListRecord, MAX_RECORDED_RESOURCES, ReachedResources,
+    RecordedDelegation, RecordedFailure, RecordedResources, RowKind, StoreError,
 };
 use gateway_core::{CredentialMode, CurrencyAnswer, Egress, Principal, PrincipalKind};
 use serde_json::{Value, json};
@@ -36,9 +38,21 @@ pub const COMPLETION_RESERVE: usize =
     "refused".len() + "oversized_or_late_read".len() + INTEGER_BYTES + MAX_OUTCOME_SENTENCE_BYTES;
 
 /// The most a call row may hold when begin writes it, in bytes: [`MAX_ROW_BYTES`] less
-/// [`COMPLETION_RESERVE`], 522,203, so the row stays within the bound once finished.
+/// [`COMPLETION_RESERVE`], 522,203, so the row stays within the bound once finished. An allowed
+/// call's `unknown` resources are counted as [`MAX_REACHED_BYTES`] towards it.
 /// `audit_postgres::MAX_BEGUN_ROW_BYTES`.
 pub const MAX_BEGUN_ROW_BYTES: usize = MAX_ROW_BYTES - COMPLETION_RESERVE;
+
+/// The most bytes finish writes in `resources` for a tool that checks its own scope: the most
+/// named resources hold, 64 of 4,656 bytes each, 63 commas and 2 brackets, 298,049 in all.
+/// Begin counts an allowed call's `unknown` resources as this, and finish refuses a longer
+/// reach. `audit_postgres::MAX_REACHED_BYTES`.
+pub const MAX_REACHED_BYTES: usize =
+    MAX_RECORDED_RESOURCES * MAX_RECORDED_RESOURCE_BYTES + (MAX_RECORDED_RESOURCES - 1) + 2;
+
+/// The most bytes one recorded resource holds as JSON: a system and a kind of 261 bytes, an
+/// identifier of 4,101, and 33 for the keys and punctuation.
+const MAX_RECORDED_RESOURCE_BYTES: usize = 2 * (2 + 2 * 128 + 3) + (2 + 2 * 2_048 + 3) + 33;
 
 /// The bytes of an integer column.
 const INTEGER_BYTES: usize = std::mem::size_of::<i64>();
@@ -124,6 +138,25 @@ fn delegation_sizes(
     ]
 }
 
+/// The bytes `record`'s resources are counted as: their JSON text, or, for an allowed call whose
+/// resources are `unknown`, [`MAX_REACHED_BYTES`], the most finish may write in their place.
+fn resources_bytes(record: &AuditRecord) -> usize {
+    let held = json_bytes(&resources(&record.resources));
+    if record.decision == DecisionKind::Allow && record.resources == RecordedResources::Unknown {
+        held.max(MAX_REACHED_BYTES)
+    } else {
+        held
+    }
+}
+
+/// The bytes the resources a tool `reached` hold as the Postgres store writes them in place of
+/// a row's `unknown` ones: their JSON text, as it writes named resources.
+pub fn reached_bytes(reached: &ReachedResources) -> usize {
+    json_bytes(&resources(&RecordedResources::Named(
+        reached.resources.clone(),
+    )))
+}
+
 /// Each column of the call row begin writes for `record` as the row `id`, and its bytes, as
 /// `audit_postgres`'s `BeginRow::sizes` counts them, in the same order.
 pub fn call_row_sizes(id: &AuditRowId, record: &AuditRecord) -> [(&'static str, usize); 38] {
@@ -180,7 +213,7 @@ pub fn call_row_sizes(id: &AuditRowId, record: &AuditRecord) -> [(&'static str, 
             "classification",
             optional_bytes(record.classification.map(|c| c.as_str())),
         ),
-        ("resources", json_bytes(&resources(&record.resources))),
+        ("resources", resources_bytes(record)),
         ("resources_omitted", INTEGER_BYTES),
         ("decision", decision.len()),
         ("reason", reason),
@@ -348,6 +381,19 @@ pub(crate) fn refuse_over(
     Ok(())
 }
 
+/// Refuses a reach longer than [`MAX_REACHED_BYTES`], in the Postgres store's words.
+pub(crate) fn refuse_long_reach(reached: &ReachedResources) -> Result<(), StoreError> {
+    let bytes = reached_bytes(reached);
+    if bytes > MAX_REACHED_BYTES {
+        return Err(format!(
+            "the audit column resources would hold {bytes} bytes, more than the \
+             {MAX_REACHED_BYTES} it may hold, so it is not written"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Refuses a refusal's sentence longer than [`MAX_OUTCOME_SENTENCE_BYTES`], in the Postgres
 /// store's words.
 pub(crate) fn refuse_long_sentence(sentence: &str) -> Result<(), StoreError> {
@@ -360,4 +406,39 @@ pub(crate) fn refuse_long_sentence(sentence: &str) -> Result<(), StoreError> {
         .into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use gateway_core::audit::RecordedResource;
+
+    use super::*;
+
+    /// A reach of exactly [`MAX_REACHED_BYTES`] as the Postgres store writes it is accepted, and
+    /// one a byte longer is refused in that store's words, naming `resources` and the cap.
+    #[test]
+    fn a_reach_longer_than_the_room_begin_left_is_refused() {
+        assert_eq!(MAX_REACHED_BYTES, 298_049);
+        let reach = |identifier: usize| ReachedResources {
+            resources: vec![RecordedResource {
+                system: "s".to_owned(),
+                kind: "k".to_owned(),
+                identifier: "i".repeat(identifier),
+            }],
+            omitted: 0,
+        };
+        let around = r#"[{"system":"s","kind":"k","identifier":""}]"#.len();
+        let fits = reach(MAX_REACHED_BYTES - around);
+        assert_eq!(reached_bytes(&fits), MAX_REACHED_BYTES);
+        refuse_long_reach(&fits).expect("a reach at the cap is written");
+        let over = reach(MAX_REACHED_BYTES - around + 1);
+        assert_eq!(
+            refuse_long_reach(&over).unwrap_err().to_string(),
+            format!(
+                "the audit column resources would hold {} bytes, more than the \
+                 {MAX_REACHED_BYTES} it may hold, so it is not written",
+                MAX_REACHED_BYTES + 1
+            )
+        );
+    }
 }

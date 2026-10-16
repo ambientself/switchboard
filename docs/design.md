@@ -161,7 +161,7 @@ lines only once the interfaces between them have settled.
 | `gateway-core` | Principals, classification, the decision function, the tool registry, the audit record type, denial sentences. No I/O. |
 | `gateway-identity` | Token verifiers, one per issuer type, and the team manifest loader. |
 | `audit-postgres` | The audit store over Postgres: the schema, its two roles, the migrations and the boot check. |
-| `connector-github` | The GitHub connector, in the gateway's own process: Otto's GitHub tools, so far `github__get_file`, `github__get_pr` and `github__get_issue`. Every token comes from the key custodian, through the client in `key-custodian`. A fake GitHub REST API behind `test-support`. |
+| `connector-github` | The GitHub connector, in the gateway's own process: Otto's GitHub tools, so far its nine reads other than skill bodies. Every token comes from the key custodian, through the client in `key-custodian`. A fake GitHub REST API behind `test-support`. |
 | `key-custodian` | The key custodian (`switchboard-custodian`), the one process that holds the GitHub App key, and its client, a library module the GitHub connector depends on. The gateway never starts the key-holding process; it links the whole crate, server code too, until the crate gains a client-only feature (#219). |
 | `gateway-otto` | The Otto adapter: Otto's policy profile, the turn-grant verifier and the client for Otto's resolver interface. The core crates do not depend on it. |
 | `connector-proxy` | The connector that forwards to a separate MCP server. |
@@ -705,19 +705,24 @@ the custodian's own record, with the revision it was checked against and never t
 is counted on a metrics listener of its own. No demo deploys it: that needs a real App.
 
 **The GitHub connector as built** (#12, the crate `connector-github`). It runs in the
-gateway's own process and holds no key. For each call it asks the custodian for one token,
-naming the caller's proved team, the tool, the repositories, the tool's entry's permission set
-as `[[connectors]]` states it, and the revision the call was decided under, which the core
-hands every connector with the call. The repositories are narrowed as the entry says: `limit`,
-the caller's limit as the snapshot the call was decided under holds it, its GitHub
+gateway's own process and holds no key. For each call it asks the custodian for a token,
+naming the caller's proved team, the tool, the repositories, a permission set and the revision
+the call was decided under, which the core hands every connector with the call. The
+permission set is the tool's entry's, as `[[connectors]]` states it, for `github__get_file`,
+`github__get_pr` and `github__get_issue`; the newer reads each ask for their own, as Otto's
+gateway does, and the connector refuses to be built with an entry that serves one of them
+without stating every permission it asks for (section 13). The repositories are narrowed as
+the entry says: `limit`, the caller's limit as the snapshot the call was decided under holds
+it, its GitHub
 repositories on the one organization the deployment configures, which the decision carries to
 the connector with the call; or `call`, the one repository the call names. The connector
 refuses to be built for an entry narrowed `none`. A token is used for its one call and
 dropped; it never appears in an answer, a row or a log line. A refusal by the custodian is an
 `error` of the kind `custodian_refusal`, GitHub's refusal to issue the token `vendor_refusal`,
 and a custodian that cannot be reached or does not answer in time `other`. The deployment
-file's `[github]` table names the organization, GitHub's API URL and its CA file, and the
-custodian's socket; the gateway reads no key and names none.
+file's `[github]` table names the organization, GitHub's API URL and its CA file, the
+custodian's socket, and the hosts a job log redirect may point to; the gateway reads no key and
+names none.
 
 ## 10. The denial contract
 
@@ -836,15 +841,20 @@ written complete, has no finish, and is never open.
   longest outcome, 7, the longest error kind, 22, the latency, 8, and the longest refusal
   sentence finish writes, 2,048). Finish refuses a longer sentence, as it refuses one holding
   U+0000 (the next entry but one). Every sentence the gateway makes fits in 2,048 bytes with a
-  server and tool name of 900 bytes each. A list row is never completed, and is refused over
+  server and tool name of 900 bytes each. An allowed call whose resources are `unknown`, one
+  whose tool checks its own scope, may have them replaced at finish by what its tool reached
+  (below), so begin counts its resources as 298,049 bytes, the most a reach can hold, not as
+  the 9 bytes of `"unknown"`; finish refuses a longer reach, never cut, as it refuses a long
+  sentence. A list row is never completed, and is refused over
   512 KiB itself. Either refusal names the row's largest column, so the call or the list is
   refused; a reach whose entry name is long enough is refused this way, naming `resources`.
   Every value a caller chooses is capped, and in the largest row they take at most 316,129
   bytes, leaving 206,074 of a begun row's 522,203 for the values from the gateway's own
   configuration, which have no cap of their own. The largest row a call can begin, finished
-  with the longest completion finish writes, is at most 524,288 bytes
-  (`audit_postgres::MAX_ROW_BYTES` works it out, and its tests write that row, finish it, read
-  it back and count every column the table holds for it).
+  with the longest completion finish writes and, for a tool that checks its own scope, the
+  longest reach, is at most 524,288 bytes (`audit_postgres::MAX_ROW_BYTES` works it out, and
+  its tests write both rows, finish them, read them back and count every column the table
+  holds for them).
 - **Audit failure fails closed.** If the row cannot be written, the call is refused.
 - **A row is the record, or there is no row.** A store that cannot hold a value exactly refuses
   the record rather than store another value in its place, and the call is refused. Postgres
@@ -876,7 +886,24 @@ written complete, has no finish, and is never open.
   It is part of the row's first half, not of its completion: a row whose tool has no entry
   records none, and rows written before it was recorded read as not recorded.
 - **A tool that checks its own scope reports what it reached** when it finishes, in place of
-  `unknown`. This is required before milestone 4.
+  `unknown` ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md),
+  #12). As built: a built-in tool declared `checks_own_scope` is begun with `unknown`
+  resources, and with its success its connector reports the resources it reached
+  (`ToolOutcome::Reached`). Finish records them in place of `unknown`, in the same write as the
+  completion, escaped, capped at 64 and counted as named resources are. A tool that reached
+  nothing records an empty list, not `unknown`; one that fails or refuses leaves `unknown`; a
+  call that named its resources before it ran keeps them. Only a tool declared
+  `checks_own_scope` may report: from any other tool the report breaks the connector's
+  contract, so nothing of it is recorded, the result is withheld, and the call is recorded as
+  an `error` of the kind `other`, or as `unknown` for a side effect, which may have taken
+  effect. Both stores write the reach only on a row begun with `unknown` resources. In
+  Postgres, migration 0011 lets `complete_once` accept that one change, from `unknown` to a
+  list, and grants the gateway's role UPDATE on `resources` and `resources_omitted`, which the
+  boot check expects; the role still cannot read them, so a repeated finish is compared on its
+  completion alone, in both stores. A reach is bounded as named resources are, at 298,049
+  bytes, and begin counts that room for an allowed row it writes with `unknown` resources, so
+  a finished row is within 512 KiB (the entry above); finish refuses a longer reach. The
+  contract suite covers it on both stores.
 - **A turn grant is recorded by what identifies it:** its digest (the SHA-256 of the grant as
   presented), issuer, key ID, session, turn, execution and epoch, the turn's egress setting when
   the grant carries one, and the pod UID the caller's token proves; and, when Otto was asked,
@@ -1147,8 +1174,10 @@ in the gateway's own process under `[connectors.<name>]`, and a cap or rate quot
 does not name, and with a `[connectors.<name>]` for a connector it does not run in its own
 process. The one built-in connector wired is GitHub's, under the name of each GitHub entry that
 declares its credential (section 13), so any other `[connectors.<name>]` is refused at start.
-It refuses to start, too, with such an entry and no `[github]` table, and with a `[github]`
-table and no such entry (#12). The boot gates wrap every connector in the gateway's own process
+It refuses to start, too, with such an entry and no `[github]` table, with a `[github]`
+table and no such entry, with a job log host its API URL's rules refuse, and with an entry
+serving one of the newer reads that does not state every permission the read asks for (#12).
+The boot gates wrap every connector in the gateway's own process
 in its bound, and in the rate quotas, so none runs without them, and refuse one wired with a
 bound of zero or past the ceilings. The
 termination grace must cover the longest deadline either table sets, and demo-checks holds the
@@ -1400,8 +1429,10 @@ call or to the limit, and no built-in entry: its connector narrows. A reload tha
 built-in entry under the same revision is refused as an unchanged revision, as the custodian
 refuses it, and under a new one until a restart, since the connector was built with the entry.
 
-The GitHub connector serves three of Otto's read tools so far: `github__get_file`,
-`github__get_pr` and `github__get_issue`. Each checks, before anything is asked of the
+The GitHub connector serves nine of Otto's read tools so far. Eight read one repository each:
+`github__get_file`, `github__get_pr`, `github__get_issue`, `github__get_checks`,
+`github__get_job_log`, `github__list_releases`, `github__pr_template` and
+`github__repo_conventions`. Each checks, before anything is asked of the
 custodian or of GitHub, what Otto's gateway checks (docs/otto-baseline.md): its arguments
 parse into its own types, and a malformed one is `error` with the kind `invalid_arguments`; its
 owner is the configured organization, and a call naming another is `refused`, with the
@@ -1412,10 +1443,67 @@ this gateway for a repository of another organization that a limit holds. A file
 256 KiB and an issue's or a pull request's comments at the first twenty, oldest first, each
 said to be cut; every result carries `provenance`, with `"trust": "untrusted-external"`. GitHub's
 404, which it also answers for a repository the token cannot see, is `other`; its 403 is
-`vendor_refusal`; its rate limit is `other`, with a sentence saying so. None of the three checks
-its own scope, so none has resources to report when it finishes: each is declared from its
-arguments, and its row names its repository. The other read tools, the write tools, Jira, the
-lookup by marker and the comment exception are not built.
+`vendor_refusal`; its rate limit is `other`, with a sentence saying so. None of the eight
+checks its own scope, so none has resources to report when it finishes: each is declared
+from its arguments, and its row names its repository.
+
+The five newer reads keep the bounds and behavior docs/otto-baseline.md records:
+
+- `github__get_checks` reads the pull request's head, then its first thirty check runs; for
+  each failing one, its first ten annotations and, for a GitHub Actions run, its job's steps;
+  then the head's combined status and its first thirty statuses. Each list says when it was
+  cut, and a summary or an annotation's message is cut at 4 KiB.
+- `github__get_job_log` asks GitHub for the log and does not follow the redirect it answers
+  with: it asks a host pinned in the deployment file's `[github] job_log_hosts` for the
+  redirect's path and query, with no token, and only when the redirect's scheme, host and port
+  are that host's. A redirect anywhere else is `refused` before any request to it, naming its
+  scheme, host and port and never its signed path or query; a log served without a redirect is
+  an `error` whose body is not read, and so is no log. At most 32 MiB is read and the last
+  64 KiB kept, said to be cut. With no host pinned, every redirect is refused.
+- `github__list_releases` reads thirty releases, without their notes, on a token for
+  `contents`, and thirty tags on one for `metadata`, each list said to be cut.
+- `github__pr_template` and `github__repo_conventions` read the repository's default branch
+  and its head commit, then every file at that commit. The template is the first
+  `pull_request_template.md` in `.github`, the root or `docs`. `AGENTS.md` is served only
+  when CODEOWNERS (the first of `.github/CODEOWNERS`, `CODEOWNERS` and `docs/CODEOWNERS`) gives
+  it an owner, by the last line whose pattern matches it; otherwise it is not read at all.
+  The matching does not recurse, and backs up only to just after the last `*` in a segment,
+  so a hostile CODEOWNERS file costs work in proportion to its length and cannot overflow a
+  worker's stack. Served, it is quoted between two markers that carry a token made for the
+  call from the operating system's random source, so a marker in the file cannot close the
+  quote. Each text is cut at 64 KiB, said to be cut.
+
+Each newer read asks for its own permission set, every permission at `read`, as Otto's gateway
+does: `actions`, `checks`, `pull_requests` and `statuses` for checks; `actions` for a job log;
+`contents` and then `metadata` for releases and tags; and `contents` for the template and
+`AGENTS.md`. Three differences from Otto's gateway are deliberate. `github__pr_template` and
+`github__repo_conventions` take `owner` as well as `repo`, since a registry adapter names a
+repository from two arguments, as a limit holds it. Their configuration is read within the call,
+not loaded in the background and answered as pending while it loads. And a malformed owner or
+repository names a repository outside every limit, so check 6 denies it before the connector
+parses it.
+
+The ninth, `github__search`, searches the organization's issues and pull requests and is
+declared `checks_own_scope`: which repositories a search reaches is known only once GitHub
+answers, so its call is begun with `unknown` resources. It checks the caller's query, 1 to 256
+bytes with no control character, whose quotes pair up and whose parentheses balance outside
+them, and a query that fails is `invalid_arguments`, so it can neither close the parenthesis it
+is put in nor open a quote that swallows the qualifier after it. An `org:` or `user:` qualifier
+naming another account is `refused`, as Otto refuses it. The query is sent as Otto's gateway
+sends it: the caller's in parentheses, then the organization qualifier,
+`(query) org:{organization}`, for one page of ten, with GitHub's advanced search requested. Its
+token is narrowed to the caller's limit, but GitHub's search also answers from public
+repositories a token was not narrowed to, so every result is checked against the caller's limit
+as the call's decision held it, and one from a repository outside it is withheld whole: that
+filter, not the qualifier, holds a search to the team's repositories. At most ten results come
+back, without their bodies, said to be cut when GitHub found more, and tagged as evidence. The
+connector reports the repositories the results came from as what the call reached, and its row
+records them in place of `unknown` when it finishes (section 11); a search that returns nothing
+records an empty list. GitHub's 422, a query it cannot run, is `invalid_arguments`. A search
+runs only under an entry narrowed to the caller's limit, as the loader requires of a tool that
+checks its own scope, and a caller whose limit holds no repository of the organization is
+refused before any request. The write tools, Jira, `otto__declare_unverified_claim`,
+`github__skill_body`, the lookup by marker and the comment exception are not built.
 
 A GitHub entry that names a `reach_report` has its reach checked against GitHub's own report,
 the first kind of reach check in decision 0011, section 4 (#193). Reading the report needs a
@@ -2161,13 +2249,16 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   every value it writes, the completion and a list row's kind included. Begin refuses a call
   row over 522,203 bytes, leaving a reserve of 2,085 bytes for the completion; finish refuses a
   refusal sentence over 2,048 bytes, as it refuses one holding U+0000, so the row is its record
-  or keeps no completion (section 11); list refuses a list row, which is never completed, over
+  or keeps no completion (section 11). Begin counts an allowed call's `unknown` resources as
+  the longest reach finish may write in their place, 298,049 bytes, and finish refuses a longer
+  reach (#12). List refuses a list row, which is never completed, over
   512 KiB. Each refusal at begin or list names the row's largest column, so the call or the
   list is refused. `audit_postgres::MAX_ROW_BYTES` works out the largest row a call can make,
   316,129 bytes of capped values. Tests write it at begin's bound to Postgres, finish it with
   the longest completion finish writes, read it back, and count every column the table holds
-  for it, within 512 KiB; and write a list row at 512 KiB, which the table holds at exactly
-  that.
+  for it, within 512 KiB; do the same for the largest row a tool that checks its own scope can
+  begin, finished with the longest reach; and write a list row at 512 KiB, which the table
+  holds at exactly that.
 - The decision 0014 signals other than each issuer's key age: built. The calls shed by scope
   and each proxied server's calls by outcome, latency and late or oversized answers (#139), the
   policy's age (#132), and each server's drift polls, withdrawals, probe results and
@@ -2285,11 +2376,46 @@ that removes the exception-list check.
   entry's permissions and the revision; a custodian refusal and a custodian that is not there;
   each vendor error; no token in an answer, a row or a log line; the in-process bound, late
   and oversized; the team's rate quota, from the wiring and from the deployment file; each
-  start refusal; and a reload that changes an entry. Not built: the other read tools, the
-  write tools, Jira, lookups, the comment exception, and any deployment of a GitHub entry,
-  which needs a real App. Left as they are: GitHub names are compared case-sensitively, so a
-  call that writes an owner or a repository in another case than its limit does is denied;
-  and each GitHub entry has quota buckets of its own, not GitHub as a whole.
+  start refusal; and a reload that changes an entry. Not built: the write tools, Jira,
+  lookups, the comment exception, and any deployment of a GitHub entry, which needs a real
+  App. Left as they are: GitHub names are compared case-sensitively, so a call that
+  writes an owner or a repository in another case than its limit does is denied; and each
+  GitHub entry has quota buckets of its own, not GitHub as a whole.
+
+- Built, in `connector-github`: the five newer reads, `github__get_checks`,
+  `github__get_job_log`, `github__list_releases`, `github__pr_template` and
+  `github__repo_conventions` (section 13), each asking the custodian for its own permission
+  set, and `[github] job_log_hosts`, the hosts a job log redirect may point to. The fake GitHub
+  REST API serves them, with a fake job log host, and the fake App's installation has
+  `actions`, `checks` and `statuses` at `read`. Their tests run over HTTP as the first three's
+  do: each tool's success and its bounds; its token narrowed to the team's repositories with
+  its own permission set, and two tokens for releases and tags; another organization refused
+  and a repository outside the limit denied, with no request; malformed arguments; and vendor
+  errors, with no token in what the caller reads or a row holds. A job log is read from the
+  pinned host at the redirect's path and query with no credential, and a redirect to another
+  host is refused with no request made to it. The template and `AGENTS.md` are read at the
+  default branch's head, and `AGENTS.md` without a CODEOWNERS owner is neither served nor
+  read; with one, it is quoted in a frame whose token differs on every call. Mutations remove
+  each bound, the host check, the CODEOWNERS check and the frame token's randomness, and ask
+  for the wrong permission set. Not built: `otto__declare_unverified_claim`, which records a
+  claim and reaches no vendor, so it is no GitHub tool, and would need a built-in connector of
+  its own with no credential, which the registry's built-in entries do not yet have; and
+  `github__skill_body`, which serves a skill only from the set pinned for the turn, and the
+  v3 grant carries no skill set. Left as they are: the differences section 13 lists; GitHub's
+  own job log hosts are not named here, so a deployment pins them in `job_log_hosts` and its
+  CA file must hold their CAs; and the CODEOWNERS reading follows GitHub's documented rules
+  without GitHub's own check that each owner exists and may own the file.
+
+- Built: `github__search`, declared `checks_own_scope` (section 13), and decision 0011's
+  report of what such a tool reached (section 11): the core's `ToolOutcome::Reached`, recorded
+  at finish in place of `unknown` and refused from any other tool, both stores, Postgres's
+  migration 0011 and the boot check's grant, and the contract suite's cases on both stores. Its
+  tests run over HTTP as the other tools' do: results from repositories outside the caller's
+  limit withheld and the rest recorded as reached; a search that returns nothing recorded as an
+  empty list; the query built as Otto's gateway builds it; a malformed query, and one GitHub
+  cannot run, `invalid_arguments` with nothing reached; and a qualifier naming another
+  organization refused before any request. The search's filter compares repository names
+  without regard to case, as GitHub does, and records the limit's own spelling.
 
 **#12, the bound around in-process connectors and the rate quotas** (decision 0014, sections 1
 and 2). Built before any built-in connector, so the first one is bounded from its first call:
@@ -2643,10 +2769,12 @@ that can do what Postgres cannot tests nothing.
    cannot hold exactly, such as one with U+0000 in a text value, is refused at begin and
    leaves no row. The fake must refuse the same records. It refuses what the Postgres store's
    column mapping refuses, the 512 KiB row bound (begin's 522,203 bytes for a call row, 512 KiB
-   for a list row) and the 2,048-byte cap on a refusal sentence at finish included. It counts a
-   row with copies of that store's constants and count, which a test in `audit-postgres` checks
-   against the originals. Of the table's own constraints, it checks the shape of unknown
-   resources and of a reach (no count left out, an entry named) and `kind_shape` so far.
+   for a list row, an allowed call's `unknown` resources counted as the longest reach), the
+   2,048-byte cap on a refusal sentence and the 298,049-byte cap on a reach at finish included.
+   It counts a row with copies of that store's constants and count, which a test in
+   `audit-postgres` checks against the originals. Of the table's own constraints, it checks the
+   shape of unknown resources and of a reach (no count left out, an entry named) and
+   `kind_shape` so far.
 3. `finish` completes a row once, accepts an identical repeat, refuses a different one, and
    touches only the completion columns. A refusal is a returned error, not a panic.
 4. Times and deadlines come from the store's clock: database time for Postgres, the

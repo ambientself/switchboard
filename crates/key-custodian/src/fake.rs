@@ -263,10 +263,13 @@ struct TokenBody {
 /// The permissions the fake's installation has: what a token asked for without any gets.
 fn installation_permissions() -> BTreeMap<String, String> {
     [
+        ("actions", "read"),
+        ("checks", "read"),
         ("contents", "write"),
         ("issues", "write"),
         ("metadata", "read"),
         ("pull_requests", "write"),
+        ("statuses", "read"),
     ]
     .into_iter()
     .map(|(name, level)| (name.to_owned(), level.to_owned()))

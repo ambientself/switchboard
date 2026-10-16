@@ -10,7 +10,7 @@ use deadpool_postgres::{
     ClientWrapper, Manager, ManagerConfig, Object, Pool, PoolError, RecyclingMethod, Transaction,
 };
 use gateway_core::audit::{
-    AuditRowId, Completion, ErrorKind, ListRecord, RowCompletion, StoreError,
+    AuditRowId, Completion, ErrorKind, ListRecord, ReachedResources, RowCompletion, StoreError,
 };
 use gateway_core::receipt::{ReceiptRequest, Reservation};
 use gateway_core::{AuditRecord, AuditStore, BoxFuture, Receipt, VendorReference};
@@ -1099,6 +1099,7 @@ impl PgAuditStore {
                 latency_ms: 0,
                 settles: "not_performed",
                 reference: None,
+                reached: None,
             },
             attempt: self.budgets.answer,
             deadline: Instant::now() + self.budgets.finish_deadline,
@@ -1141,16 +1142,18 @@ impl PgAuditStore {
         row: &AuditRowId,
         completion: &Completion,
     ) -> Result<(), PgAuditError> {
-        self.finish_with_reference(row, completion, None).await
+        self.finish_with_reference(row, completion, None, None)
+            .await
     }
 
     /// Finish, as [`AuditStore::finish`] describes it, with the vendor's `reference` for the
-    /// row's receipt.
-    async fn finish_with_reference(
+    /// row's receipt and the resources its tool `reached`.
+    pub(crate) async fn finish_with_reference(
         &self,
         row: &AuditRowId,
         completion: &Completion,
         reference: Option<&VendorReference>,
+        reached: Option<&ReachedResources>,
     ) -> Result<(), PgAuditError> {
         let _timed = Timed::start(&self.counters.finish_latency);
         let started = Instant::now();
@@ -1163,6 +1166,7 @@ impl PgAuditStore {
         };
         let finish = match FinishRow::from_completion(completion)
             .and_then(|finish| finish.with_reference(reference))
+            .and_then(|finish| finish.with_reached(reached))
         {
             Ok(finish) => finish,
             Err(error) => {
@@ -1554,19 +1558,42 @@ async fn complete_in_transaction(
             });
         }
     }
-    let statement = transaction.prepare_cached(FinishRow::UPDATE).await?;
-    let updated = transaction
-        .execute(
-            &statement,
-            &[
-                &row,
-                &finish.outcome,
-                &finish.outcome_sentence,
-                &finish.error_kind,
-                &finish.latency_ms,
-            ],
-        )
-        .await?;
+    let updated = match &finish.reached {
+        None => {
+            let statement = transaction.prepare_cached(FinishRow::UPDATE).await?;
+            transaction
+                .execute(
+                    &statement,
+                    &[
+                        &row,
+                        &finish.outcome,
+                        &finish.outcome_sentence,
+                        &finish.error_kind,
+                        &finish.latency_ms,
+                    ],
+                )
+                .await?
+        }
+        Some((resources, omitted)) => {
+            let statement = transaction
+                .prepare_cached(FinishRow::UPDATE_REACHED)
+                .await?;
+            transaction
+                .execute(
+                    &statement,
+                    &[
+                        &row,
+                        &finish.outcome,
+                        &finish.outcome_sentence,
+                        &finish.error_kind,
+                        &finish.latency_ms,
+                        resources,
+                        omitted,
+                    ],
+                )
+                .await?
+        }
+    };
     if updated == 1 {
         let statement = transaction.prepare_cached(ReceiptRow::SETTLE).await?;
         transaction
@@ -1741,6 +1768,7 @@ impl AuditStore for PgAuditStore {
                 completion.row(),
                 completion.completion(),
                 completion.reference(),
+                completion.reached(),
             )
             .await
             .map_err(StoreError::from)

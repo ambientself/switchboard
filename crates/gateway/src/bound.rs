@@ -191,7 +191,9 @@ impl Bounded {
     /// `outcome`, the connector's own, unless its result is over the size bound.
     fn sized(&self, outcome: ToolOutcome, read: bool, tool: &ToolName) -> ToolOutcome {
         let result = match &outcome {
-            ToolOutcome::Ok(result) | ToolOutcome::Completed(result, _) => result,
+            ToolOutcome::Ok(result)
+            | ToolOutcome::Completed(result, _)
+            | ToolOutcome::Reached(result, _) => result,
             ToolOutcome::Error(..) | ToolOutcome::Refused(_) | ToolOutcome::Unknown => {
                 return outcome;
             }
@@ -265,7 +267,7 @@ impl Connector for Bounded {
 /// The name of `outcome` as a row records it.
 fn outcome_name(outcome: &ToolOutcome) -> &'static str {
     match outcome {
-        ToolOutcome::Ok(_) | ToolOutcome::Completed(..) => "ok",
+        ToolOutcome::Ok(_) | ToolOutcome::Completed(..) | ToolOutcome::Reached(..) => "ok",
         ToolOutcome::Error(..) => "error",
         ToolOutcome::Refused(_) => "refused",
         ToolOutcome::Unknown => "unknown",

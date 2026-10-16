@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use connector_github::fake::{FakeRest, Mode};
+use connector_github::fake::{FakeLogHost, FakeRest, Mode};
 use connector_github::report::LIST_INSTALLATION_REPOSITORIES as REPORT_TOOL;
 use gateway::boot::{self, Settings, Wiring};
 use gateway::reach::REACH_ALLOWANCE;
@@ -190,7 +190,11 @@ registry = []
     };
     let mut text = head(true);
     let mut approvals = Vec::new();
-    for definition in connector_github::definitions() {
+    // The entry's own three tools, of the connector's read tools.
+    let own = connector_github::definitions()
+        .into_iter()
+        .filter(|definition| [GET_FILE, GET_ISSUE, GET_PR].contains(&definition.name));
+    for definition in own {
         let resources = r#"{ from_arguments = [{ from_argument = "repo", qualified_by = "owner", system = "github", kind = "repository" }] }"#;
         approvals.push((definition, ENTRY, resources));
     }
@@ -283,6 +287,8 @@ struct World {
     dir: PathBuf,
     app: Arc<FakeGitHub>,
     rest: FakeRest,
+    /// The job log host the deployment pins, which no test here reads from.
+    _log_host: FakeLogHost,
     custodian: Option<Running>,
     record: Buffer,
     store: Arc<InMemoryAuditStore>,
@@ -323,6 +329,7 @@ impl World {
             .unwrap(),
         );
         let rest = FakeRest::start(app.clone(), ACCOUNT).await.unwrap();
+        let log_host = FakeLogHost::start().await.unwrap();
         let registry = registry_text("r1", FIRST);
         write(&dir.join("registry.toml"), &registry, 0o644);
         write(&dir.join("app-key.pem"), &KEY.0, 0o600);
@@ -343,7 +350,7 @@ impl World {
         let socket = dir.join("c.sock");
         write(
             &dir.join("gateway.toml"),
-            &deployment_text(&rest.url(), &socket, ""),
+            &deployment_text(&rest.url(), &socket, &log_host.url(), ""),
             0o644,
         );
         let record = Buffer::default();
@@ -429,6 +436,7 @@ impl World {
             dir,
             app,
             rest,
+            _log_host: log_host,
             custodian: Some(custodian),
             record,
             store,

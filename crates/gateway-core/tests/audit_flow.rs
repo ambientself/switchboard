@@ -86,6 +86,11 @@ fn surface(name: &str, tools: &[&str]) -> Surface {
 /// `fixture__elsewhere` is approved, on a surface other than `fixture`, unless `elsewhere` is
 /// false, in which case it is approved nowhere.
 fn snapshot_with(elsewhere: bool) -> PolicySnapshot {
+    PolicySnapshot::new(snapshot_data(elsewhere)).unwrap()
+}
+
+/// What [`snapshot_with`] is made from.
+fn snapshot_data(elsewhere: bool) -> SnapshotData {
     let mut tools = vec![
         tool("fixture__read", Classification::Read),
         tool("fixture__propose", Classification::Propose),
@@ -95,7 +100,7 @@ fn snapshot_with(elsewhere: bool) -> PolicySnapshot {
         tools.push(tool("fixture__elsewhere", Classification::Read));
         surfaces.push(surface("other", &["fixture__elsewhere"]));
     }
-    PolicySnapshot::new(SnapshotData {
+    SnapshotData {
         revision: "audit-1".into(),
         tools,
         surfaces,
@@ -117,8 +122,7 @@ fn snapshot_with(elsewhere: bool) -> PolicySnapshot {
         ],
         limits: limits(),
         entries: Vec::new(),
-    })
-    .unwrap()
+    }
 }
 
 fn snapshot() -> PolicySnapshot {
@@ -1938,4 +1942,203 @@ fn the_currency_answer_is_recorded_when_one_was_asked() {
         let _ = begin_as(&store, common::start(), &context);
         assert_eq!(store.last().currency, currency.answer(), "{currency:?}");
     }
+}
+
+// --- What a tool that checks its own scope reached (decision 0011) ---------------------------
+
+/// [`snapshot`]'s tools, with `fixture__search`, a read declared `checks_own_scope`, and
+/// `fixture__scoped_propose`, a side effect declared the same, on the surface `fixture`.
+fn scoped_snapshot() -> PolicySnapshot {
+    let mut data = snapshot_data(true);
+    for (name, classification) in [
+        ("fixture__search", Classification::Read),
+        ("fixture__scoped_propose", Classification::Propose),
+    ] {
+        let mut scoped = tool(name, classification);
+        scoped.resources = ResourceDeclaration::ChecksOwnScope;
+        data.tools.push(scoped);
+        data.surfaces[0].tools.insert(tool_name(name));
+    }
+    PolicySnapshot::new(data).unwrap()
+}
+
+/// The guard of `context`, decided under [`scoped_snapshot`] with a delegation that lists its
+/// tools, and begun.
+fn scoped_guard(store: &dyn AuditStore, context: &CallContext) -> gateway_core::AuditGuard {
+    let mut context = context.clone();
+    let tools = [
+        "fixture__read",
+        "fixture__propose",
+        "fixture__search",
+        "fixture__scoped_propose",
+    ];
+    context.caller.delegation = Some(common::presented(&common::delegation(
+        "payments",
+        tools.map(tool_name),
+    )));
+    match common::ready(audit::begin(
+        store,
+        common::start(),
+        decide(&scoped_snapshot(), &context),
+        json!({"query": "evidence"}),
+        metadata(),
+    ))
+    .unwrap()
+    {
+        Begun::Allowed(guard) => guard,
+        other => panic!("expected a guard, got {other:?}"),
+    }
+}
+
+/// A call of `tool` whose resources cannot be known before it runs.
+fn unnamed(tool: &str) -> CallContext {
+    let mut context = call(tool);
+    context.resources = Resources::Unknown;
+    context
+}
+
+/// Runs `guard` on a connector reporting `outcome`, finishes it, and returns the answer and the
+/// row as the store then holds it.
+fn reported(
+    store: &MemoryStore,
+    guard: gateway_core::AuditGuard,
+    outcome: ToolOutcome,
+) -> (Answer, AuditRecord) {
+    let connector = RecordingConnector::answering(outcome);
+    let ran = common::ready(audit::run(&connector, guard));
+    let finished = common::ready(audit::finish(store, ran, 4));
+    assert!(finished.failure().is_none(), "{:?}", finished.failure());
+    (finished.answer().clone(), store.last())
+}
+
+/// A tool declared `checks_own_scope` is begun with `unknown` resources. What it reports it
+/// reached replaces them when it finishes, in the same write as `ok`: each distinct resource
+/// once, in the order reported, escaped and capped, the first 64, with the rest counted. An
+/// empty report is recorded as an empty list, and a success with no report leaves `unknown`.
+#[test]
+fn a_tool_that_checks_its_own_scope_records_what_it_reached_when_it_finishes() {
+    let store = MemoryStore::default();
+    let guard = scoped_guard(&store, &unnamed("fixture__search"));
+    assert_eq!(store.last().resources, RecordedResources::Unknown);
+    assert_eq!(store.last().completion, None);
+
+    let mut reached = permitted(MAX_RECORDED_RESOURCES + 2);
+    reached.insert(1, repository("repo-0"));
+    reached[2].identifier = "org/`tick`\n".into();
+    let (answer, row) = reported(
+        &store,
+        guard,
+        ToolOutcome::Reached(json!({"results": 3}), reached.clone()),
+    );
+    assert_eq!(answer, Answer::Ok(json!({"results": 3})));
+    let mut expected = permitted(MAX_RECORDED_RESOURCES);
+    expected[1].identifier = "org/\\`tick\\`\\n".into();
+    assert_eq!(row.resources, as_recorded(&expected));
+    assert_eq!(row.resources_omitted, 2);
+    assert_eq!(
+        row.completion,
+        Some(Completion {
+            outcome: Outcome::Ok,
+            latency_ms: 4,
+        })
+    );
+
+    let guard = scoped_guard(&store, &unnamed("fixture__search"));
+    let (answer, row) = reported(&store, guard, ToolOutcome::Reached(json!([]), Vec::new()));
+    assert_eq!(answer, Answer::Ok(json!([])));
+    assert_eq!(row.resources, RecordedResources::Named(Vec::new()));
+    assert_eq!(row.resources_omitted, 0);
+
+    let guard = scoped_guard(&store, &unnamed("fixture__search"));
+    let (_, row) = reported(&store, guard, ToolOutcome::Ok(json!([])));
+    assert_eq!(row.resources, RecordedResources::Unknown);
+
+    // A refusal or an error says nothing of what was reached.
+    let guard = scoped_guard(&store, &unnamed("fixture__search"));
+    let (_, row) = reported(&store, guard, ToolOutcome::Refused("Outside.".into()));
+    assert_eq!(row.resources, RecordedResources::Unknown);
+}
+
+/// A call of a tool declared `checks_own_scope` that named its resources before it ran keeps
+/// them: check 6 checked them, and a report does not replace them.
+#[test]
+fn a_self_scoped_call_that_named_its_resources_keeps_them() {
+    let store = MemoryStore::default();
+    let mut context = call("fixture__search");
+    context.resources = Resources::Named(permitted(1));
+    let guard = scoped_guard(&store, &context);
+    let (answer, row) = reported(
+        &store,
+        guard,
+        ToolOutcome::Reached(json!("found"), permitted(3)),
+    );
+    assert_eq!(answer, Answer::Ok(json!("found")));
+    assert_eq!(row.resources, as_recorded(&permitted(1)));
+    assert_eq!(
+        row.completion.map(|completion| completion.outcome),
+        Some(Outcome::Ok)
+    );
+}
+
+/// Only a tool declared `checks_own_scope` may report what it reached. From any other tool the
+/// report is a broken contract: nothing of it is recorded and the result is withheld. A read is
+/// recorded as an error of the kind `other`, with a sentence that says so; a side effect, which
+/// may have taken effect, as `unknown`, with its receipt.
+#[test]
+fn a_report_of_what_was_reached_from_a_tool_that_does_not_check_its_own_scope_is_refused() {
+    let store = MemoryStore::default();
+    let guard = scoped_guard(&store, &call("fixture__read"));
+    let (answer, row) = reported(
+        &store,
+        guard,
+        ToolOutcome::Reached(json!({"secret": true}), permitted(2)),
+    );
+    assert_eq!(
+        answer,
+        Answer::Error(
+            "The tool reported the resources it reached, which only a tool that checks its own \
+             scope may, so its result was withheld. This is a fault in the gateway's connector, \
+             not in the call."
+                .into()
+        )
+    );
+    assert_eq!(row.resources, RecordedResources::Named(Vec::new()));
+    assert_eq!(
+        row.completion.map(|completion| completion.outcome),
+        Some(Outcome::Error {
+            error_kind: ErrorKind::Other
+        })
+    );
+
+    let key = common::fresh_key();
+    let guard = scoped_guard(&store, &proposing("fixture__propose", Some(&key)));
+    let row_id = guard.row().clone();
+    let (answer, row) = reported(
+        &store,
+        guard,
+        ToolOutcome::Reached(json!({"made": 1}), permitted(2)),
+    );
+    assert!(matches!(answer, Answer::Unknown(_)), "{answer:?}");
+    assert_eq!(row.resources, RecordedResources::Named(Vec::new()));
+    assert_eq!(
+        row.completion.map(|completion| completion.outcome),
+        Some(Outcome::Unknown)
+    );
+    assert_eq!(
+        store.receipt(&row_id).map(|receipt| receipt.state),
+        Some(ReceiptState::Unknown)
+    );
+
+    // The same report from a side effect that checks its own scope is its success.
+    let key = common::fresh_key();
+    let mut context = proposing("fixture__scoped_propose", Some(&key));
+    context.resources = Resources::Unknown;
+    let guard = scoped_guard(&store, &context);
+    let (answer, row) = reported(
+        &store,
+        guard,
+        ToolOutcome::Reached(json!({"made": 1}), permitted(2)),
+    );
+    assert_eq!(answer, Answer::Ok(json!({"made": 1})));
+    assert_eq!(row.resources, as_recorded(&permitted(2)));
 }

@@ -240,7 +240,7 @@ pub struct ServerSignals {
 impl ServerSignals {
     fn record(&self, outcome: &ToolOutcome, latency: Duration) {
         let counter = match outcome {
-            ToolOutcome::Ok(_) | ToolOutcome::Completed(..) => &self.ok,
+            ToolOutcome::Ok(_) | ToolOutcome::Completed(..) | ToolOutcome::Reached(..) => &self.ok,
             ToolOutcome::Error(kind, _) => {
                 if *kind == ErrorKind::OversizedOrLateRead {
                     self.late_or_oversized.fetch_add(1, Ordering::Relaxed);

@@ -1,8 +1,11 @@
-//! A fake GitHub REST API, behind the `test-support` feature, for the three read tools and the
-//! reach report.
+//! A fake GitHub REST API, behind the `test-support` feature, for the read tools and the reach
+//! report.
 //!
 //! It serves, on a loopback port, what the tools ask for: a file through the contents API, a
-//! pull request, an issue, and an issue's or a pull request's comments. It records every
+//! pull request, an issue, and an issue's or a pull request's comments; and, for the newer
+//! reads, what `reads` lists, with a fake job log host ([`FakeLogHost`]). It answers an issue
+//! search with whatever a test set ([`FakeRest::search`]), from any repository, as GitHub's
+//! search answers from public repositories a token was not narrowed to. It records every
 //! request, with the token it carried, before it looks at anything else.
 //!
 //! It also answers `GET /installation/repositories`, GitHub's report of the repositories the
@@ -20,8 +23,8 @@
 //! - a repository outside the token's repositories, or on another account, is 404, as GitHub
 //!   answers for a repository a token cannot see;
 //! - a token without the permission the endpoint needs is 403: `contents` for a file,
-//!   `pull_requests` for a pull request, and `issues` or `pull_requests` for an issue and its
-//!   comments, each at `read` or above. A token asked for with no permissions has every one
+//!   `pull_requests` for a pull request, and `issues` or `pull_requests` for an issue, its
+//!   comments and a search, each at `read` or above. A token asked for with no permissions has every one
 //!   the installation has.
 //!
 //! It can be told to answer every request with a status, with GitHub's rate-limit answer, or
@@ -41,6 +44,10 @@ use key_custodian::fake::{FakeGitHub, IssuedToken};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+
+mod reads;
+
+pub use reads::{FakeLogHost, LogHit};
 
 /// One request the fake received.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +82,8 @@ struct Content {
     pulls: BTreeMap<(String, u64), Value>,
     issues: BTreeMap<(String, u64), Value>,
     comments: BTreeMap<(String, u64), Vec<Value>>,
+    /// What every issue search answers: its total and its items, whatever the query.
+    search: (u64, Vec<Value>),
 }
 
 struct Shared {
@@ -83,6 +92,7 @@ struct Shared {
     mode: Mutex<Mode>,
     requests: Mutex<Vec<Recorded>>,
     content: Mutex<Content>,
+    reads: Mutex<reads::Content>,
 }
 
 /// The fake, serving until dropped.
@@ -111,6 +121,7 @@ impl FakeRest {
             mode: Mutex::new(Mode::Normal),
             requests: Mutex::new(Vec::new()),
             content: Mutex::new(Content::default()),
+            reads: Mutex::new(reads::Content::default()),
         });
         let router = Router::new().fallback(answer).with_state(shared.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -173,6 +184,13 @@ impl FakeRest {
         lock(&self.shared.content)
             .issues
             .insert((repo.to_owned(), number), issue);
+    }
+
+    /// Answers every issue search, `GET /search/issues`, with `total` and `items`, the first
+    /// `per_page` of them, whatever the query asks: as GitHub does, from public repositories
+    /// the token was not narrowed to as well as its own, so a search's caller must filter.
+    pub fn search(&self, total: u64, items: Vec<Value>) {
+        lock(&self.shared.content).search = (total, items);
     }
 
     /// Serves `comments` as the comments of issue or pull request `number` of `repo`.
@@ -329,8 +347,15 @@ async fn answer(
             token.as_deref(),
         );
     };
+    if uri.path() == "/search/issues" {
+        return search(&shared, &issued, &uri, token.as_deref());
+    }
     if uri.path() == "/installation/repositories" {
         return installation_repositories(&shared, &issued, uri.query().unwrap_or(""));
+    }
+    // The endpoints of the newer reads (`reads`).
+    if let Some(response) = reads::answer(&shared, &issued, &uri, token.as_deref()) {
+        return response;
     }
     let Some((owner, repo, endpoint)) = endpoint(uri.path()) else {
         return error(StatusCode::NOT_FOUND, "Not Found", token.as_deref());
@@ -395,6 +420,28 @@ async fn answer(
         Some(body) => (StatusCode::OK, body.to_string()).into_response(),
         None => error(StatusCode::NOT_FOUND, "Not Found", token.as_deref()),
     }
+}
+
+/// An issue search's answer: the items [`FakeRest::search`] set, the first `per_page` of them,
+/// to a token with `issues` or `pull_requests` at `read` or above.
+fn search(shared: &Shared, issued: &IssuedToken, uri: &Uri, token: Option<&str>) -> Response {
+    if !permits(issued, &["issues", "pull_requests"]) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "Resource not accessible by integration",
+            token,
+        );
+    }
+    let per_page = query_value(uri.query().unwrap_or(""), "per_page")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(30);
+    let (total, items) = lock(&shared.content).search.clone();
+    let body = json!({
+        "total_count": total,
+        "incomplete_results": false,
+        "items": items.into_iter().take(per_page).collect::<Vec<_>>(),
+    });
+    (StatusCode::OK, body.to_string()).into_response()
 }
 
 /// GitHub's report of the installation's repositories, as `issued` sees them: one page of
