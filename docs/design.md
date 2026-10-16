@@ -1417,6 +1417,29 @@ its own scope, so none has resources to report when it finishes: each is declare
 arguments, and its row names its repository. The other read tools, the write tools, Jira, the
 lookup by marker and the comment exception are not built.
 
+A GitHub entry that names a `reach_report` has its reach checked against GitHub's own report,
+the first kind of reach check in decision 0011, section 4 (#193). Reading the report needs a
+credential that sees the installation's whole list of repositories, since GitHub lists to a
+token only the ones it can see, so that credential is a `[[connectors]]` entry of its own, with
+`reports_reach = true`. The loader holds such an entry to that one job: it declares its
+credential, narrowed `none`, permitting `read`, with no reach or reach report of its own; every
+tool approved on it is `read`; and its tools are served only on surfaces restricted to named
+principals, the registry's `registry-reach`. Its one tool,
+`github__list_installation_repositories`, takes no arguments and reads
+`GET /installation/repositories`, every page up to 1,000 repositories; a longer list, or one
+short of GitHub's total, is an error, never a list read in part. The key custodian makes one stated
+exception for it: a request that names no repository, which GitHub reads as every repository, is
+refused unless its tool is a reach-report entry's and it asks for `metadata: read` and nothing
+else. The flag is in the entry's binding. An entry whose reach is checked this way names the
+tool in `reach_report`, and declares a reach of its own system's repositories; the tool stays
+approved while any of the entry's tools is. The check is opt-in: no rule yet requires a
+`reach_report` of a GitHub entry with a reach, as one requires a proxied entry's `reach_check`,
+so an entry that names none loads, is served, and is never compared with GitHub's report. Its
+tokens are still narrowed to the caller's limit or the call's repository. The drift pass makes
+the check (Drift, below). What the credential permits, its permission set, is not in GitHub's
+report; the custodian checks it on every token, and refuses one GitHub issued with any
+permission beyond those asked for. Jira's report, and any proxied server's, are not built.
+
 **Proxied servers** are onboarded through the registry:
 
 1. An owner registers the server: address, credential mode, credential narrowing and reach,
@@ -1960,8 +1983,9 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   (#178). Removing every approval of an entry, the reach check's tool with the rest, still
   withdraws them on reload (section 8); a surface that serves them, such as `registry-reach`,
   must drop them too. The scheduled reach check is built
-  (the drift pass entry below). Not built: a check against a vendor's report of what a
-  credential reaches, and narrowing a proxied server's credential per call or to the caller's
+  (the drift pass entry below), and so is a check against a vendor's report of what a
+  credential reaches, for GitHub (#193, the same entry). Not built: a vendor report for Jira
+  or a proxied server, and narrowing a proxied server's credential per call or to the caller's
   limit. The gateway sends the same credential on every call to a server, so it refuses a
   proxied entry whose narrowing is not `none`; a built-in entry's connector narrows its own
   (#12, section 13). The refusal is one of the gates every registry's policy meets, at boot and
@@ -2058,7 +2082,27 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   that hangs, which holds back no poll, and the start refused without the fields.
   `tests/drift.rs` has an entry withdrawn with its reach check tool, each new approval that
   clears it or does not, a tool withdrawn with it whose own definition then changes, and the
-  start refused with an interval shorter than a call deadline.
+  start refused with an interval shorter than a call deadline. The vendor-report kind is built
+  for GitHub (#193; section 13): each built-in entry with a `reach_report` is checked on a
+  schedule of its own, every interval, at once when the pass starts and at each tick unless the
+  last is out, as a canary is. An entry that names no `reach_report` is not checked, and no rule
+  yet requires one of a GitHub entry with a reach (not built). The check sends the report's
+  tool, a reach-report entry's, through the same listener as the same principal, so it is
+  decided and audited like any call, with the deadline `[connectors.<name>]` sets for the tool's
+  entry plus the 5 s allowance, and compares the repositories it lists with the entry's recorded
+  reach both ways. A repository reported and not recorded, or recorded and not reported,
+  withdraws every tool of the entry with the cause `reach report mismatch`, judged against the
+  approvals the check began under, logged as `reach_mismatch` with `check = "vendor_report"` and
+  the repositories `added` and `dropped`, and as `tool_withdrawn`, and a new approval clears it;
+  a report that matches again does not. The report's tool, another entry's, stays served. A
+  report that cannot be read is `reach_check_failed`, withdraws nothing, and is tried again at
+  the next tick. Each is counted in `switchboard_reach_checks_total` under the checked entry's
+  name. The start is refused with a reach report and no `[drift] reach_*` settings.
+  `tests/github_reach.rs` has the matching report and its installation-wide `metadata: read`
+  token, a repository added and one dropped each withdrawn within the interval, a failed report
+  retried, a new approval clearing a withdrawal, and the start refused; the custodian's
+  `tests/reach_report.rs` has the exception refused to any other tool or permission, and the
+  registry's `tests/reach_report.rs` each rule the loader holds the two kinds of entry to.
 - The maximum policy age and the stale-policy refusal: built (#132), in the opt-outs entry
   below.
 - The 3600 s cap on user issuers' token lifetime: built. The deployment file refuses a user
