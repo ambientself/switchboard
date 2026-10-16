@@ -31,13 +31,21 @@
 //!   decided from the call's resources: each tool's resource adapter names the repository
 //!   `owner/repo`, exactly as a limit holds it.
 //!
-//! [`tools`] has three of the read tools this connector serves, `github__get_file`,
-//! `github__get_pr` and `github__get_issue`, each with the definition its approval in the
-//! registry must hash to. Each bounds its result and tags it as external evidence, as Otto's
-//! gateway does. None checks its own scope: each is declared from its arguments, so its row
-//! records the repository it reached.
+//! [`report`] has the reach report's tool, `github__list_installation_repositories`, served
+//! only on an entry the registry declares a reach report, which reads GitHub's own list of the
+//! installation's repositories for the drift pass's vendor-report reach check (decision 0011,
+//! section 4). Its token is the key custodian's one installation-wide exception.
 //!
-//! [`search`] has the fourth, `github__search`, which is declared `checks_own_scope`
+//! [`tools`] has the first three read tools, `github__get_file`, `github__get_pr` and
+//! `github__get_issue`, and [`reads`] five more, `github__get_checks`, `github__get_job_log`,
+//! `github__list_releases`, `github__pr_template` and `github__repo_conventions`;
+//! [`definitions`] gives each one's definition, which its approval in the registry must hash
+//! to. Each bounds its result and tags it as external evidence, as Otto's gateway does. None of
+//! these eight checks its own scope: each is declared from its arguments, so its row records the
+//! repository it reached. The first three ask for their entry's whole permission set; the other
+//! five each ask for their own, within the entry's.
+//!
+//! [`search`] has one more read tool, `github__search`, which is declared `checks_own_scope`
 //! (decision 0011): which repositories a search reaches is known only once GitHub answers. It
 //! builds its query as Otto's gateway does, withholds every result from a repository outside
 //! the caller's limit, and reports the repositories its results came from as the resources
@@ -58,6 +66,8 @@ mod api;
 mod connector;
 #[cfg(feature = "test-support")]
 pub mod fake;
+pub mod reads;
+pub mod report;
 pub mod search;
 pub mod tools;
 

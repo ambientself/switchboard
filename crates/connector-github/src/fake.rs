@@ -1,10 +1,20 @@
-//! A fake GitHub REST API, behind the `test-support` feature, for the three read tools.
+//! A fake GitHub REST API, behind the `test-support` feature, for the read tools and the reach
+//! report.
 //!
 //! It serves, on a loopback port, what the tools ask for: a file through the contents API, a
-//! pull request, an issue, and an issue's or a pull request's comments. It answers an issue
+//! pull request, an issue, and an issue's or a pull request's comments; and, for the newer
+//! reads, what `reads` lists, with a fake job log host ([`FakeLogHost`]). It answers an issue
 //! search with whatever a test set ([`FakeRest::search`]), from any repository, as GitHub's
 //! search answers from public repositories a token was not narrowed to. It records every
 //! request, with the token it carried, before it looks at anything else.
+//!
+//! It also answers `GET /installation/repositories`, GitHub's report of the repositories the
+//! installation reaches, from the fake App's installation as it stands, so a repository the
+//! App's administrator adds or drops ([`FakeGitHub::add_repository`],
+//! [`FakeGitHub::drop_repository`]) shows in the next report. As GitHub does, it lists to a
+//! token only the repositories the token can see: every repository of the installation to a
+//! token asked for with none, and to any other token its own, `per_page` (30 unless given, 100
+//! at most) a page.
 //!
 //! It answers only a token that the key custodian's fake App API ([`FakeGitHub`]) issued, has
 //! not revoked and has not seen expire, as GitHub answers only its own installation tokens:
@@ -34,6 +44,10 @@ use key_custodian::fake::{FakeGitHub, IssuedToken};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+
+mod reads;
+
+pub use reads::{FakeLogHost, LogHit};
 
 /// One request the fake received.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,6 +92,7 @@ struct Shared {
     mode: Mutex<Mode>,
     requests: Mutex<Vec<Recorded>>,
     content: Mutex<Content>,
+    reads: Mutex<reads::Content>,
 }
 
 /// The fake, serving until dropped.
@@ -106,6 +121,7 @@ impl FakeRest {
             mode: Mutex::new(Mode::Normal),
             requests: Mutex::new(Vec::new()),
             content: Mutex::new(Content::default()),
+            reads: Mutex::new(reads::Content::default()),
         });
         let router = Router::new().fallback(answer).with_state(shared.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -133,6 +149,17 @@ impl FakeRest {
     /// Every request received, in order.
     pub fn requests(&self) -> Vec<Recorded> {
         lock(&self.shared.requests).clone()
+    }
+
+    /// Adds repository `repo` to the fake App's installation, as its administrator can without
+    /// touching any approval: the next report lists it.
+    pub fn add_repository(&self, repo: &str) {
+        self.shared.app.add_repository(repo);
+    }
+
+    /// Drops repository `repo` from the fake App's installation: the next report leaves it out.
+    pub fn drop_repository(&self, repo: &str) {
+        self.shared.app.drop_repository(repo);
     }
 
     /// Serves `text` as the file at `path` in repository `repo` of the account.
@@ -323,6 +350,13 @@ async fn answer(
     if uri.path() == "/search/issues" {
         return search(&shared, &issued, &uri, token.as_deref());
     }
+    if uri.path() == "/installation/repositories" {
+        return installation_repositories(&shared, &issued, uri.query().unwrap_or(""));
+    }
+    // The endpoints of the newer reads (`reads`).
+    if let Some(response) = reads::answer(&shared, &issued, &uri, token.as_deref()) {
+        return response;
+    }
     let Some((owner, repo, endpoint)) = endpoint(uri.path()) else {
         return error(StatusCode::NOT_FOUND, "Not Found", token.as_deref());
     };
@@ -406,6 +440,48 @@ fn search(shared: &Shared, issued: &IssuedToken, uri: &Uri, token: Option<&str>)
         "total_count": total,
         "incomplete_results": false,
         "items": items.into_iter().take(per_page).collect::<Vec<_>>(),
+    });
+    (StatusCode::OK, body.to_string()).into_response()
+}
+
+/// GitHub's report of the installation's repositories, as `issued` sees them: one page of
+/// `query`'s `per_page` and `page`.
+fn installation_repositories(shared: &Shared, issued: &IssuedToken, query: &str) -> Response {
+    let installed = shared.app.installed();
+    let (selection, seen): (&str, Vec<String>) = match &issued.asked_repositories {
+        None => ("all", installed.into_iter().collect()),
+        Some(_) => (
+            "selected",
+            issued
+                .repositories
+                .iter()
+                .filter(|name| installed.contains(*name))
+                .cloned()
+                .collect(),
+        ),
+    };
+    let number = |name: &str, default: usize| {
+        query_value(query, name)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(default)
+    };
+    let per_page = number("per_page", 30).clamp(1, 100);
+    let page = number("page", 1).max(1);
+    let listed: Vec<Value> = seen
+        .iter()
+        .skip((page - 1) * per_page)
+        .take(per_page)
+        .map(|name| {
+            json!({
+                "name": name,
+                "full_name": format!("{}/{name}", shared.account),
+            })
+        })
+        .collect();
+    let body = json!({
+        "total_count": seen.len(),
+        "repository_selection": selection,
+        "repositories": listed,
     });
     (StatusCode::OK, body.to_string()).into_response()
 }

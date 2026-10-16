@@ -28,11 +28,26 @@
 //!   check shows nothing about the reach.
 //!
 //! The token is never logged, and only the verdict and its reason leave this module.
+//!
+//! **The vendor report** (decision 0011, section 4; #193) is the check's second kind, for a
+//! built-in entry whose vendor reports what its credential reaches, as GitHub lists an
+//! installation's repositories. [`ReachCaller::report`] sends the entry's `reach_report` tool, a
+//! reach-report entry's, with no arguments, the same way, through the same listener as the same
+//! principal, so it too is decided and audited like any call, and reads the repositories its
+//! result lists ([`Reported`]). [`compare`] compares them with the entry's recorded reach both
+//! ways: a repository reported and not recorded, or recorded and not reported, is a mismatch. A
+//! result that is an error, or that holds no list of repositories, and anything that fails the
+//! canary's call, is a failed check ([`Reported::Failed`]), which shows nothing about the reach.
+//! What the credential permits, its permission set, is checked on every token, not by the
+//! report: the key custodian refuses a token GitHub issued with any permission beyond those
+//! asked for.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use connector_proxy::outcome::UPSTREAM_REFUSED;
+use gateway_core::ToolName;
 use gateway_mcp::AUDIT_ROW_META;
 use gateway_registry::ReachCheck;
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HOST};
@@ -42,7 +57,7 @@ use hyper::body::Bytes;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 use crate::deployment::MAX_SERVER_RESULT_BYTES;
@@ -180,6 +195,46 @@ pub enum Verdict {
     Failed(String),
 }
 
+/// What one vendor report came to (see the [module documentation](self)).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reported {
+    /// The report's tool answered with the repositories it lists.
+    Listed {
+        /// The repositories, each by its full name, `owner/name`.
+        repositories: BTreeSet<String>,
+        /// The audit row the gateway wrote for the call, if its answer named one.
+        row: Option<String>,
+    },
+    /// The report could not be read, for this reason: it shows nothing about the reach.
+    Failed(String),
+}
+
+/// How a vendor's report differs from an entry's recorded reach.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Difference {
+    /// The repositories the report lists and the reach does not hold: reached, and never
+    /// approved.
+    pub added: BTreeSet<String>,
+    /// The repositories the reach holds and the report does not list: the credential no longer
+    /// reaches what was approved, so the approval no longer describes it.
+    pub dropped: BTreeSet<String>,
+}
+
+impl Difference {
+    /// Whether the report and the reach agree.
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.dropped.is_empty()
+    }
+}
+
+/// How `reported` differs from `recorded`, both ways.
+pub fn compare(recorded: &BTreeSet<String>, reported: &BTreeSet<String>) -> Difference {
+    Difference {
+        added: reported.difference(recorded).cloned().collect(),
+        dropped: recorded.difference(reported).cloned().collect(),
+    }
+}
+
 /// Makes the reach check's calls to this replica's own listener. See the [module
 /// documentation](self).
 pub struct ReachCaller {
@@ -213,36 +268,62 @@ impl ReachCaller {
     /// Sends `check` as `tools/call` through the listener, and judges the answer. Gives up
     /// `deadline` (the entry's call deadline) plus [`REACH_ALLOWANCE`] after it starts.
     pub async fn call(&self, check: &ReachCheck, deadline: Duration) -> Verdict {
+        match self.send(&check.tool, &check.arguments, deadline).await {
+            Ok(body) => judge(&body),
+            Err(reason) => Verdict::Failed(reason),
+        }
+    }
+
+    /// Sends the reach report's `tool`, with no arguments, as `tools/call` through the
+    /// listener, and reads the repositories its result lists. Gives up `deadline` (the call
+    /// deadline of the report tool's connector) plus [`REACH_ALLOWANCE`] after it starts.
+    pub async fn report(&self, tool: &ToolName, deadline: Duration) -> Reported {
+        match self.send(tool, &Map::new(), deadline).await {
+            Ok(body) => judge_report(&body),
+            Err(reason) => Reported::Failed(reason),
+        }
+    }
+
+    /// Sends `tool` with `arguments` through the listener as the registry, and reads the
+    /// answer, or says why there is none to judge.
+    async fn send(
+        &self,
+        tool: &ToolName,
+        arguments: &Map<String, Value>,
+        deadline: Duration,
+    ) -> Result<Vec<u8>, String> {
         let token = match std::fs::read_to_string(&self.settings.token_file) {
             Ok(token) if !token.trim().is_empty() => token.trim().to_owned(),
-            Ok(_) => return Verdict::Failed("the registry's token file is empty".to_owned()),
+            Ok(_) => return Err("the registry's token file is empty".to_owned()),
             Err(error) => {
-                return Verdict::Failed(format!(
-                    "could not read the registry's token file: {error}"
-                ));
+                return Err(format!("could not read the registry's token file: {error}"));
             }
         };
-        let Some(request) = self.request(check, &token) else {
-            return Verdict::Failed("could not build the request".to_owned());
+        let Some(request) = self.request(tool, arguments, &token) else {
+            return Err("could not build the request".to_owned());
         };
         match tokio::time::timeout(deadline + REACH_ALLOWANCE, self.exchange(request)).await {
-            Ok(Ok(body)) => judge(&body),
-            Ok(Err(reason)) => Verdict::Failed(reason),
-            Err(_elapsed) => Verdict::Failed(format!(
+            Ok(answer) => answer,
+            Err(_elapsed) => Err(format!(
                 "no answer within the call deadline plus {} s",
                 REACH_ALLOWANCE.as_secs()
             )),
         }
     }
 
-    fn request(&self, check: &ReachCheck, token: &str) -> Option<Request<Full<Bytes>>> {
+    fn request(
+        &self,
+        tool: &ToolName,
+        arguments: &Map<String, Value>,
+        token: &str,
+    ) -> Option<Request<Full<Bytes>>> {
         let mut bearer = HeaderValue::from_str(&format!("Bearer {token}")).ok()?;
         bearer.set_sensitive(true);
         let body = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": {"name": check.tool.as_str(), "arguments": check.arguments},
+            "params": {"name": tool.as_str(), "arguments": arguments},
         });
         let mut request = Request::post(self.settings.url.clone())
             .header(HOST, self.settings.host.as_str())
@@ -289,30 +370,36 @@ impl ReachCaller {
     }
 }
 
-/// The verdict of the gateway's answer `body` to the reach check's call.
-fn judge(body: &[u8]) -> Verdict {
-    let Ok(Value::Object(answer)) = serde_json::from_slice::<Value>(body) else {
-        return Verdict::Failed("the answer is not a JSON-RPC response".to_owned());
+/// The tool result in the gateway's answer `body`, and the audit row its `_meta` names, or why
+/// there is none.
+fn tool_result(body: &[u8]) -> Result<(Map<String, Value>, Option<String>), String> {
+    let Ok(Value::Object(mut answer)) = serde_json::from_slice::<Value>(body) else {
+        return Err("the answer is not a JSON-RPC response".to_owned());
     };
     if let Some(error) = answer.get("error") {
         let message = error
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("no message");
-        return Verdict::Failed(format!(
+        return Err(format!(
             "the gateway refused the call: {}",
             bounded(message)
         ));
     }
-    let Some(Value::Object(result)) = answer.get("result") else {
-        return Verdict::Failed("the answer has neither a result nor an error".to_owned());
+    let Some(Value::Object(result)) = answer.remove("result") else {
+        return Err("the answer has neither a result nor an error".to_owned());
     };
     let row = result
         .get("_meta")
         .and_then(|meta| meta.get(AUDIT_ROW_META))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let texts: Vec<&str> = result
+    Ok((result, row))
+}
+
+/// The text blocks of a tool `result`.
+fn texts(result: &Map<String, Value>) -> Vec<&str> {
+    result
         .get("content")
         .and_then(Value::as_array)
         .map(|content| {
@@ -321,7 +408,16 @@ fn judge(body: &[u8]) -> Verdict {
                 .filter_map(|block| block.get("text").and_then(Value::as_str))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// The verdict of the gateway's answer `body` to the reach check's call.
+fn judge(body: &[u8]) -> Verdict {
+    let (result, row) = match tool_result(body) {
+        Ok(result) => result,
+        Err(reason) => return Verdict::Failed(reason),
+    };
+    let texts = texts(&result);
     match result.get("isError") {
         Some(Value::Bool(false)) => Verdict::Mismatch { row },
         Some(Value::Bool(true)) if texts == [UPSTREAM_REFUSED] => Verdict::Held { row },
@@ -330,6 +426,41 @@ fn judge(body: &[u8]) -> Verdict {
             bounded(&texts.join(" "))
         )),
         _ => Verdict::Failed("the result is not marked as an error or not".to_owned()),
+    }
+}
+
+/// What the gateway's answer `body` to the reach report's call reports: the repositories in its
+/// result's `structuredContent.repositories`, each a full name, or why it reports nothing.
+fn judge_report(body: &[u8]) -> Reported {
+    let (result, row) = match tool_result(body) {
+        Ok(result) => result,
+        Err(reason) => return Reported::Failed(reason),
+    };
+    match result.get("isError") {
+        Some(Value::Bool(false)) => {}
+        Some(Value::Bool(true)) => {
+            return Reported::Failed(format!(
+                "the report could not be read: {}",
+                bounded(&texts(&result).join(" "))
+            ));
+        }
+        _ => {
+            return Reported::Failed("the result is not marked as an error or not".to_owned());
+        }
+    }
+    let listed = result
+        .get("structuredContent")
+        .and_then(|content| content.get("repositories"))
+        .and_then(Value::as_array)
+        .and_then(|repositories| {
+            repositories
+                .iter()
+                .map(|repository| repository.as_str().map(str::to_owned))
+                .collect::<Option<BTreeSet<String>>>()
+        });
+    match listed {
+        Some(repositories) => Reported::Listed { repositories, row },
+        None => Reported::Failed("the result holds no list of repositories".to_owned()),
     }
 }
 
@@ -480,6 +611,72 @@ mod tests {
         ] {
             assert!(
                 matches!(judge(failed.as_bytes()), Verdict::Failed(_)),
+                "{failed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_report_is_compared_with_the_reach_both_ways() {
+        let set = |names: &[&str]| -> BTreeSet<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+        let recorded = set(&["o/atlas", "o/borealis"]);
+        assert!(compare(&recorded, &set(&["o/atlas", "o/borealis"])).is_empty());
+        assert_eq!(
+            compare(&recorded, &set(&["o/atlas", "o/borealis", "o/cosmos"])),
+            Difference {
+                added: set(&["o/cosmos"]),
+                dropped: BTreeSet::new(),
+            }
+        );
+        assert_eq!(
+            compare(&recorded, &set(&["o/atlas"])),
+            Difference {
+                added: BTreeSet::new(),
+                dropped: set(&["o/borealis"]),
+            }
+        );
+        assert_eq!(
+            compare(&recorded, &set(&["o/atlas", "o/cosmos"])),
+            Difference {
+                added: set(&["o/cosmos"]),
+                dropped: set(&["o/borealis"]),
+            }
+        );
+    }
+
+    #[test]
+    fn only_a_successful_result_listing_repositories_is_a_report() {
+        let answer =
+            |result: Value| json!({"jsonrpc": "2.0", "id": 1, "result": result}).to_string();
+        let listed = answer(json!({
+            "content": [{"type": "text", "text": "{}"}],
+            "structuredContent": {"repositories": ["o/b", "o/a"], "totalCount": 2},
+            "isError": false,
+            "_meta": {AUDIT_ROW_META: "row-2"},
+        }));
+        assert_eq!(
+            judge_report(listed.as_bytes()),
+            Reported::Listed {
+                repositories: ["o/a".to_owned(), "o/b".to_owned()].into(),
+                row: Some("row-2".to_owned()),
+            }
+        );
+        for failed in [
+            answer(
+                json!({"content": [{"type": "text", "text": "GitHub answered HTTP 500"}], "isError": true}),
+            ),
+            answer(json!({"structuredContent": {"repositories": ["o/a"]}, "isError": true})),
+            answer(json!({"structuredContent": {"repositories": ["o/a", 7]}, "isError": false})),
+            answer(json!({"structuredContent": {}, "isError": false})),
+            answer(json!({"structuredContent": {"repositories": ["o/a"]}})),
+            json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32001, "message": "denied"}})
+                .to_string(),
+            "not json".to_owned(),
+        ] {
+            assert!(
+                matches!(judge_report(failed.as_bytes()), Reported::Failed(_)),
                 "{failed}"
             );
         }

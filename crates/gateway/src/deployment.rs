@@ -512,6 +512,11 @@ pub struct GitHubSection {
     /// [`DEFAULT_CUSTODIAN_DEADLINE`] if left out, and 1 to [`MAX_CUSTODIAN_DEADLINE`].
     #[serde(default)]
     pub custodian_deadline_seconds: Option<u64>,
+    /// The hosts GitHub's job log redirects may point to, each a URL with no path, under the
+    /// same rules and CA file as `api_url`. None if left out, and then every redirect is
+    /// refused.
+    #[serde(default)]
+    pub job_log_hosts: Vec<String>,
 }
 
 /// The longest the key custodian may be given to answer a token request.
@@ -533,6 +538,7 @@ impl GitHubSection {
             ca_file: self.ca_file.map(|path| base.join(path)),
             custodian_socket: base.join(self.custodian_socket),
             custodian_deadline: deadline,
+            job_log_hosts: self.job_log_hosts,
         })
     }
 }

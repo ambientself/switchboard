@@ -60,9 +60,9 @@
 //! `Decision::policy_revision`. While the gateway's drift check has withdrawn tools, that is a
 //! derived revision, `{base}+withdrawn:{names}` (decision 0013), which no registry file holds.
 //! The custodian checks the base, the part before the first `+`, which the registry loader
-//! refuses in a revision of its own; a withdrawal removes only proxied tools, which the
-//! custodian's copy does not hold, so it is the same copy under both. The record keeps the
-//! whole revision the request carried.
+//! refuses in a revision of its own. A withdrawal only removes tools from what the gateway
+//! serves, and the gateway asks for no token for a tool it does not serve, so the base's copy is
+//! the one to check against. The record keeps the whole revision the request carried.
 //!
 //! # The custodian checks less of the file than the gateway
 //!

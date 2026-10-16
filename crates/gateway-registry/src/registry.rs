@@ -7,7 +7,7 @@ use gateway_core::{
     ApprovedTool, Classification, ConnectorEntry, ConnectorName, CredentialMode, DeclaredFrom,
     EntryKind, Issuer, Narrowing, PolicyRevision, PolicySnapshot, Principal, PrincipalId,
     PrincipalRestriction, Profile, ProfileName, Resource, ResourceDeclaration, ResourceLimits,
-    Settlement, SnapshotData, SnapshotError, Surface, ToolName,
+    Settlement, SnapshotData, SnapshotError, Surface, SurfaceName, ToolName,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -556,6 +556,39 @@ pub enum RegistryError {
         /// The hash of the entry in the file.
         computed: String,
     },
+    /// A reach-report entry, or a tool approved on one, is not held to its one job (decision
+    /// 0011, section 4; see [`BuiltInEntry::reports_reach`]).
+    #[error(
+        "connector `{connector}` reports reach, and {problem}; a reach-report entry declares its \
+         credential, narrowed \"none\", permitting \"read\", with no reach or reach report of \
+         its own, and serves only `read` tools"
+    )]
+    ReachReportEntry {
+        /// The entry.
+        connector: ConnectorName,
+        /// What is wrong with it.
+        problem: String,
+    },
+    /// A surface serves a reach report's tool to any principal of its teams and groups.
+    #[error(
+        "surface `{surface}` serves `{tool}`, a reach report's tool, to any principal of its \
+         teams and groups; serve it only on a surface restricted to named principals, the \
+         registry's own"
+    )]
+    ReachReportSurface {
+        /// The surface.
+        surface: SurfaceName,
+        /// The tool.
+        tool: ToolName,
+    },
+    /// An entry's reach report cannot check its reach.
+    #[error("connector `{connector}`'s reach report {problem}")]
+    ReachReport {
+        /// The entry whose reach is checked.
+        connector: ConnectorName,
+        /// What is wrong.
+        problem: String,
+    },
     /// A tool qualifies its resource by an argument its schema does not declare as a string at
     /// the top level.
     #[error(
@@ -789,7 +822,44 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
         adapters.insert(name.clone(), checked.adapter);
         approvals.insert(name, checked.approval);
     }
+    // A reach report's tool stays approved while any tool of an entry it checks is, as a
+    // reach check's tool does, so that nothing is served under a credential whose reach is
+    // never checked.
+    for entry in connectors.values() {
+        if let Some(report) = &entry.reach_report
+            && !built_in_tools.contains_key(&report.tool)
+            && built_in_tools.values().any(|on| *on == entry.name)
+        {
+            return Err(RegistryError::ReachReport {
+                connector: entry.name.clone(),
+                problem: format!(
+                    "names `{}`, which is not approved, and other tools of the entry are: they \
+                     would be served under a credential whose reach is never checked",
+                    report.tool
+                ),
+            });
+        }
+    }
 
+    // A reach report's tool reads what a whole installation reaches: it is served only to
+    // named principals, the registry's own (decision 0011, section 4).
+    for surface in &file.surfaces {
+        if !matches!(surface.principals, PrincipalsFile::AnyInTeamsAndGroups) {
+            continue;
+        }
+        let reporting = surface.tools.iter().find(|tool| {
+            built_in_tools
+                .get(*tool)
+                .and_then(|entry| connectors.get(entry))
+                .is_some_and(|entry| entry.reports_reach)
+        });
+        if let Some(tool) = reporting {
+            return Err(RegistryError::ReachReportSurface {
+                surface: surface.name.clone(),
+                tool: tool.clone(),
+            });
+        }
+    }
     let surfaces = file
         .surfaces
         .into_iter()
@@ -1313,6 +1383,12 @@ fn check_built_in_tool(
         return Err(RegistryError::BuiltInToolNotListed {
             tool: name,
             connector: tool.connector,
+        });
+    }
+    if entry.reports_reach && tool.classification != gateway_core::Classification::Read {
+        return Err(RegistryError::ReachReportEntry {
+            connector: tool.connector,
+            problem: format!("approves `{name}` as `{}`", tool.classification.as_str()),
         });
     }
     require(&tool.description, "description", place)?;

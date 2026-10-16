@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::api::{Answered, Api, ApiError};
+use crate::report;
 use crate::search;
 use crate::tools::{self, Call};
 use crate::{REPOSITORY, SYSTEM};
@@ -35,6 +36,10 @@ pub struct GitHubSettings {
     pub custodian_socket: PathBuf,
     /// How long the custodian has to answer each token request.
     pub custodian_deadline: Duration,
+    /// The hosts GitHub's job log redirects may point to, each a URL with a scheme, a host and
+    /// a port, if not the scheme's own, and nothing else, held to the same rules and the same
+    /// CA file as `api_url`. A redirect to any other is refused, and with none every one is.
+    pub job_log_hosts: Vec<String>,
 }
 
 /// Why the connector could not be built.
@@ -47,12 +52,30 @@ pub enum SettingsError {
     #[error(transparent)]
     Api(#[from] ApiError),
     /// A GitHub entry that serves approved tools is not narrowed: GitHub tokens are always
-    /// narrowed, to the caller's limit or to the call's repository.
+    /// narrowed, to the caller's limit or to the call's repository, except a reach report's
+    /// (see [`crate::report`]).
     #[error(
         "connector `{0}` says its credential is narrowed \"none\"; the GitHub connector narrows \
-         every token, so declare \"limit\" or \"call\""
+         every token but a reach report's, so declare \"limit\" or \"call\""
     )]
     NotNarrowed(ConnectorName),
+    /// A job log host was refused.
+    #[error("the job log host `{0}` was refused: {1}")]
+    JobLogHost(String, ApiError),
+    /// An entry serves a tool whose permission set it does not hold, so the key custodian
+    /// would refuse every token the tool asks for.
+    #[error(
+        "connector `{entry}` serves `{tool}`, which asks for `{permission}: read`, and the entry \
+         does not state it"
+    )]
+    PermissionNotStated {
+        /// The entry.
+        entry: ConnectorName,
+        /// The tool.
+        tool: String,
+        /// The permission the entry does not state.
+        permission: String,
+    },
 }
 
 /// What one entry's tokens are asked for with.
@@ -60,6 +83,8 @@ pub enum SettingsError {
 struct EntryCredential {
     narrowing: Narrowing,
     permissions: BTreeMap<String, Access>,
+    /// Whether the entry is a reach report's, which serves only the report's tool.
+    reports_reach: bool,
 }
 
 /// The GitHub connector. See the [crate documentation](crate).
@@ -68,6 +93,7 @@ pub struct GitHubConnector {
     api: Api,
     custodian: CustodianClient,
     entries: BTreeMap<ConnectorName, EntryCredential>,
+    job_log_hosts: Vec<Api>,
 }
 
 impl std::fmt::Debug for GitHubConnector {
@@ -103,20 +129,31 @@ impl GitHubConnector {
             let Some(declaration) = &entry.declaration else {
                 continue;
             };
-            if declaration.narrowing == Narrowing::None {
+            if declaration.narrowing == Narrowing::None && !entry.reports_reach {
                 return Err(SettingsError::NotNarrowed(entry.name.clone()));
             }
+            crate::reads::check_entry(entry)?;
             served.insert(
                 entry.name.clone(),
                 EntryCredential {
                     narrowing: declaration.narrowing,
                     permissions: entry.permissions.clone(),
+                    reports_reach: entry.reports_reach,
                 },
             );
         }
+        let job_log_hosts = settings
+            .job_log_hosts
+            .iter()
+            .map(|host| {
+                Api::new(host, settings.ca_file.as_deref())
+                    .map_err(|error| SettingsError::JobLogHost(host.clone(), error))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             organization: organization.clone(),
             api,
+            job_log_hosts,
             custodian: CustodianClient::new(
                 settings.custodian_socket.clone(),
                 settings.custodian_deadline,
@@ -135,6 +172,9 @@ impl GitHubConnector {
 
     async fn call(&self, call: ToolCall) -> ToolOutcome {
         let tool = call.tool().name.clone();
+        if tool.as_str() == report::LIST_INSTALLATION_REPOSITORIES {
+            return self.report(&call).await;
+        }
         if tool.as_str() == search::SEARCH {
             return self.search(&call).await;
         }
@@ -159,24 +199,31 @@ impl GitHubConnector {
             Ok(repositories) => repositories,
             Err(outcome) => return outcome,
         };
-        let token = match self.token(&call, entry, repositories).await {
+        let request = match self.request(&call, entry, repositories) {
+            Ok(request) => request,
+            Err(outcome) => return outcome,
+        };
+        // The newer reads ask for their own permission sets, within the entry's.
+        if let Call::Read(read) = &parsed {
+            return crate::reads::run(self, &parsed, read, request).await;
+        }
+        let token = match self.token(&request).await {
             Ok(token) => token,
             Err(outcome) => return outcome,
         };
         self.read(&parsed, token.expose()).await
     }
 
-    /// The token for `call`, asked of the key custodian for the caller's team, narrowed to
-    /// `repositories`, with `entry`'s permissions and the call's revision; or the outcome for
-    /// the call when there is none.
+    /// The token request for `call`, for the caller's team, narrowed to `repositories`, with
+    /// `entry`'s permissions and the call's revision; or the outcome for the call when there is
+    /// none.
     #[allow(clippy::result_large_err)]
-    async fn token(
+    fn request(
         &self,
         call: &ToolCall,
         entry: &EntryCredential,
         repositories: Vec<String>,
-    ) -> Result<Token, ToolOutcome> {
-        let tool = call.tool().name.clone();
+    ) -> Result<TokenRequest, ToolOutcome> {
         let team = match &call.call().caller.principal.get().kind {
             PrincipalKind::Workload { team, .. } => team.clone(),
             PrincipalKind::User { .. } => {
@@ -187,18 +234,97 @@ impl GitHubConnector {
                 ));
             }
         };
-        let request = TokenRequest {
+        Ok(TokenRequest {
             team,
-            tool: tool.clone(),
+            tool: call.tool().name.clone(),
             repositories,
             permissions: entry.permissions.clone(),
             revision: call.policy_revision().clone(),
-        };
-        self.custodian.token(&request).await.map_err(|error| {
-            let kind = error.error_kind();
-            tracing::warn!(%tool, %error, "the key custodian gave no GitHub token");
-            ToolOutcome::error(kind, custodian_sentence(&request.team, kind))
         })
+    }
+
+    /// A token from the key custodian for `request`, or the outcome for the call when there
+    /// is none.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn token(&self, request: &TokenRequest) -> Result<Token, ToolOutcome> {
+        match self.custodian.token(request).await {
+            Ok(token) => Ok(token),
+            Err(error) => {
+                let kind = error.error_kind();
+                let tool = &request.tool;
+                tracing::warn!(%tool, %error, "the key custodian gave no GitHub token");
+                Err(ToolOutcome::error(
+                    kind,
+                    custodian_sentence(&request.team, kind),
+                ))
+            }
+        }
+    }
+
+    /// The API clients of the hosts a job log redirect may point to.
+    pub(crate) fn job_log_hosts(&self) -> &[Api] {
+        &self.job_log_hosts
+    }
+
+    /// The API client.
+    pub(crate) fn api(&self) -> &Api {
+        &self.api
+    }
+
+    /// The reach report's call (see [`crate::report`]): served only on an entry declared a
+    /// reach report, with no arguments, and a token asked for with no repositories and
+    /// `metadata: read` alone, which the key custodian gives a reach report's tool and no other.
+    async fn report(&self, call: &ToolCall) -> ToolOutcome {
+        let tool = call.tool().name.clone();
+        if call
+            .arguments()
+            .as_object()
+            .is_none_or(|arguments| !arguments.is_empty())
+        {
+            return ToolOutcome::error(
+                ErrorKind::InvalidArguments,
+                format!("`{tool}` takes no arguments"),
+            );
+        }
+        let reporting = self
+            .entries
+            .get(&call.tool().connector)
+            .is_some_and(|entry| entry.reports_reach);
+        if !reporting {
+            return ToolOutcome::error(
+                ErrorKind::Other,
+                format!(
+                    "the GitHub connector serves `{tool}` only on an entry the registry declares \
+                     a reach report, and `{}` is not one",
+                    call.tool().connector
+                ),
+            );
+        }
+        let PrincipalKind::Workload { team, .. } = &call.call().caller.principal.get().kind else {
+            return ToolOutcome::error(
+                ErrorKind::Other,
+                "the GitHub connector serves a team's workloads only: a token is asked for the \
+                 caller's team, and a person has none",
+            );
+        };
+        // The revision the call was decided under, as every token request carries it.
+        let revision = call.policy_revision().clone();
+        let request = TokenRequest {
+            team: team.clone(),
+            tool: tool.clone(),
+            repositories: Vec::new(),
+            permissions: BTreeMap::from([(report::REPORT_PERMISSION.to_owned(), Access::Read)]),
+            revision,
+        };
+        let token = match self.custodian.token(&request).await {
+            Ok(token) => token,
+            Err(error) => {
+                let kind = error.error_kind();
+                tracing::warn!(%tool, %error, "the key custodian gave no GitHub token");
+                return ToolOutcome::error(kind, custodian_sentence(&request.team, kind));
+            }
+        };
+        report::read(&self.api, token.expose()).await
     }
 
     /// The repositories a call's token is asked for, as its entry narrows it.
@@ -263,7 +389,11 @@ impl GitHubConnector {
                 self.organization
             ));
         }
-        let token = match self.token(call, entry, repositories).await {
+        let request = match self.request(call, entry, repositories) {
+            Ok(request) => request,
+            Err(outcome) => return outcome,
+        };
+        let token = match self.token(&request).await {
             Ok(token) => token,
             Err(outcome) => return outcome,
         };
@@ -408,12 +538,16 @@ impl GitHubConnector {
                 }
                 ToolOutcome::Ok(result)
             }
+            Call::Read(_) => ToolOutcome::error(
+                ErrorKind::Other,
+                "the newer GitHub reads ask for their own tokens",
+            ),
         }
     }
 
     /// GitHub's JSON answer to `GET target`, or the outcome for the call when there is none.
     #[allow(clippy::result_large_err)]
-    async fn get(
+    pub(crate) async fn get(
         &self,
         target: &str,
         token: &str,
@@ -422,42 +556,67 @@ impl GitHubConnector {
     ) -> Result<Value, ToolOutcome> {
         match self.api.get(target, token).await {
             Answered::Json(value) => Ok(value),
-            Answered::Unreadable => Err(unreadable()),
-            Answered::Unreachable => Err(unreachable()),
+            other => Err(vendor_error(other, what, call)),
+        }
+    }
+
+    /// GitHub's JSON answer to `GET target`, `None` for a 404, or the outcome for the call when
+    /// there is neither: for what a repository may or may not have.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn get_if_found(
+        &self,
+        target: &str,
+        token: &str,
+        what: &str,
+        call: &Call,
+    ) -> Result<Option<Value>, ToolOutcome> {
+        match self.api.get(target, token).await {
+            Answered::Json(value) => Ok(Some(value)),
             Answered::Status {
                 status,
-                rate_limited: true,
-            } => Err(rate_limited(status)),
-            Answered::Status { status, .. } if status == StatusCode::NOT_FOUND => {
-                Err(ToolOutcome::error(
-                    ErrorKind::Other,
-                    format!(
-                        "GitHub found no {what} there in {}/{}, or the token cannot see the \
-                         repository (HTTP 404)",
-                        call.owner(),
-                        call.repo()
-                    ),
-                ))
-            }
-            Answered::Status { status, .. } if status == StatusCode::FORBIDDEN => {
-                Err(ToolOutcome::error(
-                    ErrorKind::VendorRefusal,
-                    format!(
-                        "GitHub refused to show the {what} in {}/{} to this App (HTTP 403)",
-                        call.owner(),
-                        call.repo()
-                    ),
-                ))
-            }
-            Answered::Status { status, .. } => Err(ToolOutcome::error(
-                ErrorKind::Other,
-                format!("GitHub answered HTTP {}", status.as_u16()),
-            )),
+                rate_limited: false,
+            } if status == StatusCode::NOT_FOUND => Ok(None),
+            other => Err(vendor_error(other, what, call)),
         }
     }
 }
 
-fn unreadable() -> ToolOutcome {
+/// The outcome for a call when GitHub gave no JSON answer to a request for `what`. A 404, which
+/// GitHub also answers for a repository the token cannot see, and the rate limit are `other`;
+/// a 403 is `vendor_refusal`. No sentence quotes GitHub's answer.
+pub(crate) fn vendor_error(answered: Answered, what: &str, call: &Call) -> ToolOutcome {
+    match answered {
+        Answered::Json(_) | Answered::Unreadable => unreadable(),
+        Answered::Unreachable => unreachable(),
+        Answered::Status {
+            status,
+            rate_limited: true,
+        } => rate_limited(status),
+        Answered::Status { status, .. } if status == StatusCode::NOT_FOUND => ToolOutcome::error(
+            ErrorKind::Other,
+            format!(
+                "GitHub found no {what} there in {}/{}, or the token cannot see the repository \
+                 (HTTP 404)",
+                call.owner(),
+                call.repo()
+            ),
+        ),
+        Answered::Status { status, .. } if status == StatusCode::FORBIDDEN => ToolOutcome::error(
+            ErrorKind::VendorRefusal,
+            format!(
+                "GitHub refused to show the {what} in {}/{} to this App (HTTP 403)",
+                call.owner(),
+                call.repo()
+            ),
+        ),
+        Answered::Status { status, .. } => ToolOutcome::error(
+            ErrorKind::Other,
+            format!("GitHub answered HTTP {}", status.as_u16()),
+        ),
+    }
+}
+
+pub(crate) fn unreadable() -> ToolOutcome {
     ToolOutcome::error(ErrorKind::Other, "GitHub's answer could not be read")
 }
 

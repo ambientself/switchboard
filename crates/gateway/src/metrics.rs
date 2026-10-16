@@ -50,7 +50,9 @@
 //!     dispatched a call for a tool that does not exist; its tools stay listed;
 //!   - `switchboard_reach_checks_total{server,result}`, each reach check of the server's entry
 //!     (decision 0011, section 4), `result` one of `held`, `mismatch` and `failed`. A mismatch
-//!     withdraws the entry's tools, which `switchboard_drift_withdrawals_total` counts too;
+//!     withdraws the entry's tools, which `switchboard_drift_withdrawals_total` counts too. A
+//!     built-in entry checked against its vendor's report is counted here too, under its own
+//!     name;
 //!   - `switchboard_tools_withdrawn`, how many tools are withdrawn now. It falls when a reload
 //!     clears a withdrawal, and is 0 again after a restart.
 //! - With the registry's policy, from its [`Freshness`]: `switchboard_policy_age_seconds`, the
@@ -706,9 +708,11 @@ fn drift_signals(text: &mut Text, servers: &[(ConnectorName, DriftCounts)], with
     text.family(
         "switchboard_reach_checks_total",
         "counter",
-        "Reach checks of each proxied server's entry, by result: held (the server refused the \
-         call outside the entry's reach), mismatch (it answered, and the entry's tools were \
-         withdrawn), or failed (the check showed nothing).",
+        "Reach checks of each proxied server's entry, and of each built-in entry checked against \
+         its vendor's report, by result: held (the server refused the call outside the entry's \
+         reach, or the report listed exactly the recorded reach), mismatch (it answered, or the \
+         report differed, and the entry's tools were withdrawn), or failed (the check showed \
+         nothing).",
     );
     for (server, counts) in servers {
         for (result, count) in [

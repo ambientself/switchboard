@@ -57,6 +57,20 @@ pub(crate) struct ConnectorFile {
     pub permits: Option<Classification>,
     #[serde(default)]
     pub reach: Option<Vec<ResourceFile>>,
+    /// Whether the entry is a reach report's: see [`crate::BuiltInEntry::reports_reach`].
+    /// Absent is not, so a file written before reach reports keeps its meaning.
+    #[serde(default)]
+    pub reports_reach: bool,
+    /// The reach report the entry's reach is checked against, if it is.
+    #[serde(default)]
+    pub reach_report: Option<ReachReportFile>,
+}
+
+/// A built-in entry's reach report: the tool that reads the vendor's report.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReachReportFile {
+    pub tool: ToolName,
 }
 
 /// A built-in entry's credential: its mode and the vendor-side identity it acts as. The secret

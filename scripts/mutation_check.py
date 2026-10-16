@@ -6069,6 +6069,27 @@ mutate("gw-drift-dependent-drift-unjudged", "a tool withdrawn with its entry's r
 mutate("gw-reach-dependent-mismatch-unjudged", "a reach mismatch skips a tool withdrawn with its entry's reach check tool, so a new approval of the reach check tool alone serves it again", DRIFT,
        "                            && !state.withdrawn_on_its_own(name)\n",
        "                            && !state.standing.contains_key(*name)\n")
+# Decision 0011, section 4, the vendor-report kind (#193): a GitHub entry's recorded reach is
+# compared with GitHub's report of the installation's repositories both ways, on a schedule of its
+# own; a difference withdraws the entry's tools, and a report that cannot be read withdraws nothing.
+# tests/github_reach.rs watches each, and reach.rs's own tests the comparison.
+mutate("gw-reach-report-never-compared", "the report is compared with itself, not the recorded reach, so a repository added or dropped stays served", DRIFT,
+       "        let difference = compare(&check.reach, &repositories);\n",
+       "        let difference = compare(&repositories, &repositories);\n")
+mutate("gw-reach-report-added-ignored", "a repository the report lists and the reach does not hold is not a mismatch, so a widened installation stays served", GW + "reach.rs",
+       "        added: reported.difference(recorded).cloned().collect(),\n",
+       "        added: BTreeSet::new(),\n")
+mutate("gw-reach-report-dropped-ignored", "a repository the reach holds and the report does not list is not a mismatch, so an approval that no longer describes the credential stays served", GW + "reach.rs",
+       "        dropped: recorded.difference(reported).cloned().collect(),\n",
+       "        dropped: BTreeSet::new(),\n")
+mutate("gw-reach-report-failure-withdraws", "a report that could not be read is judged as an empty list, so a failed read withdraws the entry's tools", DRIFT,
+       "                self.signals.count(entry, |counts| counts.reach_failed += 1);\n",
+       "                self.signals.count(entry, |counts| counts.reach_failed += 1);\n"
+       "                let empty = Reported::Listed { repositories: BTreeSet::new(), row: None };\n"
+       "                self.judge_report(entry, check, started, empty);\n")
+mutate("gw-reach-report-never-scheduled", "no entry is checked against its report on the drift schedule, so a changed installation is never found", DRIFT,
+       "        for reporting in self.reporting() {\n            reports.spawn(report_every(\n",
+       "        for reporting in self.reporting().into_iter().take(0) {\n            reports.spawn(report_every(\n")
 
 
 # --- first slice: resources on rows, naming what goes down ------------------------------------
@@ -6451,7 +6472,7 @@ mutate("custodian-outside-limit-accepted", "a repository outside the team's limi
 mutate("custodian-other-account-accepted", "a repository on another account may be asked for", KP,
        "            if owner != account {", "            if false {")
 mutate("custodian-no-repositories-accepted", "a request may name no repository, which GitHub reads as all", KP,
-       "        if request.repositories.is_empty() {", "        if false {")
+       "        if request.repositories.is_empty() && !self.installation_wide(request) {", "        if false {")
 mutate("custodian-no-permissions-accepted", "a request may name no permission, which GitHub reads as all", KP,
        "        if request.permissions.is_empty() {", "        if false {")
 mutate("custodian-malformed-accepted", "a malformed request is checked as if well formed", KS,
@@ -6477,14 +6498,26 @@ mutate("custodian-socket-mode-open-accepted", "a socket mode giving others acces
 mutate("custodian-fake-jwt-unchecked", "the fake GitHub accepts any App JWT", KC + "fake.rs",
        "    if !bearer(&headers).is_some_and(|jwt| jwt_valid(&shared, jwt)) {",
        "    if bearer(&headers).is_none() {")
+# The one request that may name no repository (decision 0011, section 4; #193): a reach report's
+# tool, for metadata: read alone, asked of GitHub with no repositories. tests/reach_report.rs
+# watches each.
+mutate("custodian-reach-report-any-entry", "any tool may ask for an installation-wide metadata: read token, not only a reach report's", KP,
+       "        self.reach_reports.contains(&request.tool)\n",
+       "        self.tools.contains_key(&request.tool)\n")
+mutate("custodian-reach-report-any-permission", "a reach report's installation-wide token may carry any permission its entry states beside metadata: read", KP,
+       "            && request.permissions\n"
+       "                == BTreeMap::from([(REACH_REPORT_PERMISSION.to_owned(), Access::Read)])\n",
+       "            && request.permissions.contains_key(REACH_REPORT_PERMISSION)\n")
+mutate("custodian-reach-report-repositories-sent", "an installation-wide request is sent to GitHub with an empty repository list, not none", KG,
+       '            fields.remove("repositories");\n', "            let _ = fields;\n")
 
 # --- connector-github ----------------------------------------------------------------------
 # The GitHub connector refuses another organization before any request, asks the key custodian for
 # every token, narrowed as its entry says and with the revision its call was decided under, keeps
 # tokens out of what the caller reads, bounds and tags each result; and the gateway wires it from
 # the deployment file, behind its bound and quotas, and checks each approval against it (#12).
-# crates/gateway/tests/github.rs and github_logs.rs catch these, and the registry's built_in.rs
-# its loader's.
+# crates/gateway/tests/github.rs, github_reads.rs and github_logs.rs catch these, and the
+# registry's built_in.rs its loader's.
 
 GH = "crates/connector-github/src/"
 GHC = GH + "connector.rs"
@@ -6500,10 +6533,8 @@ mutate("github-custodian-bypassed", "GitHub is sent a token the connector made u
        "        self.read(&parsed, token.expose()).await",
        "        self.read(&parsed, call.policy_revision().as_str()).await")
 mutate("github-credential-in-error", "a vendor error names the token it was read with", GHC,
-       '            Answered::Status { status, .. } => Err(ToolOutcome::error(\n                ErrorKind::Other,\n'
-       '                format!("GitHub answered HTTP {}", status.as_u16()),',
-       '            Answered::Status { status, .. } => Err(ToolOutcome::error(\n                ErrorKind::Other,\n'
-       '                format!("GitHub answered HTTP {} to {token}", status.as_u16()),')
+       "            Answered::Json(value) => Ok(value),\n            other => Err(vendor_error(other, what, call)),",
+       '            Answered::Json(value) => Ok(value),\n            other => Err(vendor_error(other, &format!("{what} {token}"), call)),')
 mutate("github-file-bound-removed", "a file's text is not cut at 256 KiB", GHT,
        "            let (kept, cut) = bounded(text, MAX_FILE_TEXT_BYTES);",
        "            let (kept, cut) = (text, false);")
@@ -6514,6 +6545,53 @@ mutate("github-evidence-tag-dropped", "a result is not tagged as untrusted exter
 mutate("github-revision-not-sent", "a token request carries no revision", GHC,
        "            revision: call.policy_revision().clone(),",
        '            revision: gateway_core::PolicyRevision::new(""),')
+# The newer reads (crates/connector-github/src/reads): their bounds, the job log host check, the
+# CODEOWNERS check and the frame's token for AGENTS.md, and each tool's own permission set.
+# crates/gateway/tests/github_reads.rs catches these, reads.rs's own tests the entry check and
+# codeowners.rs's own tests the trailing `/**` rule.
+GHR = GH + "reads/"
+mutate("github-check-runs-bound-removed", "every check run GitHub sends is kept", GHR + "checks.rs",
+       "    for run in runs.iter().take(MAX_CHECK_RUNS) {", "    for run in runs.iter() {")
+mutate("github-annotations-bound-removed", "every annotation of a failing check run is kept", GHR + "checks.rs",
+       "                    .take(MAX_ANNOTATIONS)\n", "")
+mutate("github-statuses-bound-removed", "every commit status GitHub sends is kept", GHR + "checks.rs",
+       "        .take(MAX_STATUSES)\n", "")
+mutate("github-check-text-bound-removed", "a check run's summary is not cut at 4 KiB", GHR + "checks.rs",
+       "    let (kept, cut) = bounded(text, MAX_CHECK_TEXT_BYTES);", "    let (kept, cut) = (text, false);")
+mutate("github-releases-bound-removed", "every release GitHub sends is kept", GHR + "releases.rs",
+       "        .take(MAX_RELEASES)\n", "")
+mutate("github-tags-bound-removed", "every tag GitHub sends is kept", GHR + "releases.rs",
+       "tags.iter().take(MAX_TAGS).map(tag_fields)", "tags.iter().map(tag_fields)")
+mutate("github-job-log-bound-removed", "a job log is kept whole, up to what is read", GHR + "job_log.rs",
+       ".get_tail(&path, MAX_LOG_BYTES, MAX_LOG_READ_BYTES)", ".get_tail(&path, MAX_LOG_READ_BYTES, MAX_LOG_READ_BYTES)")
+mutate("github-job-log-read-cap-removed", "a job log is read to its end, however long, not stopped at 32 MiB", GH + "api.rs",
+       "            if read >= max_read {", "            if false {")
+mutate("github-annotation-message-bound-removed", "an annotation's message is not cut at 4 KiB", GHR + "checks.rs",
+       "    text_field(\n        annotation.get(\"message\").and_then(Value::as_str),\n        \"message\",\n        &mut kept,\n    );",
+       "    kept.insert(\"message\".into(), annotation.get(\"message\").cloned().unwrap_or(Value::Null));")
+mutate("github-template-bound-removed", "a pull request template is not cut at 64 KiB", GHR + "config.rs",
+       "        let text = text(&path, &file)?;\n        let (kept, cut) = bounded(&text, MAX_CONFIG_TEXT_BYTES);",
+       "        let text = text(&path, &file)?;\n        let (kept, cut) = (text.as_str(), false);")
+mutate("github-agents-bound-removed", "AGENTS.md is not cut at 64 KiB", GHR + "config.rs",
+       "    let text = text(AGENTS, &file)?;\n    let (kept, cut) = bounded(&text, MAX_CONFIG_TEXT_BYTES);",
+       "    let text = text(AGENTS, &file)?;\n    let (kept, cut) = (text.as_str(), false);")
+mutate("github-job-log-host-unchecked", "a job log redirect to a host the deployment does not pin is not refused", GHR + "job_log.rs",
+       "            .is_some_and(|base| base == wanted)", "            .is_some_and(|_| true)")
+mutate("github-codeowners-check-removed", "AGENTS.md is served when CODEOWNERS gives it no owner", GHR + "config.rs",
+       "    if owners.is_empty() {", "    if false {")
+mutate("github-codeowners-trailing-globstar-matches-the-file", "CODEOWNERS' `AGENTS.md/**` gives the file AGENTS.md an owner", GHR + "codeowners.rs",
+       "    if segments.len() > 1 && segments.last() == Some(&\"**\") {", "    if false {")
+mutate("github-frame-token-not-fresh", "AGENTS.md is quoted between markers with the same token every call", GHR + "config.rs",
+       "    OsRng.try_fill_bytes(&mut bytes).map_err(|_| {", "    Ok::<(), rand_core::Error>(()).map_err(|_| {")
+mutate("github-reads-ask-the-entrys-set", "a newer read asks for its entry's whole permission set, not its own", GH + "reads.rs",
+       "        permissions: set(permissions),", "        permissions: request.permissions.clone(),")
+mutate("github-tags-on-a-contents-token", "the tags are read on the releases' contents token's set, not metadata", GHR + "releases.rs",
+       "token(connector, request, TAGS_PERMISSIONS)", "token(connector, request, RELEASES_PERMISSIONS)")
+mutate("github-reads-entry-unchecked", "an entry that serves a newer read without its permissions is served", GH + "reads.rs",
+       "                if entry.permissions.get(*permission) < Some(&Access::Read) {", "                if false {")
+mutate("gateway-job-log-hosts-dropped", "the deployment file's [github] job_log_hosts do not reach the connector",
+       "crates/gateway/src/deployment.rs",
+       "            job_log_hosts: self.job_log_hosts,", "            job_log_hosts: Vec::new(),")
 # github__search checks its own scope (decision 0011): its query is built as Otto's gateway builds
 # it, its results are held to the caller's limit, and a self-scoped built-in call is begun with
 # unknown resources so that what it reached replaces them. crates/gateway/tests/github_search.rs
@@ -6588,6 +6666,18 @@ mutate("gateway-reload-connectors-uncompared", "a reload that changes a built-in
 mutate("gateway-connectors-outside-the-policy", "an entry changed under the same revision is not a changed policy",
        "crates/gateway/src/policy.rs",
        "            connectors: registry.connectors().clone(),", "            connectors: BTreeMap::new(),")
+# The registry holds a reach-report entry to its one job, and an entry's reach report to one that
+# can check it (decision 0011, section 4; #193). The registry's tests/reach_report.rs watches each.
+mutate("registry-reach-report-surface-unchecked", "a reach report's tool may be served to any principal of a team",
+       "crates/gateway-registry/src/registry.rs",
+       "        if !matches!(surface.principals, PrincipalsFile::AnyInTeamsAndGroups) {", "        if true {")
+mutate("registry-reach-report-entry-narrowed-accepted", "a reach-report entry may be narrowed, though its credential reads the whole installation",
+       "crates/gateway-registry/src/builtin.rs",
+       "            Some(declaration) if declaration.narrowing != Narrowing::None => {",
+       "            Some(declaration) if false && declaration.narrowing != Narrowing::None => {")
+mutate("registry-reach-report-unapproved-accepted", "a reach report's tool may be withdrawn while the entry it checks keeps its tools",
+       "crates/gateway-registry/src/registry.rs",
+       "            && built_in_tools.values().any(|on| *on == entry.name)\n", "            && false\n")
 
 # --- Which tests can see a mutation ----------------------------------------------------------
 #

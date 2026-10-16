@@ -59,7 +59,7 @@ impl Definition {
     }
 }
 
-fn owner_and_repo() -> Map<String, Value> {
+pub(crate) fn owner_and_repo() -> Map<String, Value> {
     let mut properties = Map::new();
     properties.insert(
         "owner".into(),
@@ -82,7 +82,7 @@ fn owner_and_repo() -> Map<String, Value> {
     properties
 }
 
-fn numbered(description: &str) -> Value {
+pub(crate) fn numbered(description: &str) -> Value {
     let mut properties = owner_and_repo();
     properties.insert(
         "number".into(),
@@ -117,7 +117,7 @@ pub fn definitions() -> Vec<Definition> {
             "description": "A branch, tag or commit. The default branch if left out."
         }),
     );
-    vec![
+    let mut definitions = vec![
         Definition {
             name: GET_FILE,
             description: "Reads one file from a repository of the configured organization, as \
@@ -146,7 +146,10 @@ pub fn definitions() -> Vec<Definition> {
             input_schema: numbered("The pull request's number."),
         },
         crate::search::definition(),
-    ]
+    ];
+    definitions.extend(crate::reads::definitions());
+    definitions.sort_by_key(|definition| definition.name);
+    definitions
 }
 
 /// A call's arguments, parsed into the tool's own types.
@@ -168,18 +171,22 @@ pub(crate) enum Call {
         repo: String,
         number: u64,
     },
+    /// One of the tools in [`crate::reads`].
+    Read(crate::reads::ReadCall),
 }
 
 impl Call {
     pub(crate) fn owner(&self) -> &str {
         match self {
             Call::File { owner, .. } | Call::Issue { owner, .. } | Call::Pr { owner, .. } => owner,
+            Call::Read(read) => &read.owner,
         }
     }
 
     pub(crate) fn repo(&self) -> &str {
         match self {
             Call::File { repo, .. } | Call::Issue { repo, .. } | Call::Pr { repo, .. } => repo,
+            Call::Read(read) => &read.repo,
         }
     }
 }
@@ -199,12 +206,12 @@ pub(crate) fn parse(tool: &str, arguments: &Value) -> Option<Result<Call, String
             repo,
             number,
         }),
-        _ => return None,
+        _ => return crate::reads::parse(tool, arguments).map(|parsed| parsed.map(Call::Read)),
     };
     Some(parsed)
 }
 
-fn object(arguments: &Value) -> Result<&Map<String, Value>, String> {
+pub(crate) fn object(arguments: &Value) -> Result<&Map<String, Value>, String> {
     arguments
         .as_object()
         .ok_or_else(|| "the arguments are not an object".to_owned())
@@ -241,7 +248,7 @@ fn repository_name(repo: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-fn owner_repo(arguments: &Map<String, Value>) -> Result<(String, String), String> {
+pub(crate) fn owner_repo(arguments: &Map<String, Value>) -> Result<(String, String), String> {
     let owner = required(arguments, "owner")?;
     let repo = required(arguments, "repo")?;
     if !account_name(&owner) {

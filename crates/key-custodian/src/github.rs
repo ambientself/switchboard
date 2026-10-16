@@ -9,7 +9,10 @@
 //! A token is asked for with `repositories` and `permissions` both set, so GitHub narrows it to
 //! them. What GitHub answers is checked: a token that names any other repository, all of
 //! them, or a permission beyond what was asked for (other than `metadata: read`, which GitHub
-//! adds to every token) is never handed out. It comes back in the `unissued` field of the
+//! adds to every token) is never handed out. The one exception is a reach report's request,
+//! which the policy lets name no repository, for `metadata: read` alone (see
+//! [`crate::policy`]): it is asked for with no `repositories`, so for the installation's whole
+//! list, and only its permissions are checked. It comes back in the `unissued` field of the
 //! [`VendorError`], and the server revokes it as it revokes a token at the end of its lifetime
 //! (see [`crate::server`]).
 
@@ -316,10 +319,17 @@ impl GitHubApp {
             .iter()
             .map(|(name, level)| (name.as_str(), level.as_str()))
             .collect();
-        let body = json!({
+        let mut body = json!({
             "repositories": names,
             "permissions": levels,
         });
+        // A reach report's installation-wide request (see `crate::policy`): GitHub reads a
+        // request with no `repositories` as one for the installation's whole list.
+        if repositories.is_empty()
+            && let Some(fields) = body.as_object_mut()
+        {
+            fields.remove("repositories");
+        }
         let jwt = self.key.jwt(&self.app_id, clock::now()).map_err(|_| {
             VendorError::new(Failure::VendorFailed, "the App JWT could not be signed")
         })?;
@@ -397,18 +407,22 @@ fn widened(
     repositories: &[String],
     permissions: &BTreeMap<String, Access>,
 ) -> Option<String> {
-    if answer.repository_selection.as_deref() != Some("selected") {
-        return Some("GitHub issued a token for every repository of the installation".into());
-    }
-    let asked: BTreeSet<&str> = repositories.iter().map(String::as_str).collect();
-    let given: BTreeSet<&str> = answer
-        .repositories
-        .iter()
-        .flatten()
-        .map(|repository| repository.full_name.as_str())
-        .collect();
-    if given != asked {
-        return Some("GitHub issued a token for other repositories than asked for".into());
+    // A request naming no repository asked for the installation's whole list, which only a
+    // reach report's may (see `crate::policy`); its permissions are still checked below.
+    if !repositories.is_empty() {
+        if answer.repository_selection.as_deref() != Some("selected") {
+            return Some("GitHub issued a token for every repository of the installation".into());
+        }
+        let asked: BTreeSet<&str> = repositories.iter().map(String::as_str).collect();
+        let given: BTreeSet<&str> = answer
+            .repositories
+            .iter()
+            .flatten()
+            .map(|repository| repository.full_name.as_str())
+            .collect();
+        if given != asked {
+            return Some("GitHub issued a token for other repositories than asked for".into());
+        }
     }
     for (name, level) in &answer.permissions {
         let allowed = match permissions.get(name) {

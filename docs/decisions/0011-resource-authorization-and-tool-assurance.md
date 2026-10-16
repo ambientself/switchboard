@@ -265,6 +265,17 @@ the other tools' own approvals, and a new approval of the reach check tool, or o
 entry, clears them. A tool withdrawn for a cause of its own still needs a new approval of its
 own. Another entry's tools are not touched. The owner accepted this on 2026-10-12 (#172).
 
+*Note added 2026-10-15:* the vendor-report kind is built for GitHub (#193). The broader
+credential is a `[[connectors]]` entry of its own, declared `reports_reach = true`, `read`,
+narrowed `none` and served only on `registry-reach`; the key custodian gives its tool alone an
+installation-wide token, for `metadata: read` alone. The drift pass compares the installation's
+repositories with the recorded reach of each entry that names a `reach_report`, both ways, and a
+mismatch withdraws the entry's tools as a canary mismatch does. The check is opt-in: unlike a
+proxied entry's `reach_check`, no rule yet requires a `reach_report` of a GitHub entry with a
+reach, so an entry that names none is served unchecked. What the credential permits is checked
+by the custodian on every token rather than from the report. Jira's report is not built
+(design.md, sections 13 and 17).
+
 ### 5. Where each part of the decision is made
 
 | Part | Made by | When | Can it allow? | On the audit record |

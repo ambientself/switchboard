@@ -18,6 +18,25 @@
 //! approved, and keeps that meaning: the custodian reads it, and the gateway loads and
 //! otherwise ignores it. An entry with them is a connector entry of the snapshot, of kind
 //! built-in, so the snapshot loader's rules apply to its tools.
+//!
+//! # Reach reports
+//!
+//! Decision 0011, section 4, checks a reach against the vendor's own report of what a
+//! credential reaches, where the vendor gives one, as GitHub lists an installation's
+//! repositories. Reading that report needs a credential that sees the whole list, broader than
+//! any entry's narrowed one, so that credential is a connector entry of its own: one with
+//! `reports_reach = true`. The loader holds such an entry to its one job: it declares its
+//! credential, narrowed `none` (it reads the whole installation), permitting `read`, with no
+//! reach of its own and no reach report; every tool approved on it is `read`; and those tools
+//! are served only on surfaces restricted to named principals (the registry's own, on
+//! `registry-reach`). The key custodian gives such an entry's tool, and no other, an
+//! installation-wide token, for `metadata: read` alone (see `key_custodian::policy`).
+//!
+//! An entry whose reach is checked that way names the report's tool in `reach_report`. It
+//! declares a reach that is not empty, and holds only repositories of its own system, which is
+//! what the report lists. The tool must be one a reach-report entry of the same system lists,
+//! and approved while any of the entry's own tools is, so that nothing is served under a
+//! credential whose reach is never checked. The drift pass makes the check (`gateway::drift`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -64,6 +83,27 @@ pub struct BuiltInEntry {
     /// The entry's credential as decision 0011 records it, when the entry serves approved
     /// tools; `None` for an entry the custodian alone reads.
     pub declaration: Option<EntryDeclaration>,
+    /// Whether the entry is a reach report's: its credential reads the vendor's report of what
+    /// the system's credentials reach (decision 0011, section 4). The loader holds such an
+    /// entry to that one job: it declares its credential, narrowed `none`, permitting `read`,
+    /// with no reach or reach report of its own; every tool approved on it is `read`; and its
+    /// tools are served only on surfaces restricted to named principals. The key custodian gives
+    /// its tools alone an installation-wide token, for `metadata: read` alone.
+    pub reports_reach: bool,
+    /// The reach report this entry's reach is checked against, if it is.
+    pub reach_report: Option<ReachReport>,
+}
+
+/// The kind of resource a reach report lists, and so of every resource in the reach of an entry
+/// checked against one: GitHub's report lists an installation's repositories.
+pub const REPORTED_KIND: &str = "repository";
+
+/// The reach report an entry's reach is checked against (decision 0011, section 4): the tool,
+/// served by a reach-report entry of the same system, that reads the vendor's report.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReachReport {
+    /// The tool, by its exposed name.
+    pub tool: ToolName,
 }
 
 /// A built-in entry's credential as decision 0011, section 1, records it.
@@ -190,16 +230,88 @@ pub(crate) fn built_in(
             (None, None, None) if entry.reach.is_none() => None,
             _ => return Err(RegistryError::EntryPartlyDeclared(entry.name)),
         };
-        checked.insert(
-            entry.name.clone(),
-            BuiltInEntry {
-                name: entry.name,
-                system: entry.system,
-                permissions: entry.permissions,
-                tools: entry.tools,
-                declaration,
-            },
-        );
+        let reach_report = entry
+            .reach_report
+            .map(|report| ReachReport { tool: report.tool });
+        let built = BuiltInEntry {
+            name: entry.name,
+            system: entry.system,
+            permissions: entry.permissions,
+            tools: entry.tools,
+            declaration,
+            reports_reach: entry.reports_reach,
+            reach_report,
+        };
+        reach_report_shape(&built)?;
+        checked.insert(built.name.clone(), built);
+    }
+    for entry in checked.values() {
+        if let Some(report) = &entry.reach_report {
+            let reported = checked.values().any(|other| {
+                other.reports_reach
+                    && other.system == entry.system
+                    && other.tools.contains(&report.tool)
+            });
+            if !reported {
+                return Err(RegistryError::ReachReport {
+                    connector: entry.name.clone(),
+                    problem: format!(
+                        "names `{}`, which no entry of system `{}` with `reports_reach = true` \
+                         lists",
+                        report.tool, entry.system
+                    ),
+                });
+            }
+        }
     }
     Ok(checked)
+}
+
+/// Refuses a reach-report entry that is not held to its one job, and an entry checked against
+/// a reach report whose reach is not one the report can be compared with (see the [module
+/// documentation](self)).
+fn reach_report_shape(entry: &BuiltInEntry) -> Result<(), RegistryError> {
+    if entry.reports_reach {
+        let problem = match &entry.declaration {
+            None => Some("declares no credential"),
+            Some(declaration) if declaration.narrowing != Narrowing::None => {
+                Some("is not narrowed \"none\", though its credential reads the whole report")
+            }
+            Some(declaration) if declaration.permits != Classification::Read => {
+                Some("permits more than \"read\"")
+            }
+            Some(declaration) if !declaration.reach.is_empty() => Some("gives a reach"),
+            Some(_) if entry.reach_report.is_some() => Some("has a reach report of its own"),
+            Some(_) => None,
+        };
+        if let Some(problem) = problem {
+            return Err(RegistryError::ReachReportEntry {
+                connector: entry.name.clone(),
+                problem: problem.to_owned(),
+            });
+        }
+    }
+    if entry.reach_report.is_some() {
+        let reach = entry
+            .declaration
+            .as_ref()
+            .map(|declaration| &declaration.reach);
+        let comparable = reach.is_some_and(|reach| {
+            !reach.is_empty()
+                && reach.iter().all(|resource| {
+                    resource.system == entry.system && resource.kind == REPORTED_KIND
+                })
+        });
+        if !comparable {
+            return Err(RegistryError::ReachReport {
+                connector: entry.name.clone(),
+                problem: format!(
+                    "needs a declared reach that is not empty and holds only resources of system \
+                     `{}` and kind `{REPORTED_KIND}`, which is what the report lists",
+                    entry.system
+                ),
+            });
+        }
+    }
+    Ok(())
 }
