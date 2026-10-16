@@ -269,10 +269,12 @@ own. Another entry's tools are not touched. The owner accepted this on 2026-10-1
 credential is a `[[connectors]]` entry of its own, declared `reports_reach = true`, `read`,
 narrowed `none` and served only on `registry-reach`; the key custodian gives its tool alone an
 installation-wide token, for `metadata: read` alone. The drift pass compares the installation's
-repositories with each checked entry's recorded reach both ways, and a mismatch withdraws the
-entry's tools as a canary mismatch does. What the credential permits is checked by the custodian
-on every token rather than from the report. Jira's report is not built (design.md, sections 13
-and 17).
+repositories with the recorded reach of each entry that names a `reach_report`, both ways, and a
+mismatch withdraws the entry's tools as a canary mismatch does. The check is opt-in: unlike a
+proxied entry's `reach_check`, no rule yet requires a `reach_report` of a GitHub entry with a
+reach, so an entry that names none is served unchecked. What the credential permits is checked
+by the custodian on every token rather than from the report. Jira's report is not built
+(design.md, sections 13 and 17).
 
 ### 5. Where each part of the decision is made
 
