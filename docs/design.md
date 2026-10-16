@@ -161,7 +161,7 @@ lines only once the interfaces between them have settled.
 | `gateway-core` | Principals, classification, the decision function, the tool registry, the audit record type, denial sentences. No I/O. |
 | `gateway-identity` | Token verifiers, one per issuer type, and the team manifest loader. |
 | `audit-postgres` | The audit store over Postgres: the schema, its two roles, the migrations and the boot check. |
-| `connector-github` | The GitHub connector, in the gateway's own process: Otto's GitHub tools, so far `github__get_file`, `github__get_pr` and `github__get_issue`. Every token comes from the key custodian, through the client in `key-custodian`. A fake GitHub REST API behind `test-support`. |
+| `connector-github` | The GitHub connector, in the gateway's own process: Otto's GitHub tools, so far `github__get_file`, `github__get_pr`, `github__get_issue` and `github__search`. Every token comes from the key custodian, through the client in `key-custodian`. A fake GitHub REST API behind `test-support`. |
 | `key-custodian` | The key custodian (`switchboard-custodian`), the one process that holds the GitHub App key, and its client, a library module the GitHub connector depends on. The gateway never starts the key-holding process; it links the whole crate, server code too, until the crate gains a client-only feature (#219). |
 | `gateway-otto` | The Otto adapter: Otto's policy profile, the turn-grant verifier and the client for Otto's resolver interface. The core crates do not depend on it. |
 | `connector-proxy` | The connector that forwards to a separate MCP server. |
@@ -876,7 +876,24 @@ written complete, has no finish, and is never open.
   It is part of the row's first half, not of its completion: a row whose tool has no entry
   records none, and rows written before it was recorded read as not recorded.
 - **A tool that checks its own scope reports what it reached** when it finishes, in place of
-  `unknown`. This is required before milestone 4.
+  `unknown` ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md),
+  #12). As built: a built-in tool declared `checks_own_scope` is begun with `unknown`
+  resources, and with its success its connector reports the resources it reached
+  (`ToolOutcome::Reached`). Finish records them in place of `unknown`, in the same write as the
+  completion, escaped, capped at 64 and counted as named resources are. A tool that reached
+  nothing records an empty list, not `unknown`; one that fails or refuses leaves `unknown`; a
+  call that named its resources before it ran keeps them. Only a tool declared
+  `checks_own_scope` may report: from any other tool the report breaks the connector's
+  contract, so nothing of it is recorded, the result is withheld, and the call is recorded as
+  an `error` of the kind `other`, or as `unknown` for a side effect, which may have taken
+  effect. Both stores write the reach only on a row begun with `unknown` resources. In
+  Postgres, migration 0011 lets `complete_once` accept that one change, from `unknown` to a
+  list, and grants the gateway's role UPDATE on `resources` and `resources_omitted`, which the
+  boot check expects; the role still cannot read them, so a repeated finish is compared on its
+  completion alone, in both stores. A reach is bounded as named resources are, so a finished
+  row's caller-chosen values are within the same 316,129 bytes; begin does not count that room
+  for a row it writes with `unknown` resources, so only a row whose configured values are near
+  the bound could finish over it. The contract suite covers it on both stores.
 - **A turn grant is recorded by what identifies it:** its digest (the SHA-256 of the grant as
   presented), issuer, key ID, session, turn, execution and epoch, the turn's egress setting when
   the grant carries one, and the pod UID the caller's token proves; and, when Otto was asked,
@@ -1400,8 +1417,8 @@ call or to the limit, and no built-in entry: its connector narrows. A reload tha
 built-in entry under the same revision is refused as an unchanged revision, as the custodian
 refuses it, and under a new one until a restart, since the connector was built with the entry.
 
-The GitHub connector serves three of Otto's read tools so far: `github__get_file`,
-`github__get_pr` and `github__get_issue`. Each checks, before anything is asked of the
+The GitHub connector serves four of Otto's read tools so far. Three read one repository each:
+`github__get_file`, `github__get_pr` and `github__get_issue`. Each checks, before anything is asked of the
 custodian or of GitHub, what Otto's gateway checks (docs/otto-baseline.md): its arguments
 parse into its own types, and a malformed one is `error` with the kind `invalid_arguments`; its
 owner is the configured organization, and a call naming another is `refused`, with the
@@ -1414,8 +1431,29 @@ said to be cut; every result carries `provenance`, with `"trust": "untrusted-ext
 404, which it also answers for a repository the token cannot see, is `other`; its 403 is
 `vendor_refusal`; its rate limit is `other`, with a sentence saying so. None of the three checks
 its own scope, so none has resources to report when it finishes: each is declared from its
-arguments, and its row names its repository. The other read tools, the write tools, Jira, the
-lookup by marker and the comment exception are not built.
+arguments, and its row names its repository.
+
+The fourth, `github__search`, searches the organization's issues and pull requests and is
+declared `checks_own_scope`: which repositories a search reaches is known only once GitHub
+answers, so its call is begun with `unknown` resources. It checks the caller's query, 1 to 256
+bytes with no control character, whose quotes pair up and whose parentheses balance outside
+them, and a query that fails is `invalid_arguments`, so it can neither close the parenthesis it
+is put in nor open a quote that swallows the qualifier after it. An `org:` or `user:` qualifier
+naming another account is `refused`, as Otto refuses it. The query is sent as Otto's gateway
+sends it: the caller's in parentheses, then the organization qualifier,
+`(query) org:{organization}`, for one page of ten, with GitHub's advanced search requested. Its
+token is narrowed to the caller's limit, but GitHub's search also answers from public
+repositories a token was not narrowed to, so every result is checked against the caller's limit
+as the call's decision held it, and one from a repository outside it is withheld whole: that
+filter, not the qualifier, holds a search to the team's repositories. At most ten results come
+back, without their bodies, said to be cut when GitHub found more, and tagged as evidence. The
+connector reports the repositories the results came from as what the call reached, and its row
+records them in place of `unknown` when it finishes (section 11); a search that returns nothing
+records an empty list. GitHub's 422, a query it cannot run, is `invalid_arguments`. A search
+runs only under an entry narrowed to the caller's limit, as the loader requires of a tool that
+checks its own scope, and a caller whose limit holds no repository of the organization is
+refused before any request. The other read tools, the write tools, Jira, the lookup by marker
+and the comment exception are not built.
 
 **Proxied servers** are onboarded through the registry:
 
@@ -2246,6 +2284,16 @@ that removes the exception-list check.
   which needs a real App. Left as they are: GitHub names are compared case-sensitively, so a
   call that writes an owner or a repository in another case than its limit does is denied;
   and each GitHub entry has quota buckets of its own, not GitHub as a whole.
+- Built: `github__search`, declared `checks_own_scope` (section 13), and decision 0011's
+  report of what such a tool reached (section 11): the core's `ToolOutcome::Reached`, recorded
+  at finish in place of `unknown` and refused from any other tool, both stores, Postgres's
+  migration 0011 and the boot check's grant, and the contract suite's cases on both stores. Its
+  tests run over HTTP as the other tools' do: results from repositories outside the caller's
+  limit withheld and the rest recorded as reached; a search that returns nothing recorded as an
+  empty list; the query built as Otto's gateway builds it; a malformed query, and one GitHub
+  cannot run, `invalid_arguments` with nothing reached; and a qualifier naming another
+  organization refused before any request. The search's filter compares repository names
+  without regard to case, as GitHub does, and records the limit's own spelling.
 
 **#12, the bound around in-process connectors and the rate quotas** (decision 0014, sections 1
 and 2). Built before any built-in connector, so the first one is bounded from its first call:
