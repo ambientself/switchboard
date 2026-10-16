@@ -893,7 +893,7 @@ async fn a_proxied_servers_and_teams_quotas_refuse_with_a_row_and_nothing_sent()
 }
 
 /// `[connectors.<name>]` for a connector the gateway does not run in its own process refuses
-/// the start. None is wired yet, so every one does.
+/// the start. This registry declares no GitHub entry, so none is wired.
 #[tokio::test]
 async fn bounds_for_a_connector_the_gateway_does_not_run_refuse_the_start() {
     let files = Files::new(

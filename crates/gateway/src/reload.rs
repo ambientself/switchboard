@@ -10,12 +10,15 @@
 //! approval of the tool is unchanged (see [`crate::drift`]). It cannot change what the running
 //! connectors were built for, so a new file is refused, and the gateway must be restarted, if
 //! it changes a server, adds or removes one, or routes a tool to an upstream tool the gateway
-//! did not start with. Withdrawing a tool is always possible.
+//! did not start with. So is a file that changes a built-in connector entry, `[[connectors]]`,
+//! under a new revision: the built-in connectors read each entry's permission set and
+//! narrowing when they are built. Withdrawing a tool is always possible.
 //!
 //! A new file that changes the policy must also change its `revision`. Audit rows explain a
 //! decision only by the revision they record, so two different policies served under one
 //! revision would make those rows ambiguous. Such a file is refused and the policy served now
-//! stays. A file whose policy is the same as the one served (a comment edited, say) is fine
+//! stays. The built-in connector entries are part of the policy here, as they are of the key
+//! custodian's copy, which refuses such a file too (#219). A file whose policy is the same as the one served (a comment edited, say) is fine
 //! with the same revision.
 //!
 //! Every read that succeeds is recorded in the [`Freshness`] the gates share, whether or not
@@ -57,6 +60,10 @@ pub enum ReloadError {
          serve it"
     )]
     RouteChanged(ToolName),
+    /// The file changes a built-in connector entry, which the built-in connectors were built
+    /// with.
+    #[error("the registry's built-in connector entries changed; restart the gateway to serve them")]
+    ConnectorsChanged,
     /// The file changes the policy but keeps the revision of the policy served now.
     #[error(
         "the registry's policy changed but its revision is still `{0}`; change the revision \
@@ -190,6 +197,9 @@ impl Reloader {
         let served = self.withdrawals.base();
         if policy.revision() == served.revision() && policy != *served {
             return Err(ReloadError::RevisionUnchanged(policy.revision().clone()));
+        }
+        if registry.connectors() != self.basis.registry.connectors() {
+            return Err(ReloadError::ConnectorsChanged);
         }
         Ok(self.withdrawals.load(registry, policy))
     }

@@ -33,9 +33,15 @@ pub(crate) struct RegistryFile {
     /// its meaning.
     #[serde(default)]
     pub connectors: Vec<ConnectorFile>,
+    /// The approvals of built-in connectors' tools. Absent is none, so a file written before
+    /// they existed keeps its meaning.
+    #[serde(default)]
+    pub built_in_tools: Vec<BuiltInToolFile>,
 }
 
-/// A built-in connector's entry: see [`crate::BuiltInEntry`].
+/// A built-in connector's entry: see [`crate::BuiltInEntry`]. The credential, its narrowing and
+/// what it permits are given together or not at all; an entry without them serves no approved
+/// tool, as every entry did before built-in tools were approved in this file.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConnectorFile {
@@ -43,6 +49,55 @@ pub(crate) struct ConnectorFile {
     pub system: String,
     pub permissions: BTreeMap<String, Access>,
     pub tools: BTreeSet<ToolName>,
+    #[serde(default)]
+    pub credential: Option<BuiltInCredentialFile>,
+    #[serde(default)]
+    pub narrowing: Option<Narrowing>,
+    #[serde(default)]
+    pub permits: Option<Classification>,
+    #[serde(default)]
+    pub reach: Option<Vec<ResourceFile>>,
+}
+
+/// A built-in entry's credential: its mode and the vendor-side identity it acts as. The secret
+/// is never in the file, and a built-in connector gets it its own way (the GitHub connector
+/// from the key custodian).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BuiltInCredentialFile {
+    pub mode: CredentialMode,
+    pub principal: String,
+}
+
+/// The approval of one built-in connector's tool (decision 0011, section 1).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BuiltInToolFile {
+    pub name: ToolName,
+    pub connector: ConnectorName,
+    pub classification: Classification,
+    #[serde(default)]
+    pub title: Option<String>,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+    pub approved_by: String,
+    pub approved_at: Datetime,
+    pub definition_sha256: String,
+    pub binding_sha256: String,
+    pub resources: BuiltInResourcesFile,
+    #[serde(default)]
+    pub settlement: Option<Settlement>,
+}
+
+/// How a built-in tool's resources are known: as a proxied tool's are, or checked by the
+/// connector itself while it runs, which only gateway code may be trusted to do.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BuiltInResourcesFile {
+    NoResources,
+    FromArguments(Vec<SourceFile>),
+    AsReach,
+    ChecksOwnScope,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,6 +186,11 @@ pub(crate) enum ResourcesFile {
 #[serde(deny_unknown_fields)]
 pub(crate) struct SourceFile {
     pub from_argument: String,
+    /// Another string argument whose value comes first in the identifier, followed by `/`, as
+    /// a repository's owner comes before its name. Absent, the identifier is the argument's
+    /// value alone, as it was before this field existed.
+    #[serde(default)]
+    pub qualified_by: Option<String>,
     pub system: String,
     pub kind: String,
 }

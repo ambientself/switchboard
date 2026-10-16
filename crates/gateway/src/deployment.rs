@@ -87,9 +87,16 @@
 //! [servers.vendor-docs]       # an https server needs its entry, for its CA file
 //! ca_file = "vendor-docs-ca.pem"  # needed for https, refused for http; the only CAs trusted
 //!
-//! [connectors.github]         # optional, for a connector in the gateway's own process
+//! [connectors.github-read]    # optional, for a connector in the gateway's own process
 //! deadline_seconds = 5        # 5 if left out; 1 to 60
 //! max_result_bytes = 1048576  # 1 MiB if left out; 1 to 1 MiB
+//!
+//! [github]                    # needed when the registry declares a GitHub connector entry
+//! organization = "example-org"   # the one organization every call must name
+//! api_url = "https://api.github.com"
+//! ca_file = "github-ca.pem"      # needed for https; the only CAs trusted
+//! custodian_socket = "/run/switchboard-custodian/custodian.sock"
+//! custodian_deadline_seconds = 5 # 5 if left out; 1 to 30
 //!
 //! [drift]
 //! interval_seconds = 300      # 300 if left out; 5 to 900
@@ -215,9 +222,20 @@
 //!   [`DEFAULT_IN_PROCESS_DEADLINE`] if left out, and `max_result_bytes`, the largest result in
 //!   bytes of its JSON text, [`DEFAULT_IN_PROCESS_RESULT_BYTES`] if left out. Zero, or past the
 //!   same ceilings as a server's, is refused, and the termination grace must cover these
-//!   deadlines too. The gateway refuses to start with an entry for a connector it does not run
-//!   in its own process; no built-in connector is wired yet (#12), so today every entry is
-//!   refused when it starts.
+//!   deadlines too. The name is a built-in connector entry's, `[[connectors]]` in the registry,
+//!   and the gateway refuses to start with an entry for a connector it does not run in its own
+//!   process: today, any but a GitHub entry that declares its credential.
+//! - **The GitHub connector** (`connector-github`) is the `[github]` table: the one
+//!   `organization` every call must name as its owner, GitHub's REST API base URL `api_url`,
+//!   its `ca_file`, the PEM bundle of the only CAs its certificate may chain to, and
+//!   `custodian_socket`, the Unix socket of the key custodian (`switchboard-custodian`), which
+//!   issues every token. `custodian_deadline_seconds` bounds each token request: 5 unless
+//!   given, and 1 to 30. The URL is `https`, which needs `ca_file`; a development build may use
+//!   plain `http` to a loopback address, with no `ca_file`, for the tests' fakes. The gateway
+//!   reads no GitHub key, and the table names none. The connector is wired for each GitHub
+//!   entry of the registry that declares its credential, and the gateway refuses to start with
+//!   such an entry and no `[github]`, or with a `[github]` and no such entry (see
+//!   [`crate::start`]); the URL and the CA file are checked when it starts.
 //! - **Each `https` server's CA file** is `[servers.<name>] ca_file`, a PEM bundle of the only
 //!   CAs the server's certificate may chain to (decision 0013, section 3). Trust is named, never
 //!   ambient: no roots are compiled in and none are read from the operating system. The
@@ -259,9 +277,10 @@
 //!
 //! Every table refuses fields it does not know. Only `listen`, `registry.max_age_seconds`, the
 //! audit pools, the limits and quotas, each server's and each connector's bounds, the drift
-//! interval and the reconciliation settings have defaults, so a gateway not told where to
-//! listen is reachable from its own machine only. `[metrics]`, `[grants]`, `[resolver]`, each
-//! server's CA file and the reach settings may be left out, each under the rules above. Any
+//! interval, the reconciliation settings and the custodian's deadline have defaults, so a
+//! gateway not told where to listen is reachable from its own machine only. `[metrics]`,
+//! `[grants]`, `[resolver]`, `[github]`, each server's CA file and the reach settings may be
+//! left out, each under the rules above. Any
 //! other missing field is an error, and so is a field that does not belong to the chosen mode
 //! or kind, such as `subjects_file` on a user issuer.
 
@@ -271,6 +290,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use audit_postgres::PoolSizes;
+use connector_github::{DEFAULT_CUSTODIAN_DEADLINE, GitHubSettings};
 use connector_proxy::{DEFAULT_DEADLINE, DEFAULT_MAX_RESPONSE_BYTES};
 use gateway_core::{ConnectorName, DeploymentName, Issuer, Subject, TeamId};
 use serde::Deserialize;
@@ -367,6 +387,9 @@ pub struct DeploymentFile {
     /// defaults.
     #[serde(default)]
     pub connectors: BTreeMap<ConnectorName, ConnectorSection>,
+    /// Where the GitHub connector finds GitHub and the key custodian, if the table is given.
+    #[serde(default)]
+    pub github: Option<GitHubSection>,
     /// How often the drift pass runs, where it differs from the default, and each proxied
     /// server's probe credential.
     #[serde(default)]
@@ -470,6 +493,48 @@ pub struct ConnectorSection {
     /// [`MAX_SERVER_RESULT_BYTES`], and [`DEFAULT_IN_PROCESS_RESULT_BYTES`] if left out.
     #[serde(default)]
     pub max_result_bytes: Option<usize>,
+}
+
+/// The `[github]` table, as written.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubSection {
+    /// The one organization every call must name as its owner.
+    pub organization: String,
+    /// GitHub's REST API base URL.
+    pub api_url: String,
+    /// The CAs trusted for an `https` URL, from the deployment file's directory.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    /// The key custodian's socket, from the deployment file's directory.
+    pub custodian_socket: PathBuf,
+    /// How long the custodian has to answer each token request, in seconds:
+    /// [`DEFAULT_CUSTODIAN_DEADLINE`] if left out, and 1 to [`MAX_CUSTODIAN_DEADLINE`].
+    #[serde(default)]
+    pub custodian_deadline_seconds: Option<u64>,
+}
+
+/// The longest the key custodian may be given to answer a token request.
+pub const MAX_CUSTODIAN_DEADLINE: Duration = Duration::from_secs(30);
+
+impl GitHubSection {
+    /// The connector's settings, with the files from `base`.
+    fn settings(self, base: &Path) -> Result<GitHubSettings, DeploymentError> {
+        let deadline = match self.custodian_deadline_seconds {
+            None => DEFAULT_CUSTODIAN_DEADLINE,
+            Some(seconds) if (1..=MAX_CUSTODIAN_DEADLINE.as_secs()).contains(&seconds) => {
+                Duration::from_secs(seconds)
+            }
+            Some(seconds) => return Err(DeploymentError::CustodianDeadlineOutOfRange { seconds }),
+        };
+        Ok(GitHubSettings {
+            organization: self.organization,
+            api_url: self.api_url,
+            ca_file: self.ca_file.map(|path| base.join(path)),
+            custodian_socket: base.join(self.custodian_socket),
+            custodian_deadline: deadline,
+        })
+    }
 }
 
 /// One proxied server's bounds and CA file, as written. Each bound left out has its default.
@@ -790,6 +855,15 @@ pub enum DeploymentError {
         /// The bound given, in bytes.
         bytes: usize,
     },
+    /// The custodian's deadline is zero or past [`MAX_CUSTODIAN_DEADLINE`].
+    #[error(
+        "`github.custodian_deadline_seconds` is {seconds}; it must be from 1 to {most}",
+        most = MAX_CUSTODIAN_DEADLINE.as_secs()
+    )]
+    CustodianDeadlineOutOfRange {
+        /// The deadline given, in seconds.
+        seconds: u64,
+    },
     /// A server's deadline is zero or past [`MAX_SERVER_DEADLINE`].
     #[error(
         "`servers.{server}.deadline_seconds` is {seconds}; it must be from 1 to {}",
@@ -877,6 +951,9 @@ pub struct Deployment {
     /// The bounds of each connector in the gateway's own process the file gives an entry,
     /// within their ceilings. Every other has [`InProcessLimits::default`].
     pub connectors: BTreeMap<ConnectorName, InProcessLimits>,
+    /// Where the GitHub connector finds GitHub and the key custodian, with its files from the
+    /// deployment file's directory, or `None` when the file has no `[github]` table.
+    pub github: Option<GitHubSettings>,
     /// Each `https` server's CA file, from the deployment file's directory.
     pub ca_files: BTreeMap<ConnectorName, PathBuf>,
     /// How often the drift pass runs.
@@ -906,6 +983,7 @@ impl std::fmt::Debug for Deployment {
             .field("limits", &self.limits)
             .field("servers", &self.servers)
             .field("connectors", &self.connectors)
+            .field("github", &self.github)
             .field("ca_files", &self.ca_files)
             .field("drift_interval", &self.drift_interval)
             .field("probe_credentials", &self.probe_credentials)
@@ -1052,6 +1130,10 @@ impl Deployment {
                 Ok((connector, bounds))
             })
             .collect::<Result<_, DeploymentError>>()?;
+        let github = file
+            .github
+            .map(|section| section.settings(base))
+            .transpose()?;
         let mut keys_urls = Vec::new();
         let identity = match file.identity {
             IdentityFile::Disabled {} => IdentitySection {
@@ -1103,6 +1185,7 @@ impl Deployment {
             limits,
             servers,
             connectors,
+            github,
             ca_files,
             drift_interval,
             probe_credentials,

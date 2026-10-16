@@ -30,8 +30,18 @@
 //! before anything is served. A `[servers.<name>]` for a server the registry does not name is
 //! refused: a bound meant for a server that is not there would be one nobody holds. So is a
 //! `[connectors.<name>]` for a connector the gateway does not run in its own process, before
-//! anything is read: no built-in connector is wired yet (#12), so today that is every one.
-//! Each bulkhead takes `[limits]`'s rate quotas too ([`crate::quota`]).
+//! anything is read. Each bulkhead takes `[limits]`'s rate quotas too ([`crate::quota`]).
+//!
+//! The GitHub connector (`connector-github`) runs in the gateway's own process, for each
+//! built-in entry of the registry of system `github` that declares its credential. Before
+//! anything is read, the gateway refuses to start with such an entry and no `[github]` table,
+//! naming the entries, and with a `[github]` table and no such entry. One connector is built
+//! from `[github]` and the entries' permission sets and narrowings, which checks the API URL
+//! and reads its CA file, and is registered under each entry's name ([`Wiring::built_in`]),
+//! with the bounds `[connectors.<name>]` sets for that entry and `[limits]`'s rate quotas, and
+//! with the definition of each tool it serves, which each approval must match. The gateway
+//! reads no GitHub key: the connector asks the key custodian at `[github] custodian_socket` for
+//! every token.
 //!
 //! Each keys URL is checked first, every one before any is fetched: it must be on its issuer's
 //! own origin, an `https` one must have a CA file that reads as a PEM bundle of certificates,
@@ -76,11 +86,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use audit_postgres::{BootCheckError, GivenUp, PgAuditError, PgAuditStore, PoolSizes};
+use connector_github::{GitHubConnector, GitHubSettings, SettingsError};
 use connector_proxy::{
     CredentialFileError, FileCredentials, Loopback, ProxyConnector, Refusal, Upstream,
     UpstreamError,
 };
-use gateway_core::{ConnectorName, CredentialMode, InstanceName, Issuer};
+use gateway_core::{ConnectorName, CredentialMode, InstanceName, Issuer, ToolName};
 use gateway_identity::Clock;
 use gateway_otto::HttpResolver;
 use gateway_otto::resolver::ResolverConfigError;
@@ -147,6 +158,24 @@ pub enum StartError {
          process; remove it, or name a built-in connector the gateway runs"
     )]
     UnknownConnectorLimits(ConnectorName),
+    /// The registry declares GitHub connector entries, and the deployment file has no
+    /// `[github]` table to say where GitHub and the key custodian are.
+    #[error(
+        "the registry declares the GitHub connector {}, but the deployment file has no \
+         `[github]` table; give its organization, API URL and the key custodian's socket",
+        named(.0)
+    )]
+    NoGitHubSettings(Vec<ConnectorName>),
+    /// The deployment file has a `[github]` table, and the registry declares no GitHub
+    /// connector entry for it to serve.
+    #[error(
+        "the deployment file has a `[github]` table, but the registry declares no GitHub \
+         connector entry; remove the table, or declare the entry's credential"
+    )]
+    GitHubUnused,
+    /// The GitHub connector could not be built from `[github]` and the registry's entries.
+    #[error(transparent)]
+    GitHub(#[from] SettingsError),
     /// The deployment file sets bounds for a server the registry does not name.
     #[error(
         "`[servers.{0}]` sets bounds for a server the registry does not name; remove it, or \
@@ -379,7 +408,8 @@ async fn prepare_with(
         &deployment.servers,
         deployment.drift_interval,
     )?;
-    in_process_bounds(&deployment.connectors, &BTreeSet::new())?;
+    let github_entries = github_entries(&registry, deployment.github.is_some())?;
+    in_process_bounds(&deployment.connectors, &github_entries)?;
 
     let credentials = Arc::new(credentials(&registry, &deployment.credentials)?);
     let probes = probe_credentials(&registry, &deployment.probe_credentials)?;
@@ -394,7 +424,14 @@ async fn prepare_with(
         },
         Wiring::new(clock),
     )?;
-    let mut wiring = wiring.instance(instance.clone());
+    let mut wiring = github(
+        &registry,
+        &github_entries,
+        deployment.github.as_ref(),
+        &deployment.connectors,
+        wiring.instance(instance.clone()),
+    )?
+    .quotas(deployment.limits.quotas);
     // Otto's resolver, before a key is fetched or the audit store connected: its URL is
     // checked, and its files read, as the client is built.
     if let Some(section) = &deployment.resolver {
@@ -681,9 +718,87 @@ fn drift_interval<'a>(
     Ok(())
 }
 
+/// The registry's GitHub entries the GitHub connector serves: each built-in entry of system
+/// `github` that declares its credential. Refuses such entries with no `[github]` table, which
+/// `configured` says is given, and a `[github]` table with none.
+fn github_entries(
+    registry: &Registry,
+    configured: bool,
+) -> Result<BTreeSet<ConnectorName>, StartError> {
+    let entries: BTreeSet<ConnectorName> = registry
+        .connectors()
+        .values()
+        .filter(|entry| entry.system == connector_github::SYSTEM && entry.declaration.is_some())
+        .map(|entry| entry.name.clone())
+        .collect();
+    match (entries.is_empty(), configured) {
+        (false, false) => Err(StartError::NoGitHubSettings(entries.into_iter().collect())),
+        (true, true) => Err(StartError::GitHubUnused),
+        _ => Ok(entries),
+    }
+}
+
+/// `wiring` with the GitHub connector, as [`prepare`] wires it: built from `settings`, the
+/// deployment file's `[github]`, and the registry's GitHub entries that declare their
+/// credential, and registered under each entry's name with the bounds `bounds`, the deployment
+/// file's `[connectors.<name>]`, set for it. Refuses such entries with no `settings`, and
+/// `settings` with no such entry.
+pub fn wire_github(
+    registry: &Registry,
+    settings: Option<&GitHubSettings>,
+    bounds: &BTreeMap<ConnectorName, InProcessLimits>,
+    wiring: Wiring,
+) -> Result<Wiring, StartError> {
+    let entries = github_entries(registry, settings.is_some())?;
+    github(registry, &entries, settings, bounds, wiring)
+}
+
+/// `wiring` with the GitHub connector, built from `settings` and the registry's `entries`,
+/// registered under each entry's name with the bounds `bounds` sets for it, and with the
+/// definition of every tool it serves. Unchanged when there are no entries.
+fn github(
+    registry: &Registry,
+    entries: &BTreeSet<ConnectorName>,
+    settings: Option<&GitHubSettings>,
+    bounds: &BTreeMap<ConnectorName, InProcessLimits>,
+    mut wiring: Wiring,
+) -> Result<Wiring, StartError> {
+    let Some(settings) = settings.filter(|_| !entries.is_empty()) else {
+        return Ok(wiring);
+    };
+    let connector = Arc::new(GitHubConnector::new(
+        settings,
+        entries
+            .iter()
+            .filter_map(|name| registry.connectors().get(name)),
+    )?);
+    let definitions: Vec<(ToolName, String)> = connector_github::definitions()
+        .iter()
+        .filter_map(|definition| {
+            Some((ToolName::parse(definition.name).ok()?, definition.sha256()))
+        })
+        .collect();
+    for name in entries {
+        wiring = wiring.built_in(name.clone(), connector.clone(), definitions.clone());
+        if let Some(limits) = bounds.get(name) {
+            wiring = wiring.in_process_limits(name.clone(), *limits);
+        }
+    }
+    tracing::info!(
+        event = "boot",
+        github_organization = %settings.organization,
+        github_api_url = %settings.api_url,
+        github_ca_file = settings.ca_file.as_ref().map(|path| path.display().to_string()),
+        custodian_socket = %settings.custodian_socket.display(),
+        github_entries = %named(&entries.iter().cloned().collect::<Vec<_>>()),
+        "the GitHub connector serves these entries, asking the key custodian for every token"
+    );
+    Ok(wiring)
+}
+
 /// Refuses bounds in `bounds`, the deployment file's `[connectors.<name>]`, for a connector not
 /// in `wired`, the connectors this gateway runs in its own process: a bound meant for a
-/// connector that is not there would be one nobody holds. None is wired yet (#12).
+/// connector that is not there would be one nobody holds.
 fn in_process_bounds(
     bounds: &BTreeMap<ConnectorName, InProcessLimits>,
     wired: &BTreeSet<ConnectorName>,
@@ -1424,6 +1539,7 @@ mod tests {
             limits: Limits::default(),
             servers: BTreeMap::new(),
             connectors: BTreeMap::new(),
+            github: None,
             ca_files: BTreeMap::new(),
             drift_interval: crate::drift::DEFAULT_DRIFT_INTERVAL,
             probe_credentials: BTreeMap::from([(ConnectorName::new("mock-docs"), probe)]),

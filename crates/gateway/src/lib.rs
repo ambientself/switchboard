@@ -48,8 +48,10 @@
 //!   hands back a [`Reloader`] that replaces it when the registry file changes.
 //! - [`start::prepare`] builds the gateway: a `ProxyConnector` per registry server, with the
 //!   bounds the deployment file sets for it, in a [`Bulkhead`], behind the registry's argument
-//!   check; each keys URL's first fetch; the Postgres audit store after its
-//!   boot checks, or audit explicitly disabled; and the boot gates.
+//!   check; the GitHub connector (`connector-github`) for the registry's GitHub entries, in its
+//!   [`Bounded`], behind the same check ([`start::wire_github`]); each keys URL's first
+//!   fetch; the Postgres audit store after its boot checks, or audit explicitly disabled; and
+//!   the boot gates.
 //! - [`KeyRefresher`] fetches the keys of each issuer configured with a keys URL again on a
 //!   timer, from the issuer's own origin, and keeps the keys in use when a fetch fails.
 //! - [`DriftPass`] reads each proxied server's tool list, once during boot before the listener
@@ -115,8 +117,9 @@ pub use config::{
 pub use currency::ResolverSection;
 pub use deployment::{
     AuditChoice, DEFAULT_MAX_AGE, DEFAULT_MAX_IN_FLIGHT, DEFAULT_PER_SERVER_IN_FLIGHT,
-    DEFAULT_PER_TEAM_PER_SERVER_IN_FLIGHT, Deployment, DeploymentError, KeysUrl, Limits,
-    MAX_SERVER_DEADLINE, MAX_SERVER_RESULT_BYTES, MetricsSection, ServerLimits,
+    DEFAULT_PER_TEAM_PER_SERVER_IN_FLIGHT, Deployment, DeploymentError, GitHubSection, KeysUrl,
+    Limits, MAX_CUSTODIAN_DEADLINE, MAX_SERVER_DEADLINE, MAX_SERVER_RESULT_BYTES, MetricsSection,
+    ServerLimits,
 };
 pub use drift::{
     DEFAULT_DRIFT_INTERVAL, DriftCounts, DriftPass, DriftSection, DriftSignals, MAX_DRIFT_INTERVAL,
