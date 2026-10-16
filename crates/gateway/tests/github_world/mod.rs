@@ -54,6 +54,8 @@ pub const SURFACE: &str = "github";
 pub const GET_FILE: &str = "github__get_file";
 pub const GET_PR: &str = "github__get_pr";
 pub const GET_ISSUE: &str = "github__get_issue";
+/// The search, which checks its own scope.
+pub const SEARCH: &str = "github__search";
 /// The permission set the entry states.
 pub const PERMISSIONS: &str = r#"{ contents = "read", issues = "read", pull_requests = "read" }"#;
 
@@ -129,11 +131,20 @@ impl Default for Options {
     }
 }
 
-/// The registry file at `revision`: one GitHub entry narrowed `narrowing`, serving the three
+/// The registry file at `revision`: one GitHub entry narrowed `narrowing`, serving the four
 /// tools on the surface `github` to team A and team B, each tool approved with its connector's
-/// own definition. Team A's limit holds atlas and borealis on the App's account and a
-/// repository of another organization; team B's holds cosmos.
+/// own definition, the search declared `checks_own_scope`. An entry narrowed per call cannot
+/// serve a tool that checks its own scope (decision 0011), so it serves the other three. Team
+/// A's limit holds atlas and borealis on the App's account and a repository of another
+/// organization; team B's holds cosmos.
 pub fn registry_text(revision: &str, narrowing: &str, permissions: &str) -> String {
+    let served: Vec<String> = connector_github::definitions()
+        .into_iter()
+        .map(|definition| definition.name)
+        .filter(|tool| narrowing != "call" || *tool != SEARCH)
+        .map(|tool| format!("\"{tool}\""))
+        .collect();
+    let tools = format!("tools = [{}]", served.join(", "));
     let head = format!(
         r#"revision = "{revision}"
 servers = []
@@ -143,14 +154,14 @@ tools = []
 name = "{ENTRY}"
 system = "github"
 permissions = {permissions}
-tools = ["{GET_FILE}", "{GET_ISSUE}", "{GET_PR}"]
+{tools}
 credential = {{ mode = "team_service_identity", principal = "switchboard-test-app" }}
 narrowing = "{narrowing}"
 permits = "read"
 
 [[surfaces]]
 name = "{SURFACE}"
-tools = ["{GET_FILE}", "{GET_ISSUE}", "{GET_PR}"]
+{tools}
 teams = ["team-a", "team-b"]
 principals = "any_in_teams_and_groups"
 
@@ -175,18 +186,15 @@ team-b = [{{ system = "github", kind = "repository", identifier = "{ACCOUNT}/cos
     );
     // The surface names the tools before they are approved, so the entry alone is loaded to
     // hash it.
-    let entry_only = head.replace(
-        &format!(
-            r#"tools = ["{GET_FILE}", "{GET_ISSUE}", "{GET_PR}"]
-teams"#
-        ),
-        "tools = []\nteams",
-    );
+    let entry_only = head.replace(&format!("{tools}\nteams"), "tools = []\nteams");
     let registry = Registry::from_toml_str(&entry_only).unwrap();
     let binding =
         built_in_binding_sha256(&registry.connectors()[&ConnectorName::new(ENTRY)]).unwrap();
     let mut text = head;
-    for definition in connector_github::definitions() {
+    for definition in connector_github::definitions()
+        .into_iter()
+        .filter(|definition| served.contains(&format!("\"{}\"", definition.name)))
+    {
         let schema = toml::Value::try_from(&definition.input_schema).unwrap();
         let mut approval = toml::Table::new();
         approval.insert("name".into(), definition.name.into());
@@ -201,11 +209,15 @@ teams"#
         );
         approval.insert("definition_sha256".into(), definition.sha256().into());
         approval.insert("binding_sha256".into(), binding.clone().into());
-        let resources: toml::Value = toml::from_str::<toml::Table>(
-            r#"r = { from_arguments = [{ from_argument = "repo", qualified_by = "owner", system = "github", kind = "repository" }] }"#,
-        )
-        .unwrap()["r"]
-            .clone();
+        let resources: toml::Value = if definition.name == SEARCH {
+            "checks_own_scope".into()
+        } else {
+            toml::from_str::<toml::Table>(
+                r#"r = { from_arguments = [{ from_argument = "repo", qualified_by = "owner", system = "github", kind = "repository" }] }"#,
+            )
+            .unwrap()["r"]
+                .clone()
+        };
         approval.insert("resources".into(), resources);
         let mut wrapper = toml::Table::new();
         wrapper.insert(
