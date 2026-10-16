@@ -4061,24 +4061,27 @@ PG = "crates/audit-postgres/"
 PG_SQL = PG + "sql/migrations/0001_call_rows.sql"
 # 0003 replaces set_times, so the mutations of its body edit 0003, not 0001.
 PG_ROW_DEADLINE = PG + "sql/migrations/0003_row_deadline.sql"
-# 0004 replaces complete_once and decision_shape, so the mutations of their bodies edit 0004.
+# 0004 replaces decision_shape, so the mutations of its body edit 0004.
 PG_LIST_ROWS = PG + "sql/migrations/0004_list_rows.sql"
+# 0004, 0006 and then 0011 replace complete_once, so the mutations of its body edit 0011's, the
+# one in force: an edit to an earlier body is undone by the next migration.
+PG_COMPLETE_ONCE = PG + "sql/migrations/0011_reached_resources.sql"
 PG_STORE = PG + "src/store.rs"
 PG_COLUMNS = PG + "src/columns.rs"
-mutate("pg-trigger-second-completion-allowed", "a completed row can be completed again", PG_LIST_ROWS,
+mutate("pg-trigger-second-completion-allowed", "a completed row can be completed again", PG_COMPLETE_ONCE,
        "    IF OLD.outcome IS NOT NULL THEN", "    IF false THEN")
-mutate("pg-trigger-denial-completed", "the trigger lets a denial be completed", PG_LIST_ROWS,
+mutate("pg-trigger-denial-completed", "the trigger lets a denial be completed", PG_COMPLETE_ONCE,
        "    IF OLD.decision IS DISTINCT FROM 'allow' THEN", "    IF false THEN")
-mutate("pg-trigger-empty-completion-allowed", "an update with no outcome passes the trigger", PG_LIST_ROWS,
+mutate("pg-trigger-empty-completion-allowed", "an update with no outcome passes the trigger", PG_COMPLETE_ONCE,
        "        RAISE EXCEPTION 'a completion of audit row % has no outcome', OLD.id;", "        NULL;")
-mutate("pg-trigger-other-columns-allowed", "a completion may change other columns", PG_LIST_ROWS,
+mutate("pg-trigger-other-columns-allowed", "a completion may change other columns", PG_COMPLETE_ONCE,
        "        RAISE EXCEPTION 'only the completion of audit row % may be written', OLD.id;", "        NULL;")
-mutate("pg-trigger-finished-at-not-set", "the database does not set the completion time", PG_LIST_ROWS,
+mutate("pg-trigger-finished-at-not-set", "the database does not set the completion time", PG_COMPLETE_ONCE,
        "    NEW.finished_at := clock_timestamp();\n", "")
 mutate("pg-trigger-not-created", "the write-once trigger is never attached", PG_SQL,
        "CREATE TRIGGER complete_once\n    BEFORE UPDATE ON switchboard_audit.call_rows\n"
        "    FOR EACH ROW EXECUTE FUNCTION switchboard_audit.complete_once();\n", "")
-mutate("pg-trigger-search-path-unpinned", "the write-once trigger looks names up in the session's search path", PG_LIST_ROWS,
+mutate("pg-trigger-search-path-unpinned", "the write-once trigger looks names up in the session's search path", PG_COMPLETE_ONCE,
        "    LANGUAGE plpgsql\n    SET search_path = pg_catalog\nAS $complete_once$", "    LANGUAGE plpgsql\nAS $complete_once$")
 mutate("pg-times-search-path-unpinned", "the trigger that sets the times looks names up in the session's search path", PG_ROW_DEADLINE,
        "    LANGUAGE plpgsql\n    SET search_path = pg_catalog\nAS $set_times$", "    LANGUAGE plpgsql\nAS $set_times$")
@@ -5012,8 +5015,6 @@ mutate("pg-reached-repeat-overwrites", "finish writes what was reached over a co
 mutate("pg-reached-replaces-named", "complete_once lets a completion replace named resources or a reach", PG_REACHED,
        "            OLD.resources = '\"unknown\"'::jsonb AND jsonb_typeof(NEW.resources) = 'array',",
        "            true,")
-mutate("pg-reached-other-columns-allowed", "the completion complete_once now holds may change other columns", PG_REACHED,
-       "        RAISE EXCEPTION 'only the completion of audit row % may be written', OLD.id;", "        NULL;")
 mutate("pg-reached-grant-missing", "the gateway's role cannot write what a tool reached", PG_REACHED,
        "GRANT UPDATE (resources, resources_omitted) ON switchboard_audit.call_rows TO switchboard_gateway;\n", "")
 
