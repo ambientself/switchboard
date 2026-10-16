@@ -17,7 +17,9 @@
 //!
 //! Otto's gateway loads this per-repository configuration in the background and answers a call
 //! made while it loads as pending. This connector reads it within the call, so a call is never
-//! answered as pending; the gateway's in-process deadline bounds it.
+//! answered as pending. The gateway's in-process deadline bounds its requests. It cannot
+//! interrupt the CODEOWNERS matching, which runs within one poll, so that matching neither
+//! recurses nor backtracks: its work is at most the file's length times the path's.
 
 use base64::Engine as _;
 use gateway_core::{ErrorKind, ToolOutcome};

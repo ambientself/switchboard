@@ -7,10 +7,11 @@
 //!
 //! Patterns follow the gitignore rules GitHub applies: `*` matches within a path segment, `?`
 //! one character of one, and `**` any number of segments; a leading `/`, or a `/` before the
-//! end, anchors a pattern at the root, and one with no `/` matches at any depth; a trailing `/`
-//! matches only a directory's contents; a pattern that matches a directory matches everything
-//! in it. Matching is case-sensitive. GitHub does not support `!` and `[...]` in CODEOWNERS, so a
-//! line starting with `!` is skipped and `[` is an ordinary character.
+//! end, anchors a pattern at the root, and one with no `/` matches at any depth; a trailing `/`,
+//! or `/**`, matches only a directory's contents, not a file of that name; a pattern that
+//! matches a directory matches everything in it. Matching is case-sensitive. GitHub does not
+//! support `!` and `[...]` in CODEOWNERS, so a line starting with `!` is skipped and `[` is an
+//! ordinary character.
 
 /// The owners the last line of `text` whose pattern matches `path` names; empty when none
 /// matches, or the last that matches names no owner.
@@ -52,43 +53,76 @@ fn uncommented(line: &str) -> &str {
 }
 
 /// Whether `pattern` matches `path`, its segments.
+///
+/// Neither this nor [`glob`] recurses or backtracks: the work is at most the pattern's length
+/// times the path's, and the stack does not grow with either, so a hostile CODEOWNERS file
+/// cannot hold a worker or overflow its stack.
 fn matches(pattern: &str, path: &[&str]) -> bool {
-    let directory_only = pattern.ends_with('/');
+    let mut directory_only = pattern.ends_with('/');
     let trimmed = pattern.trim_end_matches('/');
     let anchored = trimmed.contains('/');
     let trimmed = trimmed.strip_prefix('/').unwrap_or(trimmed);
     if trimmed.is_empty() {
         return false;
     }
-    let segments: Vec<&str> = trimmed.split('/').collect();
-    if anchored {
-        prefix(&segments, path, directory_only)
-    } else {
-        (0..path.len()).any(|start| prefix(&segments, &path[start..], directory_only))
+    let mut segments: Vec<&str> = trimmed.split('/').collect();
+    // `**/**` is `**`.
+    segments.dedup_by(|next, previous| *next == "**" && *previous == "**");
+    // A trailing `/**` matches everything inside, and not the directory or file itself.
+    if segments.len() > 1 && segments.last() == Some(&"**") {
+        segments.pop();
+        directory_only = true;
     }
-}
-
-/// Whether `pattern` matches the whole of `path`, or a directory `path` is inside.
-fn prefix(pattern: &[&str], path: &[&str], directory_only: bool) -> bool {
-    match pattern.split_first() {
-        None => !path.is_empty() || !directory_only,
-        Some((&"**", rest)) => {
-            (0..=path.len()).any(|skip| prefix(rest, &path[skip..], directory_only))
+    // `reached[at]`: the segments so far match `path[start..at]` for some start the pattern may
+    // begin at, the root's when anchored and any segment's when not.
+    let mut reached: Vec<bool> = (0..=path.len())
+        .map(|at| at == 0 || (!anchored && at < path.len()))
+        .collect();
+    for segment in segments {
+        if segment == "**" {
+            let mut any = false;
+            for at in &mut reached {
+                any |= *at;
+                *at = any;
+            }
+        } else {
+            for at in (1..=path.len()).rev() {
+                reached[at] = reached[at - 1] && glob(segment.as_bytes(), path[at - 1].as_bytes());
+            }
+            reached[0] = false;
         }
-        Some((first, rest)) => path.split_first().is_some_and(|(segment, path)| {
-            glob(first.as_bytes(), segment.as_bytes()) && prefix(rest, path, directory_only)
-        }),
     }
+    // The pattern matches the whole path, or a directory the path is inside.
+    (1..=path.len()).any(|at| reached[at] && (at < path.len() || !directory_only))
 }
 
-/// Whether `pattern`, with `*` and `?`, matches all of `text`, one segment.
+/// Whether `pattern`, with `*` and `?`, matches all of `text`, one segment: the usual
+/// two-pointer match, which goes back only to just after the last `*`.
 fn glob(pattern: &[u8], text: &[u8]) -> bool {
-    match pattern.split_first() {
-        None => text.is_empty(),
-        Some((b'*', rest)) => (0..=text.len()).any(|skip| glob(rest, &text[skip..])),
-        Some((b'?', rest)) => !text.is_empty() && glob(rest, &text[1..]),
-        Some((byte, rest)) => text.first() == Some(byte) && glob(rest, &text[1..]),
+    let (mut p, mut t) = (0, 0);
+    // The last `*` seen, and where in `text` what it matches would end.
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        match pattern.get(p) {
+            Some(b'*') => {
+                star = Some((p, t));
+                p += 1;
+            }
+            Some(&byte) if byte == b'?' || byte == text[t] => {
+                p += 1;
+                t += 1;
+            }
+            _ => match star {
+                Some((at, end)) => {
+                    star = Some((at, end + 1));
+                    p = at + 1;
+                    t = end + 1;
+                }
+                None => return false,
+            },
+        }
     }
+    pattern[p..].iter().all(|&byte| byte == b'*')
 }
 
 #[cfg(test)]
@@ -110,6 +144,9 @@ mod tests {
             "** owner@example.test",
             "**/AGENTS.md @org/owners",
             "AGENTS.?? @org/owners",
+            "**/** @org/owners",
+            "*A*G*E*N*T*S*.*m*d* @org/owners",
+            "/**/AGENTS.md @org/owners",
             "\n# a comment\n\nAGENTS.md @org/owners # and one here\n",
         ] {
             assert!(owned(text), "{text:?}");
@@ -123,6 +160,15 @@ mod tests {
             "# AGENTS.md @org/owners",
             "/docs/ @org/docs",
             "AGENTS.md/ @org/owners",
+            // A trailing `/**` matches what is inside, not the file itself.
+            "AGENTS.md/** @org/owners",
+            "/AGENTS.md/** @org/owners",
+            "*/** @org/owners",
+            "*.md/** @org/owners",
+            "AGENTS.md/**/** @org/owners",
+            "AGENTS.md\n*/** @org/owners",
+            "AGENTS.mdx @org/owners",
+            "?AGENTS.md @org/owners",
             "/agents.md @org/owners",
             "docs/AGENTS.md @org/owners",
             "*.txt @org/owners",
@@ -146,5 +192,37 @@ mod tests {
         assert_eq!(owners("docs @d", "docs/AGENTS.md"), ["@d"]);
         assert_eq!(owners("docs/** @d", "docs/a/b"), ["@d"]);
         assert!(owners("/docs/ @d", "docs").is_empty());
+        assert_eq!(owners("docs/**/x @d", "docs/x"), ["@d"]);
+        assert_eq!(owners("docs/**/x @d", "docs/a/b/x"), ["@d"]);
+        assert_eq!(owners("**/x/** @d", "a/x/b"), ["@d"]);
+        assert!(owners("**/x/** @d", "a/x").is_empty());
+        assert!(owners("docs/** @d", "docs").is_empty());
+        assert_eq!(owners("a*b*c @d", "a-b-b-c"), ["@d"]);
+        assert!(owners("a*b*c @d", "a-b-b-cx").is_empty());
+    }
+
+    /// A pattern that would take a backtracking matcher billions of steps, or a recursive one
+    /// more stack than a worker has, is matched at once: these run on the test's own thread.
+    #[test]
+    fn hostile_patterns_are_matched_in_bounded_work() {
+        let stars = format!("{}X @org/owners", "*".repeat(50));
+        assert!(!owned(&stars));
+        let many_stars = format!("{}X @org/owners", "*".repeat(100_000));
+        assert!(!owned(&many_stars));
+        let many_globstars = format!("{}X @org/owners", "**/".repeat(200_000));
+        assert!(!owned(&many_globstars));
+        let lines = format!("{}X @org/owners\n", "*?".repeat(25)).repeat(1_000);
+        assert!(!owned(&lines));
+        let segments = format!("{}AGENTS.md @org/owners", "*/".repeat(100_000));
+        assert!(!owned(&segments));
+        // They still match what they should.
+        assert!(owned(&format!(
+            "{}AGENTS.md @org/owners",
+            "**/".repeat(200_000)
+        )));
+        assert!(owned(&format!(
+            "{}AGENTS.md @org/owners",
+            "*".repeat(100_000)
+        )));
     }
 }

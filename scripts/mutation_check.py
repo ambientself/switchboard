@@ -6462,7 +6462,8 @@ mutate("github-revision-not-sent", "a token request carries no revision", GHC,
        '            revision: gateway_core::PolicyRevision::new(""),')
 # The newer reads (crates/connector-github/src/reads): their bounds, the job log host check, the
 # CODEOWNERS check and the frame's token for AGENTS.md, and each tool's own permission set.
-# crates/gateway/tests/github_reads.rs catches these, and reads.rs's own tests the entry check.
+# crates/gateway/tests/github_reads.rs catches these, reads.rs's own tests the entry check and
+# codeowners.rs's own tests the trailing `/**` rule.
 GHR = GH + "reads/"
 mutate("github-check-runs-bound-removed", "every check run GitHub sends is kept", GHR + "checks.rs",
        "    for run in runs.iter().take(MAX_CHECK_RUNS) {", "    for run in runs.iter() {")
@@ -6478,16 +6479,23 @@ mutate("github-tags-bound-removed", "every tag GitHub sends is kept", GHR + "rel
        "tags.iter().take(MAX_TAGS).map(tag_fields)", "tags.iter().map(tag_fields)")
 mutate("github-job-log-bound-removed", "a job log is kept whole, up to what is read", GHR + "job_log.rs",
        ".get_tail(&path, MAX_LOG_BYTES, MAX_LOG_READ_BYTES)", ".get_tail(&path, MAX_LOG_READ_BYTES, MAX_LOG_READ_BYTES)")
+mutate("github-job-log-read-cap-removed", "a job log is read to its end, however long, not stopped at 32 MiB", GH + "api.rs",
+       "            if read >= max_read {", "            if false {")
+mutate("github-annotation-message-bound-removed", "an annotation's message is not cut at 4 KiB", GHR + "checks.rs",
+       "    text_field(\n        annotation.get(\"message\").and_then(Value::as_str),\n        \"message\",\n        &mut kept,\n    );",
+       "    kept.insert(\"message\".into(), annotation.get(\"message\").cloned().unwrap_or(Value::Null));")
 mutate("github-template-bound-removed", "a pull request template is not cut at 64 KiB", GHR + "config.rs",
        "        let text = text(&path, &file)?;\n        let (kept, cut) = bounded(&text, MAX_CONFIG_TEXT_BYTES);",
        "        let text = text(&path, &file)?;\n        let (kept, cut) = (text.as_str(), false);")
 mutate("github-agents-bound-removed", "AGENTS.md is not cut at 64 KiB", GHR + "config.rs",
        "    let text = text(AGENTS, &file)?;\n    let (kept, cut) = bounded(&text, MAX_CONFIG_TEXT_BYTES);",
        "    let text = text(AGENTS, &file)?;\n    let (kept, cut) = (text.as_str(), false);")
-mutate("github-job-log-host-unchecked", "a job log redirect to a host the deployment does not pin is followed", GHR + "job_log.rs",
+mutate("github-job-log-host-unchecked", "a job log redirect to a host the deployment does not pin is not refused", GHR + "job_log.rs",
        "            .is_some_and(|base| base == wanted)", "            .is_some_and(|_| true)")
 mutate("github-codeowners-check-removed", "AGENTS.md is served when CODEOWNERS gives it no owner", GHR + "config.rs",
        "    if owners.is_empty() {", "    if false {")
+mutate("github-codeowners-trailing-globstar-matches-the-file", "CODEOWNERS' `AGENTS.md/**` gives the file AGENTS.md an owner", GHR + "codeowners.rs",
+       "    if segments.len() > 1 && segments.last() == Some(&\"**\") {", "    if false {")
 mutate("github-frame-token-not-fresh", "AGENTS.md is quoted between markers with the same token every call", GHR + "config.rs",
        "    OsRng.try_fill_bytes(&mut bytes).map_err(|_| {", "    Ok::<(), rand_core::Error>(()).map_err(|_| {")
 mutate("github-reads-ask-the-entrys-set", "a newer read asks for its entry's whole permission set, not its own", GH + "reads.rs",

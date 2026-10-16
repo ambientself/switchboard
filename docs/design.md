@@ -1445,7 +1445,8 @@ The five newer reads keep the bounds and behavior docs/otto-baseline.md records:
   `pull_request_template.md` in `.github`, the root or `docs`. `AGENTS.md` is served only
   when CODEOWNERS (the first of `.github/CODEOWNERS`, `CODEOWNERS` and `docs/CODEOWNERS`) gives
   it an owner, by the last line whose pattern matches it; otherwise it is not read at all.
-  Served, it is quoted between two markers that carry a token made for the call from the
+  The matching neither recurses nor backtracks, so a hostile CODEOWNERS file costs work in
+  proportion to its length and cannot overflow a worker's stack. Served, it is quoted between two markers that carry a token made for the call from the
   operating system's random source, so a marker in the file cannot close the quote. Each text
   is cut at 64 KiB, said to be cut.
 

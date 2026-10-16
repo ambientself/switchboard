@@ -20,8 +20,8 @@ use std::sync::Arc;
 use connector_github::fake::Mode;
 use connector_github::reads::{
     CHECKS_PERMISSIONS, CONFIG_PERMISSIONS, GET_CHECKS, GET_JOB_LOG, JOB_LOG_PERMISSIONS,
-    LIST_RELEASES, MAX_CHECK_TEXT_BYTES, MAX_CONFIG_TEXT_BYTES, MAX_LOG_BYTES, PR_TEMPLATE,
-    RELEASES_PERMISSIONS, REPO_CONVENTIONS, TAGS_PERMISSIONS,
+    LIST_RELEASES, MAX_CHECK_TEXT_BYTES, MAX_CONFIG_TEXT_BYTES, MAX_LOG_BYTES, MAX_LOG_READ_BYTES,
+    PR_TEMPLATE, RELEASES_PERMISSIONS, REPO_CONVENTIONS, TAGS_PERMISSIONS,
 };
 use gateway::start::{StartError, prepare};
 use gateway_core::audit::{DecisionKind, Outcome, RecordedResource, RecordedResources};
@@ -132,8 +132,13 @@ async fn checks_are_read_at_the_head_and_bounded() {
     world.rest.check_runs("atlas", HEAD, runs);
     let annotations: Vec<Value> = (0..11)
         .map(|i| {
+            let message = if i == 0 {
+                "m".repeat(MAX_CHECK_TEXT_BYTES + 10)
+            } else {
+                "boom".to_owned()
+            };
             json!({"path": "main.rs", "start_line": i + 1, "end_line": i + 1,
-                   "annotation_level": "failure", "message": "boom"})
+                   "annotation_level": "failure", "message": message})
         })
         .collect();
     world.rest.annotations("atlas", 501, annotations);
@@ -167,6 +172,15 @@ async fn checks_are_read_at_the_head_and_bounded() {
     assert_eq!(failing["conclusion"], "failure");
     assert_eq!(failing["annotations"].as_array().unwrap().len(), 10);
     assert_eq!(failing["annotationsTruncated"], true);
+    // An annotation's message is cut as a summary is.
+    let annotations = failing["annotations"].as_array().unwrap();
+    assert_eq!(
+        annotations[0]["message"].as_str().unwrap().len(),
+        MAX_CHECK_TEXT_BYTES
+    );
+    assert_eq!(annotations[0]["messageTruncated"], true);
+    assert_eq!(annotations[1]["message"], "boom");
+    assert!(annotations[1].get("messageTruncated").is_none());
     assert_eq!(failing["steps"][1]["name"], "test");
     assert_eq!(failing["steps"][1]["conclusion"], "failure");
     assert_eq!(
@@ -317,6 +331,33 @@ async fn a_job_log_is_read_only_from_the_pinned_host() {
         }
     );
     assert_eq!(world.log_host.hits().len(), 2);
+}
+
+#[tokio::test]
+async fn a_job_log_longer_than_the_read_cap_stops_being_read() {
+    let world = World::new().await;
+    let log = format!(
+        "starting\n{}##[error]the end\n",
+        "x".repeat(MAX_LOG_READ_BYTES + 1024 * 1024)
+    );
+    world.log_host.serve("/logs/94", &log);
+    world
+        .rest
+        .log_redirect("atlas", 94, &format!("{}/logs/94", world.log_host.url()));
+    let result = world
+        .read(TEAM_A, GET_JOB_LOG, numbered("atlas", "jobId", 94))
+        .await
+        .ok();
+    // The last 64 KiB of what was read: the log's middle, not its end.
+    let text = result["log"]["text"].as_str().unwrap();
+    assert_eq!(text.len(), MAX_LOG_BYTES);
+    assert!(text.bytes().all(|byte| byte == b'x'));
+    assert_eq!(result["log"]["truncated"], true);
+    let note = result["log"]["truncationNote"].as_str().unwrap();
+    assert!(note.contains("reading stopped after 32 MiB"), "{note}");
+    assert!(note.contains("the end of the log is not shown"), "{note}");
+    assert_eq!(world.log_host.hits().len(), 1);
+    assert_ok_row(&world, GET_JOB_LOG, &format!("{ACCOUNT}/atlas")).await;
 }
 
 #[tokio::test]
