@@ -9,7 +9,7 @@ use gateway_core::{
 };
 use gateway_registry::{Access, BuiltInEntry};
 use hyper::StatusCode;
-use key_custodian::{CustodianClient, TokenRequest};
+use key_custodian::{CustodianClient, Token, TokenRequest};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -34,6 +34,10 @@ pub struct GitHubSettings {
     pub custodian_socket: PathBuf,
     /// How long the custodian has to answer each token request.
     pub custodian_deadline: Duration,
+    /// The hosts GitHub's job log redirects may point to, each a URL with a scheme, a host and
+    /// a port, if not the scheme's own, and nothing else, held to the same rules and the same
+    /// CA file as `api_url`. A redirect to any other is refused, and with none every one is.
+    pub job_log_hosts: Vec<String>,
 }
 
 /// Why the connector could not be built.
@@ -53,6 +57,23 @@ pub enum SettingsError {
          every token but a reach report's, so declare \"limit\" or \"call\""
     )]
     NotNarrowed(ConnectorName),
+    /// A job log host was refused.
+    #[error("the job log host `{0}` was refused: {1}")]
+    JobLogHost(String, ApiError),
+    /// An entry serves a tool whose permission set it does not hold, so the key custodian
+    /// would refuse every token the tool asks for.
+    #[error(
+        "connector `{entry}` serves `{tool}`, which asks for `{permission}: read`, and the entry \
+         does not state it"
+    )]
+    PermissionNotStated {
+        /// The entry.
+        entry: ConnectorName,
+        /// The tool.
+        tool: String,
+        /// The permission the entry does not state.
+        permission: String,
+    },
 }
 
 /// What one entry's tokens are asked for with.
@@ -70,6 +91,7 @@ pub struct GitHubConnector {
     api: Api,
     custodian: CustodianClient,
     entries: BTreeMap<ConnectorName, EntryCredential>,
+    job_log_hosts: Vec<Api>,
 }
 
 impl std::fmt::Debug for GitHubConnector {
@@ -108,6 +130,7 @@ impl GitHubConnector {
             if declaration.narrowing == Narrowing::None && !entry.reports_reach {
                 return Err(SettingsError::NotNarrowed(entry.name.clone()));
             }
+            crate::reads::check_entry(entry)?;
             served.insert(
                 entry.name.clone(),
                 EntryCredential {
@@ -117,9 +140,18 @@ impl GitHubConnector {
                 },
             );
         }
+        let job_log_hosts = settings
+            .job_log_hosts
+            .iter()
+            .map(|host| {
+                Api::new(host, settings.ca_file.as_deref())
+                    .map_err(|error| SettingsError::JobLogHost(host.clone(), error))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             organization: organization.clone(),
             api,
+            job_log_hosts,
             custodian: CustodianClient::new(
                 settings.custodian_socket.clone(),
                 settings.custodian_deadline,
@@ -185,15 +217,43 @@ impl GitHubConnector {
             permissions: entry.permissions.clone(),
             revision: call.policy_revision().clone(),
         };
-        let token = match self.custodian.token(&request).await {
+        // The newer reads ask for their own permission sets, within the entry's.
+        if let Call::Read(read) = &parsed {
+            return crate::reads::run(self, &parsed, read, request).await;
+        }
+        let token = match self.token(&request).await {
             Ok(token) => token,
-            Err(error) => {
-                let kind = error.error_kind();
-                tracing::warn!(%tool, %error, "the key custodian gave no GitHub token");
-                return ToolOutcome::error(kind, custodian_sentence(&request.team, kind));
-            }
+            Err(outcome) => return outcome,
         };
         self.read(&parsed, token.expose()).await
+    }
+
+    /// A token from the key custodian for `request`, or the outcome for the call when there
+    /// is none.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn token(&self, request: &TokenRequest) -> Result<Token, ToolOutcome> {
+        match self.custodian.token(request).await {
+            Ok(token) => Ok(token),
+            Err(error) => {
+                let kind = error.error_kind();
+                let tool = &request.tool;
+                tracing::warn!(%tool, %error, "the key custodian gave no GitHub token");
+                Err(ToolOutcome::error(
+                    kind,
+                    custodian_sentence(&request.team, kind),
+                ))
+            }
+        }
+    }
+
+    /// The API clients of the hosts a job log redirect may point to.
+    pub(crate) fn job_log_hosts(&self) -> &[Api] {
+        &self.job_log_hosts
+    }
+
+    /// The API client.
+    pub(crate) fn api(&self) -> &Api {
+        &self.api
     }
 
     /// The reach report's call (see [`crate::report`]): served only on an entry declared a
@@ -390,12 +450,16 @@ impl GitHubConnector {
                 }
                 ToolOutcome::Ok(result)
             }
+            Call::Read(_) => ToolOutcome::error(
+                ErrorKind::Other,
+                "the newer GitHub reads ask for their own tokens",
+            ),
         }
     }
 
     /// GitHub's JSON answer to `GET target`, or the outcome for the call when there is none.
     #[allow(clippy::result_large_err)]
-    async fn get(
+    pub(crate) async fn get(
         &self,
         target: &str,
         token: &str,
@@ -404,52 +468,77 @@ impl GitHubConnector {
     ) -> Result<Value, ToolOutcome> {
         match self.api.get(target, token).await {
             Answered::Json(value) => Ok(value),
-            Answered::Unreadable => Err(unreadable()),
-            Answered::Unreachable => Err(ToolOutcome::error(
-                ErrorKind::Other,
-                "GitHub could not be reached, or its answer could not be read in full",
-            )),
+            other => Err(vendor_error(other, what, call)),
+        }
+    }
+
+    /// GitHub's JSON answer to `GET target`, `None` for a 404, or the outcome for the call when
+    /// there is neither: for what a repository may or may not have.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn get_if_found(
+        &self,
+        target: &str,
+        token: &str,
+        what: &str,
+        call: &Call,
+    ) -> Result<Option<Value>, ToolOutcome> {
+        match self.api.get(target, token).await {
+            Answered::Json(value) => Ok(Some(value)),
             Answered::Status {
                 status,
-                rate_limited: true,
-            } => Err(ToolOutcome::error(
-                ErrorKind::Other,
-                format!(
-                    "GitHub's rate limit for this App's installation is used up (HTTP {}); try \
-                     again later",
-                    status.as_u16()
-                ),
-            )),
-            Answered::Status { status, .. } if status == StatusCode::NOT_FOUND => {
-                Err(ToolOutcome::error(
-                    ErrorKind::Other,
-                    format!(
-                        "GitHub found no {what} there in {}/{}, or the token cannot see the \
-                         repository (HTTP 404)",
-                        call.owner(),
-                        call.repo()
-                    ),
-                ))
-            }
-            Answered::Status { status, .. } if status == StatusCode::FORBIDDEN => {
-                Err(ToolOutcome::error(
-                    ErrorKind::VendorRefusal,
-                    format!(
-                        "GitHub refused to show the {what} in {}/{} to this App (HTTP 403)",
-                        call.owner(),
-                        call.repo()
-                    ),
-                ))
-            }
-            Answered::Status { status, .. } => Err(ToolOutcome::error(
-                ErrorKind::Other,
-                format!("GitHub answered HTTP {}", status.as_u16()),
-            )),
+                rate_limited: false,
+            } if status == StatusCode::NOT_FOUND => Ok(None),
+            other => Err(vendor_error(other, what, call)),
         }
     }
 }
 
-fn unreadable() -> ToolOutcome {
+/// The outcome for a call when GitHub gave no JSON answer to a request for `what`. A 404, which
+/// GitHub also answers for a repository the token cannot see, and the rate limit are `other`;
+/// a 403 is `vendor_refusal`. No sentence quotes GitHub's answer.
+pub(crate) fn vendor_error(answered: Answered, what: &str, call: &Call) -> ToolOutcome {
+    match answered {
+        Answered::Json(_) | Answered::Unreadable => unreadable(),
+        Answered::Unreachable => ToolOutcome::error(
+            ErrorKind::Other,
+            "GitHub could not be reached, or its answer could not be read in full",
+        ),
+        Answered::Status {
+            status,
+            rate_limited: true,
+        } => ToolOutcome::error(
+            ErrorKind::Other,
+            format!(
+                "GitHub's rate limit for this App's installation is used up (HTTP {}); try again \
+                 later",
+                status.as_u16()
+            ),
+        ),
+        Answered::Status { status, .. } if status == StatusCode::NOT_FOUND => ToolOutcome::error(
+            ErrorKind::Other,
+            format!(
+                "GitHub found no {what} there in {}/{}, or the token cannot see the repository \
+                 (HTTP 404)",
+                call.owner(),
+                call.repo()
+            ),
+        ),
+        Answered::Status { status, .. } if status == StatusCode::FORBIDDEN => ToolOutcome::error(
+            ErrorKind::VendorRefusal,
+            format!(
+                "GitHub refused to show the {what} in {}/{} to this App (HTTP 403)",
+                call.owner(),
+                call.repo()
+            ),
+        ),
+        Answered::Status { status, .. } => ToolOutcome::error(
+            ErrorKind::Other,
+            format!("GitHub answered HTTP {}", status.as_u16()),
+        ),
+    }
+}
+
+pub(crate) fn unreadable() -> ToolOutcome {
     ToolOutcome::error(ErrorKind::Other, "GitHub's answer could not be read")
 }
 

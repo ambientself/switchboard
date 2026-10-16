@@ -36,11 +36,14 @@
 //! installation's repositories for the drift pass's vendor-report reach check (decision 0011,
 //! section 4). Its token is the key custodian's one installation-wide exception.
 //!
-//! [`tools`] has the three read tools this connector serves so far, `github__get_file`,
-//! `github__get_pr` and `github__get_issue`, each with the definition its approval in the
-//! registry must hash to. Each bounds its result and tags it as external evidence, as Otto's
-//! gateway does. None checks its own scope: each is declared from its arguments, so its row
-//! records the repository it reached.
+//! [`tools`] has the first three read tools, `github__get_file`, `github__get_pr` and
+//! `github__get_issue`, and [`reads`] the other five this connector serves,
+//! `github__get_checks`, `github__get_job_log`, `github__list_releases`, `github__pr_template`
+//! and `github__repo_conventions`; [`definitions`] gives each one's definition, which its
+//! approval in the registry must hash to. Each bounds its result and tags it as external
+//! evidence, as Otto's gateway does. None checks its own scope: each is declared from its
+//! arguments, so its row records the repository it reached. The first three ask for their
+//! entry's whole permission set; the other five each ask for their own, within the entry's.
 //!
 //! GitHub's errors are told apart: a 404, which GitHub also answers for a repository the token
 //! cannot see; a 403, the kind `vendor_refusal`; and its rate limit. A token never appears in
@@ -57,6 +60,7 @@ mod api;
 mod connector;
 #[cfg(feature = "test-support")]
 pub mod fake;
+pub mod reads;
 pub mod report;
 pub mod tools;
 
