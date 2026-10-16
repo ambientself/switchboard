@@ -84,7 +84,11 @@ pub struct BuiltInEntry {
     /// tools; `None` for an entry the custodian alone reads.
     pub declaration: Option<EntryDeclaration>,
     /// Whether the entry is a reach report's: its credential reads the vendor's report of what
-    /// the system's credentials reach (see the [module documentation](self)).
+    /// the system's credentials reach (decision 0011, section 4). The loader holds such an
+    /// entry to that one job: it declares its credential, narrowed `none`, permitting `read`,
+    /// with no reach or reach report of its own; every tool approved on it is `read`; and its
+    /// tools are served only on surfaces restricted to named principals. The key custodian gives
+    /// its tools alone an installation-wide token, for `metadata: read` alone.
     pub reports_reach: bool,
     /// The reach report this entry's reach is checked against, if it is.
     pub reach_report: Option<ReachReport>,
