@@ -31,11 +31,17 @@
 //!   decided from the call's resources: each tool's resource adapter names the repository
 //!   `owner/repo`, exactly as a limit holds it.
 //!
-//! [`tools`] has the three read tools this connector serves so far, `github__get_file`,
+//! [`tools`] has three of the read tools this connector serves, `github__get_file`,
 //! `github__get_pr` and `github__get_issue`, each with the definition its approval in the
 //! registry must hash to. Each bounds its result and tags it as external evidence, as Otto's
 //! gateway does. None checks its own scope: each is declared from its arguments, so its row
 //! records the repository it reached.
+//!
+//! [`search`] has the fourth, `github__search`, which is declared `checks_own_scope`
+//! (decision 0011): which repositories a search reaches is known only once GitHub answers. It
+//! builds its query as Otto's gateway does, withholds every result from a repository outside
+//! the caller's limit, and reports the repositories its results came from as the resources
+//! the call reached, which its row records when it finishes.
 //!
 //! GitHub's errors are told apart: a 404, which GitHub also answers for a repository the token
 //! cannot see; a 403, the kind `vendor_refusal`; and its rate limit. A token never appears in
@@ -52,6 +58,7 @@ mod api;
 mod connector;
 #[cfg(feature = "test-support")]
 pub mod fake;
+pub mod search;
 pub mod tools;
 
 pub use api::{ApiError, MAX_ANSWER_BYTES};
