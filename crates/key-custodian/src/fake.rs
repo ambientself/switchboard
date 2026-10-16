@@ -14,7 +14,10 @@
 //!
 //! It can be told to refuse, fail, hang, widen what it issues, or issue tokens that expire
 //! sooner than GitHub's hour (see [`Behaviour`]), and to fail the next revocations with 500
-//! (see [`FakeGitHub::fail_revocations`]). It keeps every token it issued and revoked, when
+//! (see [`FakeGitHub::fail_revocations`]). An administrator can add a repository to the
+//! installation or drop one from it ([`FakeGitHub::add_repository`],
+//! [`FakeGitHub::drop_repository`]), which changes what a token asked for with no repositories
+//! reaches, and what the fake GitHub REST API reports as the installation's repositories. It keeps every token it issued and revoked, when
 //! each revocation was attempted, and counts the JWTs it refused, for the tests to inspect.
 //!
 //! Its tokens look like GitHub's installation tokens, built at run time from parts, so no
@@ -83,7 +86,7 @@ pub struct FakeApp {
     pub installation_id: u64,
     /// The account it is installed on.
     pub account: String,
-    /// The repositories it is installed on, by name.
+    /// The repositories it is installed on at first, by name.
     pub repositories: BTreeSet<String>,
 }
 
@@ -101,6 +104,8 @@ struct FakeState {
     revoked: Vec<String>,
     revocations_to_fail: usize,
     revocation_attempts: Vec<u64>,
+    /// The repositories the installation is on now.
+    installed: BTreeSet<String>,
 }
 
 /// The fake, serving until dropped.
@@ -128,6 +133,7 @@ impl FakeGitHub {
     /// Starts the fake for `app` on a loopback port.
     pub async fn start(app: FakeApp) -> Result<Self, FakeError> {
         let key = DecodingKey::from_rsa_der(&app.public_key_der);
+        let installed = app.repositories.clone();
         let shared = Arc::new(Shared {
             app,
             key,
@@ -139,6 +145,7 @@ impl FakeGitHub {
                 revoked: Vec::new(),
                 revocations_to_fail: 0,
                 revocation_attempts: Vec::new(),
+                installed,
             }),
         });
         let router = Router::new()
@@ -195,6 +202,22 @@ impl FakeGitHub {
     /// When each revocation arrived, failed or not, in seconds since the epoch.
     pub fn revocation_attempts(&self) -> Vec<u64> {
         self.shared.lock().revocation_attempts.clone()
+    }
+
+    /// The repositories the installation is on now, by name.
+    pub fn installed(&self) -> BTreeSet<String> {
+        self.shared.lock().installed.clone()
+    }
+
+    /// Adds repository `name` to the installation, as an administrator can without touching
+    /// any approval.
+    pub fn add_repository(&self, name: &str) {
+        self.shared.lock().installed.insert(name.to_owned());
+    }
+
+    /// Drops repository `name` from the installation.
+    pub fn drop_repository(&self, name: &str) {
+        self.shared.lock().installed.remove(name);
     }
 }
 
@@ -313,6 +336,7 @@ async fn create(
     let Ok(asked) = serde_json::from_slice::<TokenBody>(&body) else {
         return error(StatusCode::UNPROCESSABLE_ENTITY, "Invalid request");
     };
+    let installed = shared.lock().installed.clone();
     if let Some(repositories) = &asked.repositories {
         if repositories.len() > 500 {
             return error(
@@ -320,10 +344,7 @@ async fn create(
                 "Too many repositories requested",
             );
         }
-        if repositories
-            .iter()
-            .any(|name| !shared.app.repositories.contains(name))
-        {
+        if repositories.iter().any(|name| !installed.contains(name)) {
             return error(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "There is at least one repository that does not exist or is not accessible",
@@ -352,7 +373,7 @@ async fn create(
         (Some(names), behaviour) if behaviour != Behaviour::Widen => {
             ("selected", names.iter().cloned().collect())
         }
-        _ => ("all", shared.app.repositories.clone()),
+        _ => ("all", installed),
     };
     let lifetime = match behaviour {
         Behaviour::ExpireIn(seconds) => seconds,

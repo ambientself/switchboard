@@ -31,6 +31,11 @@
 //!   decided from the call's resources: each tool's resource adapter names the repository
 //!   `owner/repo`, exactly as a limit holds it.
 //!
+//! [`report`] has the reach report's tool, `github__list_installation_repositories`, served
+//! only on an entry the registry declares a reach report, which reads GitHub's own list of the
+//! installation's repositories for the drift pass's vendor-report reach check (decision 0011,
+//! section 4). Its token is the key custodian's one installation-wide exception.
+//!
 //! [`tools`] has the first three read tools, `github__get_file`, `github__get_pr` and
 //! `github__get_issue`, and [`reads`] the other five this connector serves,
 //! `github__get_checks`, `github__get_job_log`, `github__list_releases`, `github__pr_template`
@@ -56,6 +61,7 @@ mod connector;
 #[cfg(feature = "test-support")]
 pub mod fake;
 pub mod reads;
+pub mod report;
 pub mod tools;
 
 pub use api::{ApiError, MAX_ANSWER_BYTES};

@@ -13,9 +13,9 @@
 //! where each proxied server is reached (decision 0013, section 3): an `https` server needs the
 //! CA file `[servers.<name>] ca_file` names, an `http` server may have none, and an address
 //! that is an IP literal the connector would never connect to is refused, loopback among them
-//! outside a development build. It refuses a registry whose entries have a reach check when the
-//! deployment file gives no `[drift] reach_*` settings, naming those entries, since their reach
-//! would never be checked (decision 0011, section 4). It refuses a `[drift] interval_seconds`
+//! outside a development build. It refuses a registry whose entries have a reach check, or a
+//! reach report, when the deployment file gives no `[drift] reach_*` settings, naming those
+//! entries, since their reach would never be checked (decision 0011, section 4). It refuses a `[drift] interval_seconds`
 //! shorter than any proxied server's call deadline, the one `[servers.<name>]` sets or the
 //! default, naming the server, its deadline and the interval: a poll that answered late would
 //! hold back the next, and a changed definition could be served for longer than one interval
@@ -39,9 +39,10 @@
 //! from `[github]` and the entries' permission sets and narrowings, which checks the API URL
 //! and reads its CA file, and is registered under each entry's name ([`Wiring::built_in`]),
 //! with the bounds `[connectors.<name>]` sets for that entry and `[limits]`'s rate quotas, and
-//! with the definition of each tool it serves, which each approval must match. The gateway
-//! reads no GitHub key: the connector asks the key custodian at `[github] custodian_socket` for
-//! every token.
+//! with the definition of each tool it serves, the reach report's tool among them, which each
+//! approval must match. The gateway reads no GitHub key: the connector asks the key custodian at
+//! `[github] custodian_socket` for every token. The drift pass gives a reach report's call the
+//! deadline `[connectors.<name>]` sets for the entry that serves the report's tool.
 //!
 //! Each keys URL is checked first, every one before any is fetched: it must be on its issuer's
 //! own origin, an `https` one must have a CA file that reads as a PEM bundle of certificates,
@@ -196,12 +197,12 @@ pub enum StartError {
     /// A proxied server has no probe credential, or its file could not be loaded.
     #[error(transparent)]
     ProbeCredentials(#[from] ProbeCredentialError),
-    /// Registry entries have a reach check, and the deployment file does not say how to make
-    /// it (decision 0011, section 4): their reach would never be checked.
+    /// Registry entries have a reach check or a reach report, and the deployment file does not
+    /// say how to make it (decision 0011, section 4): their reach would never be checked.
     #[error(
-        "the registry gives {} a reach check, but the deployment file has no `[drift] \
-         reach_token_file`, `reach_url` and `reach_host`; give all three, so that each entry's \
-         reach is checked",
+        "the registry gives {} a reach check or a reach report, but the deployment file has no \
+         `[drift] reach_token_file`, `reach_url` and `reach_host`; give all three, so that each \
+         entry's reach is checked",
         named(.0)
     )]
     NoReachSettings(Vec<ConnectorName>),
@@ -605,7 +606,9 @@ async fn prepare_with(
                 reach_host = %reach.host,
                 "each entry's reach is checked through this listener, as the registry's workload, once it is bound and then every interval"
             );
-            drift = drift.with_reach(ReachCaller::new(reach), &deployment.servers);
+            drift = drift
+                .with_reach(ReachCaller::new(reach), &deployment.servers)
+                .with_report_deadlines(&deployment.connectors);
         }
         None => tracing::info!(
             event = "boot",
@@ -678,14 +681,22 @@ fn named(servers: &[ConnectorName]) -> String {
         .join(", ")
 }
 
-/// Refuses a registry with an entry that has a reach check when the deployment file gives no
-/// reach settings: that entry's reach would never be checked (decision 0011, section 4).
+/// Refuses a registry with an entry that has a reach check, or a reach report, when the
+/// deployment file gives no reach settings: that entry's reach would never be checked
+/// (decision 0011, section 4).
 fn reach_settings(registry: &Registry, reach: Option<&ReachSettings>) -> Result<(), StartError> {
     let checked: Vec<ConnectorName> = registry
         .servers()
         .iter()
         .filter(|(_, server)| server.reach_check.is_some())
         .map(|(name, _)| name.clone())
+        .chain(
+            registry
+                .connectors()
+                .values()
+                .filter(|entry| entry.reach_report.is_some())
+                .map(|entry| entry.name.clone()),
+        )
         .collect();
     if reach.is_none() && !checked.is_empty() {
         return Err(StartError::NoReachSettings(checked));
@@ -774,6 +785,7 @@ fn github(
     )?);
     let definitions: Vec<(ToolName, String)> = connector_github::definitions()
         .iter()
+        .chain([&connector_github::report::definition()])
         .filter_map(|definition| {
             Some((ToolName::parse(definition.name).ok()?, definition.sha256()))
         })

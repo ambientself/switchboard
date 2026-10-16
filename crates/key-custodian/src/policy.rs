@@ -13,7 +13,28 @@
 //! - each team's GitHub repositories: the resources of system `github` and kind `repository`
 //!   in the team's limit, each identified `owner/name`;
 //! - each tool's permission set: the `permissions` of the built-in connector entry of system
-//!   `github` that serves it (see [`gateway_registry::BuiltInEntry`]).
+//!   `github` that serves it (see [`gateway_registry::BuiltInEntry`]);
+//! - each reach report's tool: a tool served by an entry of system `github` the registry
+//!   declares `reports_reach = true`.
+//!
+//! # The one request that may name no repository
+//!
+//! A request names at least one repository, because GitHub reads a token request that names
+//! none as one for every repository of the installation. There is one exception, stated here
+//! and nowhere else. Decision 0011, section 4, checks a GitHub entry's recorded reach against
+//! GitHub's own report of the installation's repositories, `GET /installation/repositories`, and
+//! GitHub lists to a token only the repositories that token can see: a narrowed token cannot
+//! read the whole list. So a request may name no repository when, and only when:
+//!
+//! - its tool is a reach report's, served by an entry the registry declares a reach report,
+//!   which the loader holds to that job (narrowed `none`, `read`, served only to named
+//!   principals; see [`gateway_registry::BuiltInEntry::reports_reach`]); and
+//! - it asks for `metadata: read` and nothing else, the permission every GitHub token carries
+//!   and the least that lists the repositories. It reads no contents, issues or pull requests.
+//!
+//! Such a token is installation-wide, and is checked as GitHub issues it for every permission
+//! beyond `metadata: read` (see [`crate::github`]). Any other tool, or any other permission,
+//! with no repository is refused as `no_repositories`.
 //!
 //! [`PolicyCell::watch`] reads the file again every few seconds, as the gateway's reloader
 //! does, and serves a new copy that loads from the next request on. A file that does not load
@@ -43,7 +64,12 @@ pub struct CustodianPolicy {
     revision: PolicyRevision,
     teams: BTreeMap<TeamId, BTreeSet<String>>,
     tools: BTreeMap<ToolName, BTreeMap<String, Access>>,
+    reach_reports: BTreeSet<ToolName>,
 }
+
+/// The one permission an installation-wide request may ask for: see the [module
+/// documentation](self).
+pub const REACH_REPORT_PERMISSION: &str = "metadata";
 
 /// Why a request was refused, and a sentence for the operator.
 pub type Refused = (Refusal, String);
@@ -78,11 +104,26 @@ impl CustodianPolicy {
                     .map(|tool| (tool.clone(), entry.permissions.clone()))
             })
             .collect();
+        let reach_reports = registry
+            .connectors()
+            .values()
+            .filter(|entry| entry.system == GITHUB_SYSTEM && entry.reports_reach)
+            .flat_map(|entry| entry.tools.iter().cloned())
+            .collect();
         Self {
             revision: snapshot.revision().clone(),
             teams,
             tools,
+            reach_reports,
         }
+    }
+
+    /// Whether `request` may name no repository: its tool is a reach report's, and it asks for
+    /// `metadata: read` and nothing else (see the [module documentation](self)).
+    fn installation_wide(&self, request: &TokenRequest) -> bool {
+        self.reach_reports.contains(&request.tool)
+            && request.permissions
+                == BTreeMap::from([(REACH_REPORT_PERMISSION.to_owned(), Access::Read)])
     }
 
     /// The revision this copy was generated at.
@@ -116,10 +157,12 @@ impl CustodianPolicy {
                 format!("no GitHub connector entry serves tool `{}`", request.tool),
             ));
         };
-        if request.repositories.is_empty() {
+        if request.repositories.is_empty() && !self.installation_wide(request) {
             return Err((
                 Refusal::NoRepositories,
-                "the request names no repository".into(),
+                "the request names no repository, which GitHub reads as every repository; only \
+                 a reach report's tool may, for `metadata: read` alone"
+                    .into(),
             ));
         }
         if request.repositories.len() > MAX_REPOSITORIES {

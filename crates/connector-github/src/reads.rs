@@ -365,6 +365,8 @@ mod tests {
                 .map(|tool| gateway_core::ToolName::parse(tool).unwrap())
                 .collect(),
             declaration: None,
+            reports_reach: false,
+            reach_report: None,
         }
     }
 

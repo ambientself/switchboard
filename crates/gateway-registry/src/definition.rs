@@ -170,9 +170,13 @@ pub fn binding_sha256(server: &Server) -> String {
 /// - `permissions`: an object of each vendor permission the credential may be asked for and
 ///   its level, `"read"` or `"write"`;
 /// - `reach`: the reach, as [`binding_sha256`] has it;
+/// - `reports_reach`: `true`, only for a reach-report entry, whose tool the key custodian gives
+///   an installation-wide token ([`BuiltInEntry::reports_reach`]). Left out otherwise, so an
+///   entry's binding is what it was before reach reports;
 /// - `system`: the system the entry's credential reaches.
 ///
-/// The entry's name and the tools it lists are not in it.
+/// The entry's name, the tools it lists and its reach report are not in it: the drift pass
+/// makes the check, as it repeats a proxied entry's reach check.
 pub fn built_in_binding_sha256(entry: &BuiltInEntry) -> Option<String> {
     let declaration = entry.declaration.as_ref()?;
     let permissions: serde_json::Map<String, Value> = entry
@@ -191,7 +195,7 @@ pub fn built_in_binding_sha256(entry: &BuiltInEntry) -> Option<String> {
             })
         })
         .collect();
-    let binding = json!({
+    let mut binding = json!({
         "kind": "built_in",
         "credential_mode": credential_mode(declaration.credential),
         "credential_principal": declaration.principal,
@@ -202,6 +206,9 @@ pub fn built_in_binding_sha256(entry: &BuiltInEntry) -> Option<String> {
         "reach": reach,
         "system": entry.system,
     });
+    if entry.reports_reach {
+        binding["reports_reach"] = Value::Bool(true);
+    }
     Some(sha256_hex(&binding))
 }
 

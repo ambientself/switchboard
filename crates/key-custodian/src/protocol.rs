@@ -40,7 +40,8 @@ pub struct TokenRequest {
     /// The tool being called.
     pub tool: ToolName,
     /// The repositories the token is for, each `owner/name` as GitHub writes it: at least one,
-    /// at most [`MAX_REPOSITORIES`], none twice.
+    /// at most [`MAX_REPOSITORIES`], none twice. Only a reach report's request, for
+    /// `metadata: read` alone, may name none (see [`crate::policy`]).
     pub repositories: Vec<String>,
     /// The permissions the token is for, each at its level: at least one.
     pub permissions: BTreeMap<String, Access>,
@@ -202,7 +203,8 @@ pub enum Refusal {
     UnknownTeam,
     /// No connector entry the custodian serves states the tool's permission set.
     UnknownTool,
-    /// The request names no repository, which GitHub reads as every repository.
+    /// The request names no repository, which GitHub reads as every repository, and is not a
+    /// reach report's request for `metadata: read` alone (see [`crate::policy`]).
     NoRepositories,
     /// The request names more than [`MAX_REPOSITORIES`] repositories.
     TooManyRepositories,

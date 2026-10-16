@@ -41,7 +41,7 @@ mod registry;
 mod selection;
 
 pub use adapter::{ArgumentAdapter, ArgumentError, JsonPointer, ResourceSource};
-pub use builtin::{Access, BuiltInEntry, EntryDeclaration};
+pub use builtin::{Access, BuiltInEntry, EntryDeclaration, REPORTED_KIND, ReachReport};
 pub use definition::{
     Approval, Route, SCHEMA_DIALECT, ToolDefinition, binding_sha256, built_in_binding_sha256,
     definition_sha256,

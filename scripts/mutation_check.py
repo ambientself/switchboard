@@ -6018,6 +6018,27 @@ mutate("gw-drift-dependent-drift-unjudged", "a tool withdrawn with its entry's r
 mutate("gw-reach-dependent-mismatch-unjudged", "a reach mismatch skips a tool withdrawn with its entry's reach check tool, so a new approval of the reach check tool alone serves it again", DRIFT,
        "                            && !state.withdrawn_on_its_own(name)\n",
        "                            && !state.standing.contains_key(*name)\n")
+# Decision 0011, section 4, the vendor-report kind (#193): a GitHub entry's recorded reach is
+# compared with GitHub's report of the installation's repositories both ways, on a schedule of its
+# own; a difference withdraws the entry's tools, and a report that cannot be read withdraws nothing.
+# tests/github_reach.rs watches each, and reach.rs's own tests the comparison.
+mutate("gw-reach-report-never-compared", "the report is compared with itself, not the recorded reach, so a repository added or dropped stays served", DRIFT,
+       "        let difference = compare(&check.reach, &repositories);\n",
+       "        let difference = compare(&repositories, &repositories);\n")
+mutate("gw-reach-report-added-ignored", "a repository the report lists and the reach does not hold is not a mismatch, so a widened installation stays served", GW + "reach.rs",
+       "        added: reported.difference(recorded).cloned().collect(),\n",
+       "        added: BTreeSet::new(),\n")
+mutate("gw-reach-report-dropped-ignored", "a repository the reach holds and the report does not list is not a mismatch, so an approval that no longer describes the credential stays served", GW + "reach.rs",
+       "        dropped: recorded.difference(reported).cloned().collect(),\n",
+       "        dropped: BTreeSet::new(),\n")
+mutate("gw-reach-report-failure-withdraws", "a report that could not be read is judged as an empty list, so a failed read withdraws the entry's tools", DRIFT,
+       "                self.signals.count(entry, |counts| counts.reach_failed += 1);\n",
+       "                self.signals.count(entry, |counts| counts.reach_failed += 1);\n"
+       "                let empty = Reported::Listed { repositories: BTreeSet::new(), row: None };\n"
+       "                self.judge_report(entry, check, started, empty);\n")
+mutate("gw-reach-report-never-scheduled", "no entry is checked against its report on the drift schedule, so a changed installation is never found", DRIFT,
+       "        for reporting in self.reporting() {\n            reports.spawn(report_every(\n",
+       "        for reporting in self.reporting().into_iter().take(0) {\n            reports.spawn(report_every(\n")
 
 
 # --- first slice: resources on rows, naming what goes down ------------------------------------
@@ -6400,7 +6421,7 @@ mutate("custodian-outside-limit-accepted", "a repository outside the team's limi
 mutate("custodian-other-account-accepted", "a repository on another account may be asked for", KP,
        "            if owner != account {", "            if false {")
 mutate("custodian-no-repositories-accepted", "a request may name no repository, which GitHub reads as all", KP,
-       "        if request.repositories.is_empty() {", "        if false {")
+       "        if request.repositories.is_empty() && !self.installation_wide(request) {", "        if false {")
 mutate("custodian-no-permissions-accepted", "a request may name no permission, which GitHub reads as all", KP,
        "        if request.permissions.is_empty() {", "        if false {")
 mutate("custodian-malformed-accepted", "a malformed request is checked as if well formed", KS,
@@ -6426,6 +6447,18 @@ mutate("custodian-socket-mode-open-accepted", "a socket mode giving others acces
 mutate("custodian-fake-jwt-unchecked", "the fake GitHub accepts any App JWT", KC + "fake.rs",
        "    if !bearer(&headers).is_some_and(|jwt| jwt_valid(&shared, jwt)) {",
        "    if bearer(&headers).is_none() {")
+# The one request that may name no repository (decision 0011, section 4; #193): a reach report's
+# tool, for metadata: read alone, asked of GitHub with no repositories. tests/reach_report.rs
+# watches each.
+mutate("custodian-reach-report-any-entry", "any tool may ask for an installation-wide metadata: read token, not only a reach report's", KP,
+       "        self.reach_reports.contains(&request.tool)\n",
+       "        self.tools.contains_key(&request.tool)\n")
+mutate("custodian-reach-report-any-permission", "a reach report's installation-wide token may carry any permission its entry states beside metadata: read", KP,
+       "            && request.permissions\n"
+       "                == BTreeMap::from([(REACH_REPORT_PERMISSION.to_owned(), Access::Read)])\n",
+       "            && request.permissions.contains_key(REACH_REPORT_PERMISSION)\n")
+mutate("custodian-reach-report-repositories-sent", "an installation-wide request is sent to GitHub with an empty repository list, not none", KG,
+       '            fields.remove("repositories");\n', "            let _ = fields;\n")
 
 # --- connector-github ----------------------------------------------------------------------
 # The GitHub connector refuses another organization before any request, asks the key custodian for
@@ -6557,6 +6590,18 @@ mutate("gateway-reload-connectors-uncompared", "a reload that changes a built-in
 mutate("gateway-connectors-outside-the-policy", "an entry changed under the same revision is not a changed policy",
        "crates/gateway/src/policy.rs",
        "            connectors: registry.connectors().clone(),", "            connectors: BTreeMap::new(),")
+# The registry holds a reach-report entry to its one job, and an entry's reach report to one that
+# can check it (decision 0011, section 4; #193). The registry's tests/reach_report.rs watches each.
+mutate("registry-reach-report-surface-unchecked", "a reach report's tool may be served to any principal of a team",
+       "crates/gateway-registry/src/registry.rs",
+       "        if !matches!(surface.principals, PrincipalsFile::AnyInTeamsAndGroups) {", "        if true {")
+mutate("registry-reach-report-entry-narrowed-accepted", "a reach-report entry may be narrowed, though its credential reads the whole installation",
+       "crates/gateway-registry/src/builtin.rs",
+       "            Some(declaration) if declaration.narrowing != Narrowing::None => {",
+       "            Some(declaration) if false && declaration.narrowing != Narrowing::None => {")
+mutate("registry-reach-report-unapproved-accepted", "a reach report's tool may be withdrawn while the entry it checks keeps its tools",
+       "crates/gateway-registry/src/registry.rs",
+       "            && built_in_tools.values().any(|on| *on == entry.name)\n", "            && false\n")
 
 # --- Which tests can see a mutation ----------------------------------------------------------
 #
