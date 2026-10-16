@@ -21,8 +21,8 @@ use crate::clock::FixedClock;
 use crate::contract::StoredRecord;
 use crate::gate::Gate;
 use crate::row_bound::{
-    MAX_BEGUN_ROW_BYTES, MAX_ROW_BYTES, call_row_sizes, list_row_sizes, refuse_long_sentence,
-    refuse_over,
+    MAX_BEGUN_ROW_BYTES, MAX_ROW_BYTES, call_row_sizes, list_row_sizes, refuse_long_reach,
+    refuse_long_sentence, refuse_over,
 };
 
 /// The instance [`row_start`] names.
@@ -342,13 +342,20 @@ fn refused_at_list(id: &AuditRowId, record: &ListRecord) -> Result<(), StoreErro
     )
 }
 
-/// Why the Postgres store would refuse to write `completion`, if it would: a refusal's sentence
-/// is refused, never cut, when it holds U+0000 or is longer than
-/// [`MAX_OUTCOME_SENTENCE_BYTES`](crate::row_bound::MAX_OUTCOME_SENTENCE_BYTES).
-fn refused_at_finish(completion: &Completion) -> Result<(), StoreError> {
+/// Why the Postgres store would refuse to write `completion`, and what its tool `reached`, if
+/// it would: a refusal's sentence is refused, never cut, when it holds U+0000 or is longer than
+/// [`MAX_OUTCOME_SENTENCE_BYTES`](crate::row_bound::MAX_OUTCOME_SENTENCE_BYTES), and a reach
+/// when it is longer than [`MAX_REACHED_BYTES`](crate::row_bound::MAX_REACHED_BYTES).
+fn refused_at_finish(
+    completion: &Completion,
+    reached: Option<&ReachedResources>,
+) -> Result<(), StoreError> {
     refuse_nul(serde_json::to_value(completion))?;
     if let Outcome::Refused { sentence } = &completion.outcome {
         refuse_long_sentence(sentence)?;
+    }
+    if let Some(reached) = reached {
+        refuse_long_reach(reached)?;
     }
     refuse_past_bigint("the latency", completion.latency_ms)
 }
@@ -500,7 +507,7 @@ impl State {
             return Ok(None);
         };
         let reuse = Reuse::answer(request, &self.as_read(earlier, now));
-        refused_at_finish(&reuse.completion())?;
+        refused_at_finish(&reuse.completion(), None)?;
         Ok(Some(reuse))
     }
 
@@ -1231,7 +1238,7 @@ impl AuditStore for InMemoryAuditStore {
             state.finish_gate.clone()
         };
         Box::pin(async move {
-            refused_at_finish(completion.completion())?;
+            refused_at_finish(completion.completion(), completion.reached())?;
             if let Some(gate) = gate {
                 gate.wait().await;
             }

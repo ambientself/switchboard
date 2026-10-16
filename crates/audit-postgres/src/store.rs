@@ -1148,7 +1148,7 @@ impl PgAuditStore {
 
     /// Finish, as [`AuditStore::finish`] describes it, with the vendor's `reference` for the
     /// row's receipt and the resources its tool `reached`.
-    async fn finish_with_reference(
+    pub(crate) async fn finish_with_reference(
         &self,
         row: &AuditRowId,
         completion: &Completion,

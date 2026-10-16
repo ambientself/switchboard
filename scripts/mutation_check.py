@@ -1864,7 +1864,7 @@ mutate("testkit-unknown-resources-omitted-accepted", "the in-memory store writes
        "    if record.resources == RecordedResources::Unknown && record.resources_omitted != 0 {",
        "    if false {")
 mutate("testkit-completion-unchecked", "the in-memory store writes any completion", A,
-       "            refused_at_finish(completion.completion())?;\n", "")
+       "            refused_at_finish(completion.completion(), completion.reached())?;\n", "")
 mutate("testkit-allowance-wraps", "a call deadline near the largest wraps round to a short deadline", A,
        "        .saturating_add(call_deadline_ms)", "        .wrapping_add(call_deadline_ms)")
 mutate("testkit-allowance-rounds-up", "a budget is counted in part milliseconds, not whole ones as Postgres counts it", A,
@@ -1925,6 +1925,10 @@ mutate("testkit-row-bound-groups-uncounted", "the in-memory store leaves a user'
        "                groups.iter().map(|group| group.as_str().len()).sum::<usize>() * 0,")
 mutate("testkit-list-kind-uncounted", "the in-memory store leaves a list row's kind out of its size", ROW_BOUND,
        '        ("kind", kind(RowKind::List).len()),', '        ("kind", 0),')
+mutate("testkit-unknown-counted-as-written", "the in-memory store's begin leaves no room for a reach", ROW_BOUND,
+       "        held.max(MAX_REACHED_BYTES)\n", "        held\n")
+mutate("testkit-reach-uncapped", "the in-memory store writes a reach of any length at finish", ROW_BOUND,
+       "    if bytes > MAX_REACHED_BYTES {\n", "    if false {\n")
 
 # Receipts in the in-memory store (decision 0009, part 2), as its contract suite's item 6 and
 # the end-to-end reuse test check them.
@@ -4254,6 +4258,15 @@ mutate("pg-columns-list-row-unbounded", "a list row over 512 KiB is sent to the 
 mutate("pg-columns-list-kind-uncounted", "a list row's kind, which its statement writes itself, is left out of its size", PG_COLUMNS,
        '            ("kind", text_bytes(kind(RowKind::List))),\n',
        '            ("kind", 0),\n')
+# A tool that checks its own scope (decision 0011, #12): begin counts an allowed row's unknown
+# resources as the longest reach finish may write in their place, and finish refuses a longer
+# reach. columns.rs's a_self_scoped_row_leaves_room_for_the_longest_reach, the contract suite's
+# a_call_row_over_begins_bound_is_refused_naming_its_largest_column and tests/store.rs's
+# the_largest_self_scoped_row_finished_with_the_longest_reach_is_within_the_bound catch these.
+mutate("pg-columns-unknown-counted-as-written", "begin leaves no room for a reach, so a self-scoped row may finish over 512 KiB", PG_COLUMNS,
+       "            held.max(MAX_REACHED_BYTES)\n", "            held\n")
+mutate("pg-columns-reach-uncapped", "finish writes a reach of any length", PG_COLUMNS,
+       "                if bytes > MAX_REACHED_BYTES {\n", "                if false {\n")
 mutate("pg-sql-resources-nullable", "a call row may record no resources at all", PG_LIST_ROWS,
        "                AND resources IS NOT NULL AND resources_omitted IS NOT NULL\n",
        "                AND resources_omitted IS NOT NULL\n")

@@ -96,7 +96,8 @@ mod tests;
 
 pub use check::{BootCheckError, Problem};
 pub use columns::{
-    COMPLETION_RESERVE, MAX_BEGUN_ROW_BYTES, MAX_OUTCOME_SENTENCE_BYTES, MAX_ROW_BYTES,
+    COMPLETION_RESERVE, MAX_BEGUN_ROW_BYTES, MAX_OUTCOME_SENTENCE_BYTES, MAX_REACHED_BYTES,
+    MAX_ROW_BYTES,
 };
 pub use migrate::{
     GATEWAY_ROLE, MIGRATIONS, MigrateError, Migration, OWNER_ROLE, ROLES, SCHEMA, migrate,

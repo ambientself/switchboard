@@ -836,15 +836,20 @@ written complete, has no finish, and is never open.
   longest outcome, 7, the longest error kind, 22, the latency, 8, and the longest refusal
   sentence finish writes, 2,048). Finish refuses a longer sentence, as it refuses one holding
   U+0000 (the next entry but one). Every sentence the gateway makes fits in 2,048 bytes with a
-  server and tool name of 900 bytes each. A list row is never completed, and is refused over
+  server and tool name of 900 bytes each. An allowed call whose resources are `unknown`, one
+  whose tool checks its own scope, may have them replaced at finish by what its tool reached
+  (below), so begin counts its resources as 298,049 bytes, the most a reach can hold, not as
+  the 9 bytes of `"unknown"`; finish refuses a longer reach, never cut, as it refuses a long
+  sentence. A list row is never completed, and is refused over
   512 KiB itself. Either refusal names the row's largest column, so the call or the list is
   refused; a reach whose entry name is long enough is refused this way, naming `resources`.
   Every value a caller chooses is capped, and in the largest row they take at most 316,129
   bytes, leaving 206,074 of a begun row's 522,203 for the values from the gateway's own
   configuration, which have no cap of their own. The largest row a call can begin, finished
-  with the longest completion finish writes, is at most 524,288 bytes
-  (`audit_postgres::MAX_ROW_BYTES` works it out, and its tests write that row, finish it, read
-  it back and count every column the table holds for it).
+  with the longest completion finish writes and, for a tool that checks its own scope, the
+  longest reach, is at most 524,288 bytes (`audit_postgres::MAX_ROW_BYTES` works it out, and
+  its tests write both rows, finish them, read them back and count every column the table
+  holds for them).
 - **Audit failure fails closed.** If the row cannot be written, the call is refused.
 - **A row is the record, or there is no row.** A store that cannot hold a value exactly refuses
   the record rather than store another value in its place, and the call is refused. Postgres
@@ -890,10 +895,10 @@ written complete, has no finish, and is never open.
   Postgres, migration 0011 lets `complete_once` accept that one change, from `unknown` to a
   list, and grants the gateway's role UPDATE on `resources` and `resources_omitted`, which the
   boot check expects; the role still cannot read them, so a repeated finish is compared on its
-  completion alone, in both stores. A reach is bounded as named resources are, so a finished
-  row's caller-chosen values are within the same 316,129 bytes; begin does not count that room
-  for a row it writes with `unknown` resources, so only a row whose configured values are near
-  the bound could finish over it. The contract suite covers it on both stores.
+  completion alone, in both stores. A reach is bounded as named resources are, at 298,049
+  bytes, and begin counts that room for an allowed row it writes with `unknown` resources, so
+  a finished row is within 512 KiB (the entry above); finish refuses a longer reach. The
+  contract suite covers it on both stores.
 - **A turn grant is recorded by what identifies it:** its digest (the SHA-256 of the grant as
   presented), issuer, key ID, session, turn, execution and epoch, the turn's egress setting when
   the grant carries one, and the pod UID the caller's token proves; and, when Otto was asked,
@@ -2155,13 +2160,16 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   every value it writes, the completion and a list row's kind included. Begin refuses a call
   row over 522,203 bytes, leaving a reserve of 2,085 bytes for the completion; finish refuses a
   refusal sentence over 2,048 bytes, as it refuses one holding U+0000, so the row is its record
-  or keeps no completion (section 11); list refuses a list row, which is never completed, over
+  or keeps no completion (section 11). Begin counts an allowed call's `unknown` resources as
+  the longest reach finish may write in their place, 298,049 bytes, and finish refuses a longer
+  reach (#12). List refuses a list row, which is never completed, over
   512 KiB. Each refusal at begin or list names the row's largest column, so the call or the
   list is refused. `audit_postgres::MAX_ROW_BYTES` works out the largest row a call can make,
   316,129 bytes of capped values. Tests write it at begin's bound to Postgres, finish it with
   the longest completion finish writes, read it back, and count every column the table holds
-  for it, within 512 KiB; and write a list row at 512 KiB, which the table holds at exactly
-  that.
+  for it, within 512 KiB; do the same for the largest row a tool that checks its own scope can
+  begin, finished with the longest reach; and write a list row at 512 KiB, which the table
+  holds at exactly that.
 - The decision 0014 signals other than each issuer's key age: built. The calls shed by scope
   and each proxied server's calls by outcome, latency and late or oversized answers (#139), the
   policy's age (#132), and each server's drift polls, withdrawals, probe results and
@@ -2647,10 +2655,12 @@ that can do what Postgres cannot tests nothing.
    cannot hold exactly, such as one with U+0000 in a text value, is refused at begin and
    leaves no row. The fake must refuse the same records. It refuses what the Postgres store's
    column mapping refuses, the 512 KiB row bound (begin's 522,203 bytes for a call row, 512 KiB
-   for a list row) and the 2,048-byte cap on a refusal sentence at finish included. It counts a
-   row with copies of that store's constants and count, which a test in `audit-postgres` checks
-   against the originals. Of the table's own constraints, it checks the shape of unknown
-   resources and of a reach (no count left out, an entry named) and `kind_shape` so far.
+   for a list row, an allowed call's `unknown` resources counted as the longest reach), the
+   2,048-byte cap on a refusal sentence and the 298,049-byte cap on a reach at finish included.
+   It counts a row with copies of that store's constants and count, which a test in
+   `audit-postgres` checks against the originals. Of the table's own constraints, it checks the
+   shape of unknown resources and of a reach (no count left out, an entry named) and
+   `kind_shape` so far.
 3. `finish` completes a row once, accepts an identical repeat, refuses a different one, and
    touches only the completion columns. A refusal is a returned error, not a panic.
 4. Times and deadlines come from the store's clock: database time for Postgres, the

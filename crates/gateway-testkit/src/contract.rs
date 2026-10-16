@@ -92,7 +92,8 @@ use crate::fixture::{
     UNKNOWN_PROFILE, policy_data, policy_data_with_draft_lookup,
 };
 use crate::row_bound::{
-    MAX_BEGUN_ROW_BYTES, MAX_OUTCOME_SENTENCE_BYTES, MAX_ROW_BYTES, call_row_sizes, list_row_sizes,
+    MAX_BEGUN_ROW_BYTES, MAX_OUTCOME_SENTENCE_BYTES, MAX_REACHED_BYTES, MAX_ROW_BYTES,
+    call_row_sizes, list_row_sizes,
 };
 
 /// What a contract function needs of a store: the store, a read-back, its budgets and its clock.
@@ -655,46 +656,57 @@ fn counted(columns: &[(&'static str, usize)]) -> usize {
     columns.iter().map(|(_, bytes)| bytes).sum()
 }
 
-/// Decision 0014, section 7: a call row of exactly begin's bound, [`MAX_BEGUN_ROW_BYTES`] as
-/// the store counts it, is begun and stored as the record. One byte more is refused, naming the
-/// row's largest column, and leaves no row.
+/// Decision 0014, section 7: a call row of exactly begin's bound, [`MAX_BEGUN_ROW_BYTES`] as the
+/// store counts it, is begun and stored as the record. One byte more is refused, naming the
+/// row's largest column, and leaves no row. An allowed call whose resources are `unknown`, one
+/// whose tool checks its own scope (decision 0011), is counted with room for the longest reach
+/// finish may write in their place, [`MAX_REACHED_BYTES`], so its row is refused a byte over
+/// that count, naming `resources`, though it holds far less when begun.
 pub async fn a_call_row_over_begins_bound_is_refused_naming_its_largest_column(
     contract: &impl ContractStore,
 ) {
     let store = contract.store();
-    let row = row_start().row;
-    let mut record = records().swap_remove(0);
-    let held = counted(&call_row_sizes(&row, &record)) - record.policy_revision.as_str().len();
-    record.policy_revision = "r".repeat(MAX_BEGUN_ROW_BYTES - held).as_str().into();
-    assert_eq!(counted(&call_row_sizes(&row, &record)), MAX_BEGUN_ROW_BYTES);
-    store
-        .begin(&row, &record)
-        .await
-        .expect("the store refused a call row at begin's bound");
-    let at_bound = stored(contract, &row).await;
-    assert_eq!(at_bound.record, StoredRecord::Call(record.clone()));
-    assert_eq!(at_bound.completion, None);
+    let named = records().swap_remove(0);
+    let mut self_scoped = named.clone();
+    self_scoped.resources = RecordedResources::Unknown;
+    self_scoped.resources_omitted = 0;
+    for (mut record, largest) in [(named, "policy_revision"), (self_scoped, "resources")] {
+        let row = row_start().row;
+        let held = counted(&call_row_sizes(&row, &record)) - record.policy_revision.as_str().len();
+        record.policy_revision = "r".repeat(MAX_BEGUN_ROW_BYTES - held).as_str().into();
+        assert_eq!(counted(&call_row_sizes(&row, &record)), MAX_BEGUN_ROW_BYTES);
+        if record.resources == RecordedResources::Unknown {
+            assert!(call_row_sizes(&row, &record).contains(&("resources", MAX_REACHED_BYTES)));
+        }
+        store
+            .begin(&row, &record)
+            .await
+            .expect("the store refused a call row at begin's bound");
+        let at_bound = stored(contract, &row).await;
+        assert_eq!(at_bound.record, StoredRecord::Call(record.clone()));
+        assert_eq!(at_bound.completion, None);
 
-    let over = AuditRecord {
-        policy_revision: format!("{}r", record.policy_revision.as_str())
-            .as_str()
-            .into(),
-        ..record
-    };
-    let row = row_start().row;
-    let failure = store
-        .begin(&row, &over)
-        .await
-        .expect_err("the store began a call row over begin's bound")
-        .to_string();
-    assert!(
-        failure.contains(&format!(
-            "would hold {} bytes, more than the {MAX_BEGUN_ROW_BYTES}",
-            MAX_BEGUN_ROW_BYTES + 1
-        )) && failure.ends_with("its largest column is policy_revision"),
-        "a call row over begin's bound was refused for another reason: {failure}"
-    );
-    assert_eq!(contract.stored(&row).await, None);
+        let over = AuditRecord {
+            policy_revision: format!("{}r", record.policy_revision.as_str())
+                .as_str()
+                .into(),
+            ..record
+        };
+        let row = row_start().row;
+        let failure = store
+            .begin(&row, &over)
+            .await
+            .expect_err("the store began a call row over begin's bound")
+            .to_string();
+        assert!(
+            failure.contains(&format!(
+                "would hold {} bytes, more than the {MAX_BEGUN_ROW_BYTES}",
+                MAX_BEGUN_ROW_BYTES + 1
+            )) && failure.ends_with(&format!("its largest column is {largest}")),
+            "a call row over begin's bound was refused for another reason: {failure}"
+        );
+        assert_eq!(contract.stored(&row).await, None);
+    }
 }
 
 /// Decision 0014, section 7: a list row of exactly the bound, [`MAX_ROW_BYTES`] as the store
