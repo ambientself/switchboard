@@ -16,7 +16,9 @@
 //! with its time at begin from the store's clock, and is never completed, and that a call
 //! record of kind `list` is refused at begin. Of item 3, it covers decision 0011's report of
 //! what a tool that checks its own scope reached: written in place of the row's `unknown`
-//! resources in the same write as the completion, and refused from any other tool. That the
+//! resources in the same write as the completion, and refused from any other tool. Of item 2, it
+//! covers decision 0011's exception: stored on an allowed call of a `write` tool, the answer to
+//! a reused key included, and refused on any other row. That the
 //! store overwrites times an insert
 //! carries cannot be tried through [`AuditStore`], whose callers pass no times: the Postgres
 //! schema tests try it. The open-row query is not here: it is Postgres's alone for now.
@@ -72,10 +74,11 @@ use gateway_core::audit::{
 use gateway_core::receipt::EstablishedBy;
 use gateway_core::{
     ArgumentDigest, AuditGuard, AuditRecord, AuditStore, BoxFuture, CallContext, CallerContext,
-    Claimed, Connector, CredentialIdentity, CredentialMode, Currency, CurrencyAnswer, Decision,
-    Delegation, DelegationDigest, DelegationFailure, DelegationKeyScope, Egress, IdempotencyKey,
-    KeyScope, LeaseHolder, LookupAnswer, PodUid, PresentedDelegation, Principal, PrincipalKind,
-    Proved, Reason, ReasonKind, Receipt, ReceiptQueue, ReceiptState, Recorded, RequestedTool,
+    Claimed, Classification, Connector, CredentialIdentity, CredentialMode, Currency,
+    CurrencyAnswer, Decision, Delegation, DelegationDigest, DelegationFailure, DelegationKeyScope,
+    Egress, ExceptionName, IdempotencyKey, KeyScope, LeaseHolder, LookupAnswer, PodUid,
+    PolicySnapshot, PresentedDelegation, Principal, PrincipalKind, Proved, Reason, ReasonKind,
+    Receipt, ReceiptQueue, ReceiptState, Recorded, RequestedTool,
     Resource, Resources, Reuse, TeamId, ToolCall, ToolOutcome, ToolUseId, UnverifiedDelegation,
     VendorReference, Verifier, WasProved, decide,
 };
@@ -88,8 +91,8 @@ use crate::connector::{
 };
 use crate::credentials::FakeCredentialSource;
 use crate::fixture::{
-    Caller, Fixture, SURFACE_ALL, SURFACE_READ, TEAM_A, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT,
-    UNKNOWN_PROFILE, policy_data, policy_data_with_draft_lookup,
+    Caller, Fixture, PROFILE_TEAM_A, SURFACE_ALL, SURFACE_READ, TEAM_A, TEAM_A_DOCUMENT,
+    TEAM_B_DOCUMENT, UNKNOWN_PROFILE, draft_lookup, policy_data, policy_data_with_draft_lookup,
 };
 use crate::row_bound::{
     MAX_BEGUN_ROW_BYTES, MAX_OUTCOME_SENTENCE_BYTES, MAX_REACHED_BYTES, MAX_ROW_BYTES,
@@ -1113,6 +1116,140 @@ pub async fn an_unverified_delegation_denied_before_check_3_is_stored_as_that_de
             );
         }
     }
+}
+
+/// Decision 0011, section 9: an allowed call of a `write` tool records the exception in its
+/// profile that let it past check 5, and the store keeps it as begun. A store refuses one
+/// anywhere else, and leaves no row: on a denial, on an allowed read and on an allowed
+/// proposal. Through the core, the exception is recorded on the row of an allowed call and on
+/// the row of a reused key's answer, written complete at begin, and not on the row of a call
+/// that check 5 let past by the exception and the currency check then denied. A list row has
+/// no exception in the core; the Postgres schema tests try one there.
+pub async fn an_exception_is_stored_on_an_allowed_write_and_refused_elsewhere(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let records = records();
+    let (allowed, denied) = (records[0].clone(), records[1].clone());
+    let exception = ExceptionName::parse("otto-comment-tools").expect("a valid exception name");
+    for written in [
+        AuditRecord {
+            allowed_by_exception: Some(exception.clone()),
+            ..allowed.clone()
+        },
+        AuditRecord {
+            classification: Some(Classification::Destructive),
+            allowed_by_exception: Some(exception.clone()),
+            ..allowed.clone()
+        },
+    ] {
+        let row = row_start().row;
+        store
+            .begin(&row, &written)
+            .await
+            .expect("the store refused an allowed write's exception");
+        assert_eq!(
+            stored(contract, &row).await.record,
+            StoredRecord::Call(written.clone()),
+            "{written:?}"
+        );
+    }
+    for refused in [
+        AuditRecord {
+            allowed_by_exception: Some(exception.clone()),
+            ..denied.clone()
+        },
+        AuditRecord {
+            classification: Some(Classification::Read),
+            allowed_by_exception: Some(exception.clone()),
+            ..allowed.clone()
+        },
+        AuditRecord {
+            classification: Some(Classification::Propose),
+            allowed_by_exception: Some(exception.clone()),
+            ..allowed.clone()
+        },
+    ] {
+        let row = row_start().row;
+        assert!(
+            store.begin(&row, &refused).await.is_err(),
+            "the store accepted {refused:?}"
+        );
+        assert_eq!(contract.stored(&row).await, None, "{refused:?}");
+    }
+
+    // Through the core: team A's profile requires currency and excepts the write tool, which
+    // is settled by a lookup, as the loader requires.
+    let fixture = fixture();
+    let mut data = policy_data();
+    for tool in data["tools"].as_array_mut().expect("the fixture's tools") {
+        if tool["name"] == WRITE_TOOL {
+            tool["settlement"] = draft_lookup();
+        }
+    }
+    for profile in data["profiles"].as_array_mut().expect("the fixture's profiles") {
+        if profile["name"] == PROFILE_TEAM_A {
+            profile["requires_currency"] = json!(true);
+            profile["exceptions"] = json!([{"name": exception.as_str(), "tools": [WRITE_TOOL]}]);
+        }
+    }
+    let policy: PolicySnapshot =
+        serde_json::from_value(data).expect("the excepting policy loads");
+    let arguments = json!({ DOCUMENT_ARGUMENT: TEAM_A_DOCUMENT });
+    let key = fresh_key();
+    let context = |currency: Currency| CallContext {
+        caller: fixture
+            .caller_context(Caller::TeamA, SURFACE_ALL)
+            .expect("the fixture knows team A"),
+        tool: RequestedTool::new(WRITE_TOOL),
+        resources: FixtureConnector::resources_of(WRITE_TOOL, &arguments),
+        key: Some(key.clone()),
+        currency,
+    };
+    let excepted = |row: &AuditRowId| {
+        let row = row.clone();
+        async move {
+            match stored(contract, &row).await.record {
+                StoredRecord::Call(record) => record.allowed_by_exception,
+                StoredRecord::List(_) => panic!("a call was stored as a list"),
+            }
+        }
+    };
+
+    let start = row_start();
+    let decided = decide(&policy, &context(Currency::NotAsked));
+    assert_eq!(
+        decided.reason().map(Reason::kind),
+        Some(ReasonKind::CurrencyUnconfirmed)
+    );
+    let begun = begin_keyed(store, &start, decided, &arguments, Some(key.as_str()))
+        .await
+        .expect("the store refused a denial at the currency check");
+    assert!(matches!(begun, Begun::Denied(_)), "{begun:?}");
+    assert_eq!(excepted(&start.row).await, None);
+
+    let start = row_start();
+    let decided = decide(&policy, &context(Currency::Asked(CurrencyAnswer::Current)));
+    assert_eq!(decided.exception(), Some(&exception));
+    let Ok(Begun::Allowed(guard)) =
+        begin_keyed(store, &start, decided, &arguments, Some(key.as_str())).await
+    else {
+        panic!("an excepted write was not begun as allowed");
+    };
+    assert_eq!(excepted(&start.row).await, Some(exception.clone()));
+    let ran = audit::run(&Answering::with(ToolOutcome::Ok(json!({}))), guard).await;
+    let finished = audit::finish(store, ran, 4).await;
+    assert!(finished.failure().is_none(), "{:?}", finished.failure());
+
+    let reused = row_start();
+    let decided = decide(&policy, &context(Currency::Asked(CurrencyAnswer::Current)));
+    let begun = begin_keyed(store, &reused, decided, &arguments, Some(key.as_str()))
+        .await
+        .expect("the store refused a reused key");
+    assert!(matches!(begun, Begun::Reused(_)), "{begun:?}");
+    let answered = stored(contract, &reused.row).await;
+    assert!(answered.completion.is_some(), "{answered:?}");
+    assert_eq!(excepted(&reused.row).await, Some(exception));
 }
 
 /// `record`'s proved workload, with a pod.
