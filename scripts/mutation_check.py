@@ -4969,14 +4969,13 @@ for server_role in ["pg_execute_server_program", "pg_read_server_files", "pg_wri
            f'        "{server_role}",\n', '        "pg_monitor",\n')
 
 mutate("pg-check-rule-ignored", "a rule on the table passes the check", PG_CHECK,
-       "            .map(|row| Problem::Rule { rule: row.get(0) }),",
-       "            .filter(|_| false)\n            .map(|row| Problem::Rule { rule: row.get(0) }),")
+       "            rules(client, table, CALL_ROWS, &mut problems).await?;\n", "")
 mutate("pg-check-reaching-ignored", "a grant on a view or rule outside the schema that reaches the table passes the check", PG_CHECK,
        "                 WHERE n.nspname <> 'switchboard_audit'\n                     AND ({}",
        "                 WHERE false\n                     AND ({}")
 mutate("pg-check-reaching-direct-only", "a view over a view over the table is not followed", PG_CHECK,
        "            JOIN pg_catalog.pg_depend d ON d.refobjid = x.oid\n",
-       "            JOIN pg_catalog.pg_depend d ON d.refobjid = x.oid AND x.oid = $1::oid\n")
+       "            JOIN pg_catalog.pg_depend d ON d.refobjid = x.oid AND x.oid = x.root\n")
 mutate("pg-check-reaching-views-only", "a rule on another table that writes the table is not followed", PG_CHECK,
        "            JOIN pg_catalog.pg_rewrite rw ON rw.oid = d.objid\n",
        "            JOIN pg_catalog.pg_rewrite rw ON rw.oid = d.objid AND rw.rulename = '_RETURN'\n")
@@ -4988,7 +4987,7 @@ mutate("pg-check-definer-column-owner-ignored", "a definer function whose owner 
        "OR has_any_column_privilege({owner}, x.oid,", "OR false AND has_any_column_privilege({owner}, x.oid,")
 mutate("pg-check-definer-view-owner-ignored", "a definer function whose owner holds privileges only on a view over the table passes the check", PG_CHECK,
        "        FROM reaching x\n            JOIN pg_catalog.pg_class c ON c.oid = x.oid\n",
-       "        FROM (SELECT $1::oid AS oid) x\n            JOIN pg_catalog.pg_class c ON c.oid = x.oid\n")
+       "        FROM unnest($1::oid[]) AS x(oid)\n            JOIN pg_catalog.pg_class c ON c.oid = x.oid\n")
 mutate("pg-check-definer-schema-owner-ignored", "a definer function of the schema's owner passes the check", PG_CHECK,
        "OR EXISTS (SELECT FROM schema_owner s", "OR false AND EXISTS (SELECT FROM schema_owner s")
 mutate("pg-check-definer-chain-not-followed", "a definer function that reaches the table through another passes the check", PG_CHECK,
@@ -5086,7 +5085,21 @@ mutate("pg-check-cascade-partition-copy-judged", "a partitioned table's foreign 
 mutate("pg-check-cascade-partition-copies-refused", "a partition's copy of a foreign key is refused for the partition's owner, which the action does not run as", PG_CHECK,
        "WHERE k.contype = 'f' AND k.conparentid = 0\n", "WHERE k.contype = 'f'\n")
 mutate("pg-check-cascade-references-call-rows-refused", "a cascading foreign key that references call_rows is refused", PG_CHECK,
-       "AND k.conrelid <> $1::oid AND k.confrelid <> $1::oid", "AND k.conrelid <> $1::oid")
+       "AND k.conrelid <> ALL($3::oid[]) AND k.confrelid <> $1::oid", "AND k.conrelid <> ALL($3::oid[])")
+# #203: the routes around the grants that the check follows to call_rows, followed to receipts
+# too: a rule or a foreign key's action on receipts, a view or rule elsewhere that reaches it, a
+# definer function or a cascading table whose owner can change it, and one whose owner owns
+# receipt_moves. tests/check.rs's receipt route tests catch these.
+mutate("pg-check-receipt-rule-ignored", "a rule on the receipt table passes the check", PG_CHECK,
+       "    rules(client, table, RECEIPTS_TABLE, problems).await?;\n", "")
+mutate("pg-check-receipt-referential-action-ignored", "a foreign key on the receipt table with ON DELETE CASCADE passes the check", PG_CHECK,
+       "    referential_actions(client, table, RECEIPTS_TABLE, problems).await?;\n", "")
+mutate("pg-check-reaching-receipts-ignored", "a grant on a view or rule outside the schema that reaches receipts passes the check", PG_CHECK,
+       "reaching_privileges(client, &audited, version", "reaching_privileges(client, &audited[..1], version")
+mutate("pg-check-able-receipts-ignored", "a definer function or cascading table whose owner can delete receipts passes the check", PG_CHECK,
+       "able(client, &audited, version)", "able(client, &audited[..1], version)")
+mutate("pg-check-definer-ignores-receipt-trigger-function-owner", "a definer function whose owner owns receipt_moves passes the check", PG_CHECK,
+       "WHERE g.tgrelid = ANY($1::oid[])", "WHERE g.tgrelid = ($1::oid[])[1]")
 # Receipts (decision 0009, part 2): migration 0008's table, grants and trigger receipt_moves, the
 # begin with a receipt in one transaction, a retried begin refused once its own receipt is pending
 # past the row's deadline, finish settling the receipt only before the deadline, the boot check's
@@ -5179,7 +5192,8 @@ mutate("pg-check-lookup-trigger-skipped", "the boot check does not look for the 
        "        fires: \"before each insert, update or delete\",\n        tgtype: 1 | 2 | 4 | 8 | 16,\n    },\n",
        "")
 mutate("pg-check-receipts-unchecked", "the boot check does not check the receipt table: that it is there, logged, and the role's grants on its columns", PG_CHECK,
-       "            receipts(client, &mut problems).await?;\n", "")
+       "            if let Some(receipts) = receipts(client, &mut problems).await? {\n",
+       "            if let Some(receipts) = None {\n")
 mutate("pg-unknown-receipts-only-state-unknown", "the count of receipts in unknown leaves out those pending past their row's deadline", PG_STORE,
        "     WHERE r.state = 'unknown' OR (r.state = 'pending' AND c.deadline < clock_timestamp())\";",
        "     WHERE r.state = 'unknown'\";")

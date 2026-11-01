@@ -347,16 +347,17 @@ const SERVER_FUNCTIONS: &[&str] = &[
     "pg_file_write",
 ];
 
-/// Every relation whose rules read or write `call_rows`, given as `$1`, directly or through
-/// another such relation, in any schema, `call_rows` included: a view or materialized view
-/// over it, and a table or view with a rule whose action reaches it. A view's query is a rule,
-/// so one walk over the rules' dependencies finds them all. A view runs with its owner's
-/// privileges, and a rule with those of its table's owner, so a grant on any of them can give
-/// what the grants on `call_rows` withhold.
-const REACHING: &str = "reaching(oid) AS (
-        SELECT $1::oid
+/// Every relation whose rules read or write one of the audit tables, `call_rows` and
+/// `receipts`, given as the array `$1`, directly or through another such relation, in any
+/// schema, the tables included: a view or materialized view over one, and a table or view with
+/// a rule whose action reaches one. A view's query is a rule, so one walk over the rules'
+/// dependencies finds them all. A view runs with its owner's privileges, and a rule with those
+/// of its table's owner, so a grant on any of them can give what the grants on the tables
+/// withhold. Each relation comes with `root`, the table it reaches, once for each it reaches.
+const REACHING: &str = "reaching(oid, root) AS (
+        SELECT t.oid, t.oid FROM unnest($1::oid[]) AS t(oid)
         UNION
-        SELECT rw.ev_class
+        SELECT rw.ev_class, x.root
         FROM reaching x
             JOIN pg_catalog.pg_depend d ON d.refobjid = x.oid
                 AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
@@ -367,9 +368,9 @@ const REACHING: &str = "reaching(oid) AS (
 /// The sets [`ABLE`] reads, each read from the catalog once and kept, so that asking [`ABLE`]
 /// of a role reads these small sets rather than the catalog again: the relations
 /// [`REACHING`] finds, with their owners; the owner of the schema; the owners of the functions
-/// the table's triggers run; the roles in [`SERVER_ROLES`], named by `$3`; and the functions no
-/// owner may run, those in [`SERVER_FUNCTIONS`], named by `$4`, and those in an untrusted
-/// language, found by name and language before any privilege is asked.
+/// the audit tables' triggers run; the roles in [`SERVER_ROLES`], named by `$3`; and the
+/// functions no owner may run, those in [`SERVER_FUNCTIONS`], named by `$4`, and those in an
+/// untrusted language, found by name and language before any privilege is asked.
 const ABLE_SETS: &str = "reached AS MATERIALIZED (
         SELECT c.oid, c.relowner
         FROM reaching x
@@ -382,7 +383,7 @@ const ABLE_SETS: &str = "reached AS MATERIALIZED (
         SELECT f.proowner
         FROM pg_catalog.pg_trigger g
             JOIN pg_catalog.pg_proc f ON f.oid = g.tgfoid
-        WHERE g.tgrelid = $1::oid
+        WHERE g.tgrelid = ANY($1::oid[])
     ),
     server_roles AS MATERIALIZED (
         SELECT s.oid FROM pg_catalog.pg_roles s WHERE s.rolname = ANY($3::text[])
@@ -396,8 +397,9 @@ const ABLE_SETS: &str = "reached AS MATERIALIZED (
             OR (l.lanispl AND NOT l.lanpltrusted)
     )";
 
-/// A condition that the role `{owner}` is able: it can read or change `call_rows`, given as `$1`,
-/// or turn off its triggers. [`definers`] and [`cascade_actions`] say what counts. It reads
+/// A condition that the role `{owner}` is able: it can read or change an audit table,
+/// `call_rows` or `receipts`, given in the array `$1`, or turn off its triggers. [`definers`]
+/// and [`cascade_actions`] say what counts. It reads
 /// [`ABLE_SETS`], and `$2`, the table-level privileges, from [`AbleParameters`]. `{replication}`
 /// is [`replication_condition`]'s. It asks about `{owner}` with what it inherits; [`able`] asks it
 /// of every role, and then counts every member of a role it holds for as able too.
@@ -441,24 +443,24 @@ fn replication_condition(version: i32) -> String {
 }
 
 /// The parameters [`ABLE_SETS`] and [`ABLE`] read.
-struct AbleParameters {
-    table: tokio_postgres::types::Oid,
+struct AbleParameters<'a> {
+    tables: &'a [tokio_postgres::types::Oid],
     privileges: String,
     server_roles: Vec<&'static str>,
 }
 
-fn able_parameters(table: tokio_postgres::types::Oid, version: i32) -> AbleParameters {
+fn able_parameters(tables: &[tokio_postgres::types::Oid], version: i32) -> AbleParameters<'_> {
     AbleParameters {
-        table,
+        tables,
         privileges: table_privileges(version).join(", "),
         server_roles: SERVER_ROLES.iter().map(|(role, _)| *role).collect(),
     }
 }
 
-impl AbleParameters {
+impl AbleParameters<'_> {
     fn as_params(&self) -> [&(dyn tokio_postgres::types::ToSql + Sync); 4] {
         [
-            &self.table,
+            &self.tables,
             &self.privileges,
             &self.server_roles,
             &SERVER_FUNCTIONS,
@@ -494,7 +496,9 @@ const RUNNERS: &str = "WITH fresh AS MATERIALIZED (
              ORDER BY 1";
 
 /// Every role that is able, and every definer function that runs as one, found once for
-/// [`definers`] and [`cascade_actions`] both.
+/// [`definers`] and [`cascade_actions`] both, for the audit tables `tables`: `call_rows`, and
+/// `receipts` when it is there. A role that can delete or rewrite a receipt is able, as one
+/// that can change an audit row is.
 ///
 /// A role is able when [`ABLE`] holds for it, or when it can run a definer function: one whose
 /// owner is a member, inherited or not, of an able role ([`by_any_member`]), with EXECUTE on it
@@ -505,7 +509,7 @@ const RUNNERS: &str = "WITH fresh AS MATERIALIZED (
 /// role not yet found, whether it can run a definer function the round found.
 async fn able(
     client: &ClientWrapper,
-    table: tokio_postgres::types::Oid,
+    tables: &[tokio_postgres::types::Oid],
     version: i32,
 ) -> Result<Able, tokio_postgres::Error> {
     let oids = |rows: Vec<tokio_postgres::Row>| -> Vec<tokio_postgres::types::Oid> {
@@ -522,7 +526,7 @@ async fn able(
                     ABLE.replace("{replication}", &replication_condition(version))
                         .replace("{owner}", "r.oid"),
                 ),
-                &able_parameters(table, version).as_params(),
+                &able_parameters(tables, version).as_params(),
             )
             .await?,
     );
@@ -701,20 +705,26 @@ pub enum Problem {
         /// What it is held on.
         object: String,
     },
-    /// `switchboard_audit.call_rows` has a rule. A rule's statements run, as the table's owner,
-    /// in place of or beside a write the gateway makes, so one could delete a row whenever the
-    /// gateway completes one. The migration makes none.
+    /// An audit table, `switchboard_audit.call_rows` or `switchboard_audit.receipts`, has a
+    /// rule. A rule's statements run, as the table's owner, in place of or beside a write the
+    /// gateway makes, so one could delete a row whenever the gateway completes one, or a receipt
+    /// whenever the gateway settles one. The migrations make none.
     Rule {
+        /// The table, with its schema.
+        table: String,
         /// The rule.
         rule: String,
     },
-    /// `switchboard_audit.call_rows` has a foreign key whose action, on a delete or an update
-    /// of the row it references, is `CASCADE`, `SET NULL` or `SET DEFAULT`. The action deletes
-    /// or changes rows of `call_rows`, as the table's owner, whenever a role that can write the
-    /// referenced table deletes or updates a row of it, so it is a write path as a rule is. The
-    /// migrations make no foreign key; one with `NO ACTION` or `RESTRICT` only refuses a write
-    /// and passes.
+    /// An audit table, `switchboard_audit.call_rows` or `switchboard_audit.receipts`, has a
+    /// foreign key whose action, on a delete or an update of the row it references, is
+    /// `CASCADE`, `SET NULL` or `SET DEFAULT`. The action deletes or changes rows of the table,
+    /// as its owner, whenever a role that can write the referenced table deletes or updates a
+    /// row of it, so it is a write path as a rule is. The migrations' foreign keys, from
+    /// `receipts` to `call_rows` and from `call_rows` to `receipts`, are `NO ACTION`; one with
+    /// `NO ACTION` or `RESTRICT` only refuses a write and passes.
     ReferentialAction {
+        /// The table that holds the foreign key, with its schema.
+        table: String,
         /// The foreign key.
         constraint: String,
         /// The table it references.
@@ -724,9 +734,9 @@ pub enum Problem {
         /// The action, as `CREATE TABLE` spells it.
         action: String,
     },
-    /// A `SECURITY DEFINER` function runs as a role that can read or change `call_rows` or turn
-    /// off its triggers, itself or through another such function, and the session's role, or a
-    /// role it can become, can run it with EXECUTE.
+    /// A `SECURITY DEFINER` function runs as a role that can read or change an audit table,
+    /// `call_rows` or `receipts`, or turn off its triggers, itself or through another such
+    /// function, and the session's role, or a role it can become, can run it with EXECUTE.
     Definer {
         /// The function, with its schema and argument types.
         function: String,
@@ -749,9 +759,9 @@ pub enum Problem {
         /// The table the trigger is on.
         table: String,
     },
-    /// A table other than `call_rows` holds a foreign key whose action, on a delete or an
+    /// A table other than the audit tables holds a foreign key whose action, on a delete or an
     /// update of the row it references, writes that table, and the table's owner can read or
-    /// change `call_rows` or turn off its triggers, as [`Problem::Definer`] counts it. Postgres
+    /// change an audit table or turn off its triggers, as [`Problem::Definer`] counts it. Postgres
     /// runs the action as that owner, for any role that may delete or update the referenced
     /// row, and with it whatever the write sets off on the table: its triggers, its rules, its
     /// checks and its defaults. The catalog cannot say what each of those writes, so the key
@@ -951,22 +961,22 @@ impl fmt::Display for Problem {
                 "this session's role, or a role it can become, holds {privilege} on {object}, \
                  which the gateway must not have"
             ),
-            Self::Rule { rule } => write!(
+            Self::Rule { table, rule } => write!(
                 f,
-                "the table switchboard_audit.call_rows has the rule {rule}, whose statements run \
-                 as the table's owner when the gateway writes"
+                "the table {table} has the rule {rule}, whose statements run as the table's \
+                 owner when the gateway writes"
             ),
             Self::ReferentialAction {
+                table,
                 constraint,
                 referenced,
                 event,
                 action,
             } => write!(
                 f,
-                "the table switchboard_audit.call_rows has the foreign key {constraint}, which \
-                 references {referenced} with ON {event} {action}, so each {event} on \
-                 {referenced}, by any role that may make one, writes audit rows as the table's \
-                 owner"
+                "the table {table} has the foreign key {constraint}, which references \
+                 {referenced} with ON {event} {action}, so each {event} on {referenced}, by any \
+                 role that may make one, writes rows of {table} as the table's owner"
             ),
             Self::Definer {
                 function,
@@ -974,9 +984,8 @@ impl fmt::Display for Problem {
                 by,
             } => write!(
                 f,
-                "the SECURITY DEFINER function {function} runs as {owner}, which can read or \
-                 change switchboard_audit.call_rows or turn off its triggers, and this \
-                 session's role, or a role it can become, holds {by}"
+                "the SECURITY DEFINER function {function} runs as {owner}, which {ABLE_ON}, and \
+                 this session's role, or a role it can become, holds {by}"
             ),
             Self::DefinerTrigger {
                 function,
@@ -986,9 +995,8 @@ impl fmt::Display for Problem {
             } => write!(
                 f,
                 "the trigger {trigger} on {table} runs the SECURITY DEFINER function {function} \
-                 as {owner}, which can read or change switchboard_audit.call_rows or turn off \
-                 its triggers; a trigger asks for no EXECUTE, and any write that reaches \
-                 {table}, through a view, a rule or a foreign key, fires it"
+                 as {owner}, which {ABLE_ON}; a trigger asks for no EXECUTE, and any write that \
+                 reaches {table}, through a view, a rule or a foreign key, fires it"
             ),
             Self::CascadeAction {
                 table,
@@ -998,10 +1006,9 @@ impl fmt::Display for Problem {
             } => write!(
                 f,
                 "the table {table} has the foreign key {constraint}, whose action writes {table} \
-                 as its owner {owner}, which can read or change switchboard_audit.call_rows or \
-                 turn off its triggers: each delete or update on {referenced}, by any role that \
-                 may make one, runs that action, and the triggers, rules, checks and defaults it \
-                 sets off, as {owner}"
+                 as its owner {owner}, which {ABLE_ON}: each delete or update on {referenced}, \
+                 by any role that may make one, runs that action, and the triggers, rules, \
+                 checks and defaults it sets off, as {owner}"
             ),
             Self::DefinerEventTrigger {
                 function,
@@ -1010,8 +1017,7 @@ impl fmt::Display for Problem {
             } => write!(
                 f,
                 "the enabled event trigger {event_trigger} runs the SECURITY DEFINER function \
-                 {function} as {owner}, which can read or change switchboard_audit.call_rows \
-                 or turn off its triggers, on statements any role may run"
+                 {function} as {owner}, which {ABLE_ON}, on statements any role may run"
             ),
             Self::UntrustedLanguage { function, language } => write!(
                 f,
@@ -1106,6 +1112,13 @@ fn list(problems: &[Problem]) -> String {
 
 const CALL_ROWS: &str = "switchboard_audit.call_rows";
 
+/// The receipt table, with its schema, as reports name it.
+const RECEIPTS_TABLE: &str = "switchboard_audit.receipts";
+
+/// What makes a role able, as reports say it ([`ABLE`]).
+const ABLE_ON: &str = "can read or change switchboard_audit.call_rows or \
+                       switchboard_audit.receipts, or turn off their triggers";
+
 impl PgAuditStore {
     /// Checks, as the role the store connects as, that the store can be trusted to write the
     /// audit log, and refuses otherwise, naming every reason. Run it at boot, before serving,
@@ -1149,6 +1162,13 @@ impl PgAuditStore {
     ///   owner may run one.
     /// - Changes after boot, C functions from extensions, and connections back in through
     ///   `postgres_fdw` or `dblink`: out of scope, as the last section says.
+    ///
+    /// The routes around the grants that it follows to `call_rows` it follows to `receipts`
+    /// too (#203): a rule on `receipts`, a foreign key on it whose action writes it, a view or
+    /// rule elsewhere that reaches it, a definer function whose owner can change it or turn off
+    /// `receipt_moves`, and a foreign key's action on another table whose owner can. Each would
+    /// let the gateway's role delete or rewrite a receipt, which its grants on `receipts` and
+    /// the trigger withhold, and each is refused as it is for `call_rows`.
     ///
     /// # What it requires
     ///
@@ -1202,22 +1222,24 @@ impl PgAuditStore {
     ///   owned by `switchboard_owner`, with the definition migration 0005 gives it, whitespace
     ///   aside, and with no options, such as `security_invoker`. The role may select from it,
     ///   and may do nothing else with it.
-    /// - `call_rows` is a table, not a view or foreign table of that name, and has no rule. A
-    ///   rule's statements run as the table's owner whenever the gateway writes.
-    /// - No foreign key on `call_rows` has a `CASCADE`, `SET NULL` or `SET DEFAULT` action on
-    ///   delete or on update. Such an action writes `call_rows`, as its owner, whenever a row of
-    ///   the table it references is deleted or updated, by any role that may. `NO ACTION` and
-    ///   `RESTRICT` only refuse a write. The migrations make no foreign key.
+    /// - `call_rows` is a table, not a view or foreign table of that name, and has no rule, and
+    ///   neither has `receipts`. A rule's statements run as the table's owner whenever the
+    ///   gateway writes.
+    /// - No foreign key on `call_rows` or on `receipts` has a `CASCADE`, `SET NULL` or
+    ///   `SET DEFAULT` action on delete or on update. Such an action writes the table, as its
+    ///   owner, whenever a row of the table it references is deleted or updated, by any role
+    ///   that may. `NO ACTION` and `RESTRICT` only refuse a write. The migrations' foreign keys,
+    ///   from `receipts` to `call_rows` and back, are `NO ACTION`.
     /// - Neither the role nor any role it can become, PUBLIC included, holds anything on a
     ///   view, materialized view or table with a rule, in any schema, that reaches `call_rows`
-    ///   directly or through other views and rules. A view runs with its owner's privileges,
-    ///   and a rule with its table's owner's. Neither owns one outside the schema: an owner
-    ///   that has revoked its own grants can grant them back.
+    ///   or `receipts` directly or through other views and rules. A view runs with its owner's
+    ///   privileges, and a rule with its table's owner's. Neither owns one outside the schema:
+    ///   an owner that has revoked its own grants can grant them back.
     /// - Neither can run, with EXECUTE, a `SECURITY DEFINER` function, in any schema, whose
-    ///   owner can read or change `call_rows` or turn off its triggers: one that holds a
-    ///   privilege on it, or on a view or rule that reaches it; or can act as the owner of the
-    ///   table, of such a view or rule, of the schema, or of the functions the table's
-    ///   triggers run; or can set `session_replication_role`; or is `pg_read_server_files`,
+    ///   owner can read or change `call_rows` or `receipts` or turn off their triggers: one that
+    ///   holds a privilege on either, or on a view or rule that reaches either; or can act as the
+    ///   owner of either table, of such a view or rule, of the schema, or of the functions the
+    ///   tables' triggers run; or can set `session_replication_role`; or is `pg_read_server_files`,
     ///   `pg_write_server_files` or `pg_execute_server_program`, which reach the server's
     ///   files and programs as a superuser does; or can run one of the catalog's functions
     ///   that reach those files, listed below, or a function in an untrusted language; or can
@@ -1229,9 +1251,9 @@ impl PgAuditStore {
     ///   a rule or a foreign key's cascade fires it as a direct one does. An event trigger
     ///   fires on statements any role may run, such as `CREATE TEMP TABLE`. The migrations'
     ///   trigger functions are not `SECURITY DEFINER`.
-    /// - No table other than `call_rows` holds a foreign key with a `CASCADE`, `SET NULL` or
-    ///   `SET DEFAULT` action, on delete or on update, when the table's owner can read or
-    ///   change `call_rows` or turn off its triggers, as a definer function's owner is counted
+    /// - No table other than `call_rows` and `receipts` holds a foreign key with a `CASCADE`,
+    ///   `SET NULL` or `SET DEFAULT` action, on delete or on update, when the table's owner can
+    ///   read or change either or turn off their triggers, as a definer function's owner is counted
     ///   above, or can run such a function, with EXECUTE or through a trigger on a table it can
     ///   write; a member of such a role, inherited or not, counts too. Postgres runs the action
     ///   as that owner, for any role that may delete or update a referenced row, and with it
@@ -1241,9 +1263,10 @@ impl PgAuditStore {
     ///   whatever the table has: a bare cascading key with no trigger, rule, check or default
     ///   is refused too. A foreign key that references `call_rows` passes: its action runs only
     ///   when an audit row is deleted or its key changes, which the gateway's role may not do.
-    ///   The migrations make no foreign key. In a database shared with other applications, a
-    ///   cascading key on a table owned by a superuser, or by any role that can reach
-    ///   `call_rows`, therefore stops the gateway from booting; narrowing this is #151.
+    ///   One that references `receipts` is judged like any other. In a database shared with
+    ///   other applications, a cascading key on a table owned by a superuser, or by any role
+    ///   that can reach `call_rows` or `receipts`, therefore stops the gateway from booting;
+    ///   narrowing this is #151.
     /// - Neither can run the catalog's functions that read or write the server's own files:
     ///   `lo_export`, `lo_import`, `pg_read_file`, `pg_read_binary_file`, `pg_ls_dir`,
     ///   `pg_stat_file`, and adminpack's `pg_file_*` where the server has them.
@@ -1259,17 +1282,16 @@ impl PgAuditStore {
     /// migrations make.
     ///
     /// - Anything changed after it passes, until the next boot. Making a grant, view, rule or
-    ///   function that reaches `call_rows` needs a role the check refuses to the gateway.
+    ///   function that reaches `call_rows` or `receipts` needs a role the check refuses to the
+    ///   gateway.
     /// - Functions in C from an extension. Only a superuser installs C code, and the catalog
     ///   cannot say what it does.
     /// - A way back in through another connection: `postgres_fdw` or `dblink`, through a user
     ///   mapping or a function that holds another role's password, can reach `call_rows` as
     ///   that role. Only an administrator stores that password. A foreign table in
     ///   `switchboard_audit` is refused; one elsewhere is not followed to where it connects.
-    /// - The routes it follows to `call_rows`, through views, rules, definer functions and
-    ///   foreign keys' actions, it does not yet follow to `receipts`. A rule on `receipts`, a
-    ///   view over it in another schema, or a definer function whose owner can write it, is
-    ///   not refused.
+    /// - The routes it follows to `call_rows` and `receipts` it does not yet follow to
+    ///   `receipt_lookups`. Its grants and its trigger `lookup_appends` are checked.
     ///
     /// It asks whether a role is able once per role, where it used to ask that once for every
     /// pair of a definer function and a role, and its walk over definer functions reads small
@@ -1362,6 +1384,9 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
                 row.get::<_, bool>(1),
             )
         });
+    // The audit tables found, `call_rows` first and then `receipts`, for the routes that reach
+    // them other than through the grants on them.
+    let mut audited = Vec::new();
     match table {
         None => problems.push(Problem::TableMissing),
         Some((table, partitioned)) => {
@@ -1372,8 +1397,8 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
             unlogged(client, table, &mut problems).await?;
             columns(client, table, "call_rows", COLUMNS, &mut problems).await?;
             triggers(client, &mut problems).await?;
-            rules(client, table, &mut problems).await?;
-            referential_actions(client, table, &mut problems).await?;
+            rules(client, table, CALL_ROWS, &mut problems).await?;
+            referential_actions(client, table, CALL_ROWS, &mut problems).await?;
             column_privileges(
                 client,
                 table,
@@ -1386,16 +1411,22 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
                 &mut problems,
             )
             .await?;
-            receipts(client, &mut problems).await?;
+            audited.push(table);
+            if let Some(receipts) = receipts(client, &mut problems).await? {
+                audited.push(receipts);
+            }
         }
     }
     other_privileges(client, version, &mut problems).await?;
     open_rows(client, &mut problems).await?;
     if let Some((table, _)) = table {
-        reaching_privileges(client, table, version, &mut problems).await?;
-        let found = able(client, table, version).await?;
+        // The routes around the grants, followed to each audit table: a view or rule that
+        // reaches one, a definer function whose owner can change one, and a foreign key's
+        // action on another table whose owner can.
+        reaching_privileges(client, &audited, version, &mut problems).await?;
+        let found = able(client, &audited, version).await?;
         definers(client, &found, &mut problems).await?;
-        cascade_actions(client, table, &found, &mut problems).await?;
+        cascade_actions(client, table, &audited, &found, &mut problems).await?;
     }
     server_functions(client, &mut problems).await?;
     untrusted_functions(client, &mut problems).await?;
@@ -1667,9 +1698,11 @@ fn trigger_problem(trigger: &Trigger, enabled: Option<&str>) -> Option<Problem> 
     }
 }
 
+/// Every rule on the audit table `table`, named `name` in reports.
 async fn rules(
     client: &ClientWrapper,
     table: tokio_postgres::types::Oid,
+    name: &str,
     problems: &mut Vec<Problem>,
 ) -> Result<(), tokio_postgres::Error> {
     let found = client
@@ -1679,19 +1712,20 @@ async fn rules(
             &[&table],
         )
         .await?;
-    problems.extend(
-        found
-            .into_iter()
-            .map(|row| Problem::Rule { rule: row.get(0) }),
-    );
+    problems.extend(found.into_iter().map(|row| Problem::Rule {
+        table: name.to_owned(),
+        rule: row.get(0),
+    }));
     Ok(())
 }
 
-/// Every foreign key on `table` whose action on a delete or an update of the row it references
-/// writes `table`: `CASCADE` ('c'), `SET NULL` ('n') or `SET DEFAULT` ('d'). `NO ACTION` ('a')
-/// and `RESTRICT` ('r') only refuse the write. Postgres runs the action as the owner of the
-/// table that holds the key, whoever deleted or updated the referenced row, so one is a write
-/// path into `call_rows` as a rule on it is.
+/// Every foreign key on the audit table `table`, named `name` in reports, whose action on a
+/// delete or an update of the row it references writes `table`: `CASCADE` ('c'), `SET NULL`
+/// ('n') or `SET DEFAULT` ('d'). `NO ACTION` ('a') and `RESTRICT` ('r') only refuse the write.
+/// Postgres runs the action as the owner of the table that holds the key, whoever deleted or
+/// updated the referenced row, so one is a write path into the table as a rule on it is. It is
+/// asked of `call_rows` and of `receipts`, whose migrations' foreign keys, to each other, are
+/// `NO ACTION`.
 ///
 /// A foreign key on another table that references `call_rows` passes. Its action writes that
 /// other table, not `call_rows`, and the gateway's role cannot set it off. The action fires only
@@ -1703,11 +1737,13 @@ async fn rules(
 /// none of those columns and never changes, or its old value has a NULL and Postgres takes no
 /// action. The one exception is `resources` and `resources_omitted`, which the completion of a
 /// row begun with unknown resources writes once (migration 0011): a key on them can change
-/// then, and its action writes only the referencing table. A foreign key on another table, whose action runs as that table's owner, is
-/// [`cascade_actions`]'.
+/// then, and its action writes only the referencing table. A foreign key on another table, whose
+/// action runs as that table's owner, is [`cascade_actions`]', and so is one that references
+/// `receipts`.
 async fn referential_actions(
     client: &ClientWrapper,
     table: tokio_postgres::types::Oid,
+    name: &str,
     problems: &mut Vec<Problem>,
 ) -> Result<(), tokio_postgres::Error> {
     let found = client
@@ -1727,6 +1763,7 @@ async fn referential_actions(
         )
         .await?;
     problems.extend(found.into_iter().map(|row| Problem::ReferentialAction {
+        table: name.to_owned(),
         constraint: row.get(0),
         referenced: row.get(1),
         event: row.get(2),
@@ -1846,21 +1883,25 @@ async fn ordinary_table(
 /// columns what the store needs of receipts and nothing more: [`RECEIPT_INSERTED`],
 /// [`RECEIPT_UPDATED`] and [`RECEIPT_SELECTED`]. Anything on the table as a whole, `DELETE`
 /// among them, is refused with the rest of the schema by `other_privileges`; its trigger is
-/// checked with the others. Then the same of the lookup table, [`lookups`].
+/// checked with the others. It has no rule and no foreign key whose action writes it, as for
+/// `call_rows`. Then the same of the lookup table, [`lookups`]. The receipt table, if it is
+/// there, for the routes [`check`] follows to it after.
 async fn receipts(
     client: &ClientWrapper,
     problems: &mut Vec<Problem>,
-) -> Result<(), tokio_postgres::Error> {
+) -> Result<Option<tokio_postgres::types::Oid>, tokio_postgres::Error> {
     let Some(table) = ordinary_table(client, RECEIPTS).await? else {
         problems.push(Problem::ReceiptsMissing);
-        return Ok(());
+        return Ok(None);
     };
     unlogged(client, table, problems).await?;
     columns(client, table, RECEIPTS, RECEIPT_COLUMNS, problems).await?;
+    rules(client, table, RECEIPTS_TABLE, problems).await?;
+    referential_actions(client, table, RECEIPTS_TABLE, problems).await?;
     column_privileges(
         client,
         table,
-        &format!("switchboard_audit.{RECEIPTS}"),
+        RECEIPTS_TABLE,
         [
             ("INSERT", RECEIPT_INSERTED),
             ("UPDATE", RECEIPT_UPDATED),
@@ -1869,7 +1910,8 @@ async fn receipts(
         problems,
     )
     .await?;
-    lookups(client, problems).await
+    lookups(client, problems).await?;
+    Ok(Some(table))
 }
 
 /// The lookup table is there, as a table that is not unlogged, with every column the store
@@ -2087,22 +2129,25 @@ async fn open_rows(
 }
 
 /// Nothing, for the session's role or any role it can become, PUBLIC included, on any view,
-/// materialized view or table with a rule, in another schema, that reaches `call_rows`
-/// ([`REACHING`]); and neither owns one. An owner that has revoked its own privileges can grant
-/// them back, and a materialized view's owner can read what it copied from `call_rows`. Those
-/// in the schema are refused with everything else there.
+/// materialized view or table with a rule, in another schema, that reaches an audit table in
+/// `tables`, `call_rows` or `receipts` ([`REACHING`]); and neither owns one. An owner that has
+/// revoked its own privileges can grant them back, and a materialized view's owner can read what
+/// it copied from the table. A grant on a view over `receipts` can let a role delete or rewrite a
+/// receipt, which the grants on `receipts` withhold, as one over `call_rows` can an audit row.
+/// Those in the schema are refused with everything else there.
 async fn reaching_privileges(
     client: &ClientWrapper,
-    table: tokio_postgres::types::Oid,
+    tables: &[tokio_postgres::types::Oid],
     version: i32,
     problems: &mut Vec<Problem>,
 ) -> Result<(), tokio_postgres::Error> {
     let privileges = table_privileges(version);
+    // A relation that reaches both tables is found once for each; it is reported once.
     let held = client
         .query(
             &format!(
                 "WITH RECURSIVE {REACHING}
-                 SELECT n.nspname || '.' || v.relname, p
+                 SELECT DISTINCT n.nspname || '.' || v.relname, p
                  FROM reaching x
                      JOIN pg_catalog.pg_class v ON v.oid = x.oid
                      JOIN pg_catalog.pg_namespace n ON n.oid = v.relnamespace,
@@ -2114,7 +2159,7 @@ async fn reaching_privileges(
                 by_any_role("has_table_privilege(r.oid, v.oid, p)"),
                 by_any_role("has_any_column_privilege(r.oid, v.oid, p)"),
             ),
-            &[&table, &privileges],
+            &[&tables, &privileges],
         )
         .await?;
     for row in held {
@@ -2123,20 +2168,22 @@ async fn reaching_privileges(
             object: row.get(0),
         });
     }
+    // Named with the table it reaches, once for each it reaches.
     let owned = client
         .query(
             &format!(
                 "WITH RECURSIVE {REACHING}
-                 SELECT 'the relation ' || n.nspname || '.' || v.relname
-                        || ', which reaches {CALL_ROWS}'
+                 SELECT DISTINCT 'the relation ' || n.nspname || '.' || v.relname
+                        || ', which reaches switchboard_audit.' || t.relname
                  FROM reaching x
                      JOIN pg_catalog.pg_class v ON v.oid = x.oid
                      JOIN pg_catalog.pg_namespace n ON n.oid = v.relnamespace
+                     JOIN pg_catalog.pg_class t ON t.oid = x.root
                  WHERE n.nspname <> 'switchboard_audit'
                      AND pg_has_role(current_user, v.relowner, 'MEMBER')
                  ORDER BY 1"
             ),
-            &[&table],
+            &[&tables],
         )
         .await?;
     problems.extend(
@@ -2147,15 +2194,16 @@ async fn reaching_privileges(
     Ok(())
 }
 
-/// No `SECURITY DEFINER` function, in any schema, that runs as a role able to read or change
-/// `call_rows`, or turn off its triggers, may be run by the session's role or a role it can
-/// become, PUBLIC included, which holds EXECUTE on every new function unless it is revoked.
+/// No `SECURITY DEFINER` function, in any schema, that runs as a role able to read or change an
+/// audit table, `call_rows` or `receipts`, or turn off its triggers, may be run by the session's
+/// role or a role it can become, PUBLIC included, which holds EXECUTE on every new function
+/// unless it is revoked.
 ///
-/// A function's owner is able when it holds a privilege on `call_rows` or on anything
+/// A function's owner is able when it holds a privilege on an audit table or on anything
 /// [`REACHING`] finds, superusers among them since they hold every privilege; when it can act
 /// as the owner of one of those, which may grant itself any privilege on it, or of the schema,
-/// which may drop the table, or of a function the table's triggers run (`set_times` and
-/// `complete_once`), which may drop the trigger with it; when it can set
+/// which may drop the table, or of a function the tables' triggers run (`set_times`,
+/// `complete_once` and `receipt_moves`), which may drop the trigger with it; when it can set
 /// `session_replication_role`, under which neither trigger fires; or when it can run another
 /// such function, itself or through a trigger on a table it can write. An owner that is one of
 /// [`SERVER_ROLES`] is able too: it reaches the server's files and programs, and through them
@@ -2261,10 +2309,12 @@ async fn definers(
     Ok(())
 }
 
-/// No table other than `call_rows` may hold a foreign key whose action on a delete or an
-/// update of the row it references writes that table (`CASCADE`, `SET NULL` or `SET DEFAULT`),
-/// when the table's owner is able ([`able`]: a member, inherited or not, of an able role, or
-/// of one that can run a definer function whose owner is able, as [`able`] finds them).
+/// No table other than the audit tables `tables` may hold a foreign key whose action on a
+/// delete or an update of the row it references writes that table (`CASCADE`, `SET NULL` or
+/// `SET DEFAULT`), when the table's owner is able ([`able`]: a member, inherited or not, of an
+/// able role, or of one that can run a definer function whose owner is able, as [`able`] finds
+/// them). An owner that can delete or rewrite a receipt is able, so such an action can no more
+/// reach `receipts` than `call_rows`.
 ///
 /// Postgres runs a foreign key's action as the owner of the table that holds the key, whether
 /// or not anything it sets off is `SECURITY DEFINER`, for any role that may delete or update a
@@ -2280,13 +2330,16 @@ async fn definers(
 /// there. So only a foreign key that is not a partition's copy is judged, by the owner of the
 /// table that holds it.
 ///
-/// A foreign key on `call_rows` itself is [`referential_actions`]'. One that references
-/// `call_rows` acts only when an audit row is deleted, which the gateway's role may not do, or
-/// when its referenced key changes, which an update of the completion cannot do, but for a key
-/// on the resources a completion writes once, as [`referential_actions`] says; it passes.
+/// A foreign key on an audit table itself is [`referential_actions`]', which refuses its action
+/// whoever owns the table. One that references `call_rows`, `table`, acts only when an audit
+/// row is deleted, which the gateway's role may not do, or when its referenced key changes,
+/// which an update of the completion cannot do, but for a key on the resources a completion
+/// writes once, as [`referential_actions`] says; it passes. One that references `receipts` is
+/// judged here like any other.
 async fn cascade_actions(
     client: &ClientWrapper,
     table: tokio_postgres::types::Oid,
+    tables: &[tokio_postgres::types::Oid],
     able: &Able,
     problems: &mut Vec<Problem>,
 ) -> Result<(), tokio_postgres::Error> {
@@ -2302,13 +2355,13 @@ async fn cascade_actions(
                      JOIN pg_catalog.pg_class r ON r.oid = k.confrelid
                      JOIN pg_catalog.pg_namespace rn ON rn.oid = r.relnamespace
                  WHERE k.contype = 'f' AND k.conparentid = 0
-                     AND k.conrelid <> $1::oid AND k.confrelid <> $1::oid
+                     AND k.conrelid <> ALL($3::oid[]) AND k.confrelid <> $1::oid
                      AND (k.confdeltype NOT IN ('a', 'r') OR k.confupdtype NOT IN ('a', 'r'))
                      AND {}
                  ORDER BY 1, 3",
                 by_any_member("tbl.relowner", "$2"),
             ),
-            &[&table, &able.roles],
+            &[&table, &able.roles, &tables],
         )
         .await?;
     problems.extend(found.into_iter().map(|row| Problem::CascadeAction {
@@ -2588,8 +2641,9 @@ mod tests {
                     by: "EXECUTE on it".into(),
                 },
                 "the SECURITY DEFINER function reports.take() runs as audit_table_owner, which \
-                 can read or change switchboard_audit.call_rows or turn off its triggers, and \
-                 this session's role, or a role it can become, holds EXECUTE on it",
+                 can read or change switchboard_audit.call_rows or switchboard_audit.receipts, \
+                 or turn off their triggers, and this session's role, or a role it can become, \
+                 holds EXECUTE on it",
             ),
             (
                 Problem::DefinerTrigger {
@@ -2600,9 +2654,9 @@ mod tests {
                 },
                 "the trigger purge_rows on reports.notes runs the SECURITY DEFINER function \
                  reports.purge_rows() as switchboard_owner, which can read or change \
-                 switchboard_audit.call_rows or turn off its triggers; a trigger asks for no \
-                 EXECUTE, and any write that reaches reports.notes, through a view, a rule or \
-                 a foreign key, fires it",
+                 switchboard_audit.call_rows or switchboard_audit.receipts, or turn off their \
+                 triggers; a trigger asks for no EXECUTE, and any write that reaches \
+                 reports.notes, through a view, a rule or a foreign key, fires it",
             ),
             (
                 Problem::DefinerEventTrigger {
@@ -2612,8 +2666,8 @@ mod tests {
                 },
                 "the enabled event trigger purge_on_ddl runs the SECURITY DEFINER function \
                  reports.purge_on_ddl() as switchboard_owner, which can read or change \
-                 switchboard_audit.call_rows or turn off its triggers, on statements any role \
-                 may run",
+                 switchboard_audit.call_rows or switchboard_audit.receipts, or turn off their \
+                 triggers, on statements any role may run",
             ),
             (
                 Problem::UntrustedLanguage {
@@ -2648,6 +2702,7 @@ mod tests {
             ),
             (
                 Problem::ReferentialAction {
+                    table: "switchboard_audit.call_rows".into(),
                     constraint: "purge".into(),
                     referenced: "reports.parents".into(),
                     event: "UPDATE".into(),
@@ -2655,8 +2710,16 @@ mod tests {
                 },
                 "the table switchboard_audit.call_rows has the foreign key purge, which \
                  references reports.parents with ON UPDATE SET DEFAULT, so each UPDATE on \
-                 reports.parents, by any role that may make one, writes audit rows as the \
-                 table's owner",
+                 reports.parents, by any role that may make one, writes rows of \
+                 switchboard_audit.call_rows as the table's owner",
+            ),
+            (
+                Problem::Rule {
+                    table: "switchboard_audit.receipts".into(),
+                    rule: "also_purge".into(),
+                },
+                "the table switchboard_audit.receipts has the rule also_purge, whose statements \
+                 run as the table's owner when the gateway writes",
             ),
         ];
         for (problem, expected) in cases {

@@ -5,6 +5,7 @@ use tokio_postgres::NoTls;
 
 use std::collections::BTreeSet;
 
+use super::receipts::{fresh_id, receipt_in};
 use super::{DUMMY_PASSWORD, GATEWAY_ROLE, OWNER_ROLE, TestDatabase, connect};
 use crate::check::{
     INSERTED, LOOKUP_INSERTED, LOOKUP_SELECTED, OPEN_ROWS_DEFINITION, RECEIPT_INSERTED,
@@ -1681,6 +1682,7 @@ async fn a_rule_on_the_table_is_refused() {
     assert_eq!(
         problems,
         &vec![Problem::Rule {
+            table: "switchboard_audit.call_rows".into(),
             rule: "also_purge".into()
         }]
     );
@@ -2427,6 +2429,7 @@ async fn a_foreign_key_on_the_table_whose_action_writes_it_is_refused() {
         .await
         .unwrap();
     let action = |constraint: &str, event: &str, action: &str| Problem::ReferentialAction {
+        table: "switchboard_audit.call_rows".into(),
         constraint: constraint.into(),
         referenced: "reports.parents".into(),
         event: event.into(),
@@ -2444,7 +2447,7 @@ async fn a_foreign_key_on_the_table_whose_action_writes_it_is_refused() {
         found[1].to_string(),
         "the table switchboard_audit.call_rows has the foreign key purge, which references \
          reports.parents with ON DELETE CASCADE, so each DELETE on reports.parents, by any role \
-         that may make one, writes audit rows as the table's owner"
+         that may make one, writes rows of switchboard_audit.call_rows as the table's owner"
     );
     // What the check refuses is real: the gateway, which may not delete an audit row, deletes
     // one by deleting the row it references.
@@ -2952,8 +2955,9 @@ async fn a_foreign_key_whose_action_fires_a_trigger_is_refused_when_its_owner_is
         found[0].to_string(),
         "the table reports.children has the foreign key follow, whose action writes \
          reports.children as its owner switchboard_owner, which can read or change \
-         switchboard_audit.call_rows or turn off its triggers: each delete or update on \
-         reports.parents, by any role that may make one, runs that action, and the triggers, \
+         switchboard_audit.call_rows or switchboard_audit.receipts, or turn off their \
+         triggers: each delete or update on reports.parents, by any role that may make one, \
+         runs that action, and the triggers, \
          rules, checks and defaults it sets off, as switchboard_owner"
     );
     // What the check refuses is real, as the issue found: the gateway's delete on the parent
@@ -3496,5 +3500,324 @@ async fn many_harmless_definer_functions_pass_well_inside_the_boot_budget() {
     assert!(
         took < std::time::Duration::from_secs(5),
         "the check took {took:?}"
+    );
+}
+
+// --- The routes around the grants, followed to receipts (#203) ----------------------------------
+
+/// A receipt `pending` under an allowed row whose deadline is an hour away, written as the
+/// superuser, and its row's identifier, which is also its key.
+async fn a_receipt(db: &TestDatabase) -> String {
+    let admin = db.admin().await;
+    let id = fresh_id(&admin).await;
+    receipt_in(&admin, &id, &id, "pending", false).await;
+    id
+}
+
+/// How many receipts there are, as the superuser counts them.
+async fn receipts(db: &TestDatabase) -> i64 {
+    db.admin()
+        .await
+        .query_one("SELECT count(*) FROM switchboard_audit.receipts", &[])
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// A rule on `receipts` runs its statements as the table's owner whenever the gateway writes a
+/// receipt: here settling one deletes it, which the gateway's grants and `receipt_moves` never
+/// let it do. It is refused as a rule on `call_rows` is.
+#[tokio::test]
+async fn a_rule_on_the_receipt_table_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "SET ROLE {OWNER_ROLE};
+             CREATE RULE also_purge AS ON UPDATE TO switchboard_audit.receipts
+                 DO ALSO DELETE FROM switchboard_audit.receipts WHERE row_id = OLD.row_id;"
+        ))
+        .await
+        .unwrap();
+    let found = problems_of(&db).await;
+    assert_eq!(
+        found,
+        vec![Problem::Rule {
+            table: "switchboard_audit.receipts".into(),
+            rule: "also_purge".into()
+        }]
+    );
+    assert_eq!(
+        found[0].to_string(),
+        "the table switchboard_audit.receipts has the rule also_purge, whose statements run as \
+         the table's owner when the gateway writes"
+    );
+
+    // What the check refuses is real: the gateway settles a receipt, and it is gone.
+    let receipt = a_receipt(&db).await;
+    db.connect_as(GATEWAY_ROLE)
+        .await
+        .batch_execute(&format!(
+            "UPDATE switchboard_audit.receipts SET state = 'completed', established_by = 'call'
+             WHERE row_id = '{receipt}'"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(receipts(&db).await, 0);
+}
+
+/// A foreign key on `receipts` whose action writes it runs as the table's owner whenever a row
+/// it references is deleted or updated, by any role that may: here the gateway deletes a
+/// receipt by deleting the row it references. It is refused as one on `call_rows` is, whoever
+/// owns the table; one that only refuses a write passes.
+#[tokio::test]
+async fn a_foreign_key_on_the_receipt_table_whose_action_writes_it_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let receipt = a_receipt(&db).await;
+    let admin = db.admin().await;
+    admin
+        .batch_execute(&format!(
+            "CREATE SCHEMA reports AUTHORIZATION {OWNER_ROLE};
+             GRANT USAGE ON SCHEMA reports TO PUBLIC;
+             SET ROLE {OWNER_ROLE};
+             CREATE TABLE reports.parents (id uuid PRIMARY KEY);
+             INSERT INTO reports.parents VALUES ('{receipt}');
+             ALTER TABLE switchboard_audit.receipts
+                 ADD CONSTRAINT purge FOREIGN KEY (row_id) REFERENCES reports.parents
+                     ON DELETE CASCADE;
+             GRANT DELETE ON reports.parents TO {GATEWAY_ROLE};
+             RESET ROLE;"
+        ))
+        .await
+        .unwrap();
+    let found = problems_of(&db).await;
+    assert_eq!(
+        found,
+        vec![Problem::ReferentialAction {
+            table: "switchboard_audit.receipts".into(),
+            constraint: "purge".into(),
+            referenced: "reports.parents".into(),
+            event: "DELETE".into(),
+            action: "CASCADE".into(),
+        }]
+    );
+    assert_eq!(
+        found[0].to_string(),
+        "the table switchboard_audit.receipts has the foreign key purge, which references \
+         reports.parents with ON DELETE CASCADE, so each DELETE on reports.parents, by any role \
+         that may make one, writes rows of switchboard_audit.receipts as the table's owner"
+    );
+
+    // What the check refuses is real: the gateway, which may not delete a receipt, deletes one.
+    db.connect_as(GATEWAY_ROLE)
+        .await
+        .batch_execute("DELETE FROM reports.parents")
+        .await
+        .unwrap();
+    assert_eq!(receipts(&db).await, 0);
+
+    // A foreign key that only refuses a write passes.
+    let receipt = a_receipt(&db).await;
+    admin
+        .batch_execute(&format!(
+            "SET ROLE {OWNER_ROLE};
+             ALTER TABLE switchboard_audit.receipts DROP CONSTRAINT purge;
+             INSERT INTO reports.parents VALUES ('{receipt}');
+             ALTER TABLE switchboard_audit.receipts
+                 ADD CONSTRAINT kept FOREIGN KEY (row_id) REFERENCES reports.parents
+                     ON DELETE RESTRICT ON UPDATE NO ACTION;
+             RESET ROLE;"
+        ))
+        .await
+        .unwrap();
+    db.store(PoolSizes::default())
+        .check_at_boot()
+        .await
+        .unwrap();
+}
+
+/// A grant on a view over `receipts` in another schema, or on a table there whose rule writes
+/// `receipts`, lets a role delete a receipt, which the grants on `receipts` withhold, as one
+/// over `call_rows` lets it change an audit row. So does owning such a view: its owner can
+/// grant itself back what it revoked. Each is refused as it is for `call_rows`.
+#[tokio::test]
+async fn a_grant_on_a_view_or_rule_that_reaches_the_receipt_table_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let deleter = db.new_role("NOLOGIN", &[]).await;
+    let role = db.new_role("LOGIN", &[GATEWAY_ROLE]).await;
+    db.cluster_wide(&format!("GRANT {deleter} TO {role} WITH INHERIT FALSE"))
+        .await;
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "SET ROLE {OWNER_ROLE};
+             CREATE SCHEMA reports;
+             CREATE VIEW reports.receipts AS SELECT * FROM switchboard_audit.receipts;
+             CREATE TABLE reports.inbox (id uuid);
+             CREATE RULE purge AS ON INSERT TO reports.inbox
+                 DO ALSO DELETE FROM switchboard_audit.receipts WHERE row_id = NEW.id;
+             GRANT USAGE ON SCHEMA reports TO PUBLIC;
+             GRANT SELECT ON reports.receipts TO PUBLIC;
+             GRANT DELETE ON reports.receipts TO {deleter};
+             GRANT INSERT (id) ON reports.inbox TO {GATEWAY_ROLE};
+             CREATE VIEW reports.mine AS SELECT row_id FROM switchboard_audit.receipts;
+             RESET ROLE;
+             ALTER VIEW reports.mine OWNER TO {GATEWAY_ROLE};
+             REVOKE ALL ON reports.mine FROM {GATEWAY_ROLE};"
+        ))
+        .await
+        .unwrap();
+    let found = problems(&db.store_as(&role)).await;
+    assert_eq!(
+        found,
+        vec![
+            extra("INSERT", "reports.inbox"),
+            extra("DELETE", "reports.receipts"),
+            extra("SELECT", "reports.receipts"),
+            Problem::Owns {
+                object: "the relation reports.mine, which reaches switchboard_audit.receipts"
+                    .into()
+            },
+        ]
+    );
+
+    // What the check refuses is real: the role deletes receipts through the view, as the role
+    // it can become, and through the rule, as itself.
+    let first = a_receipt(&db).await;
+    let second = a_receipt(&db).await;
+    db.connect_as(&role)
+        .await
+        .batch_execute(&format!(
+            "SET ROLE {deleter};
+             DELETE FROM reports.receipts WHERE row_id = '{first}';
+             RESET ROLE;
+             INSERT INTO reports.inbox (id) VALUES ('{second}');"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(receipts(&db).await, 0);
+}
+
+/// A `SECURITY DEFINER` function whose owner can delete receipts, though it holds nothing on
+/// `call_rows`, lets whoever can run it delete them; so does one whose owner owns
+/// `receipt_moves`, which can drop the trigger. A foreign key's action on a table owned by a
+/// role that can delete receipts runs as that role, and the table's triggers with it. Each is
+/// refused as it is when the owner can change `call_rows`.
+#[tokio::test]
+async fn a_definer_or_a_foreign_keys_action_whose_owner_can_change_receipts_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let deleter = db.new_role("NOLOGIN", &[]).await;
+    let admin = db.admin().await;
+    admin
+        .batch_execute(&format!(
+            "CREATE SCHEMA reports AUTHORIZATION {OWNER_ROLE};
+             GRANT USAGE ON SCHEMA reports TO PUBLIC;
+             GRANT CREATE ON SCHEMA reports TO {deleter};
+             SET ROLE {OWNER_ROLE};
+             GRANT USAGE ON SCHEMA switchboard_audit TO {deleter};
+             GRANT DELETE ON switchboard_audit.receipts TO {deleter};
+             SET ROLE {deleter};
+             CREATE FUNCTION reports.forget() RETURNS void
+                 LANGUAGE sql SECURITY DEFINER AS 'DELETE FROM switchboard_audit.receipts';
+             REVOKE EXECUTE ON FUNCTION reports.forget() FROM PUBLIC;
+             GRANT EXECUTE ON FUNCTION reports.forget() TO {GATEWAY_ROLE};
+             RESET ROLE;"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems_of(&db).await,
+        vec![definer("reports.forget()", &deleter, "EXECUTE on it")]
+    );
+    // What the check refuses is real.
+    a_receipt(&db).await;
+    let gateway = db.connect_as(GATEWAY_ROLE).await;
+    gateway
+        .batch_execute("SELECT reports.forget()")
+        .await
+        .unwrap();
+    assert_eq!(receipts(&db).await, 0);
+
+    // A cascading foreign key on a table the same role owns, whose plain trigger deletes
+    // receipts: the gateway's delete of a parent row runs the action, and the trigger, as that
+    // role.
+    admin
+        .batch_execute(&format!(
+            "DROP FUNCTION reports.forget();
+             SET ROLE {OWNER_ROLE};
+             CREATE TABLE reports.parents (id uuid PRIMARY KEY);
+             CREATE TABLE reports.children (
+                 parent uuid CONSTRAINT follow REFERENCES reports.parents ON DELETE CASCADE
+             );
+             CREATE FUNCTION reports.on_child_delete() RETURNS trigger
+                 LANGUAGE plpgsql
+                 AS $$BEGIN DELETE FROM switchboard_audit.receipts; RETURN OLD; END$$;
+             CREATE TRIGGER on_child_delete BEFORE DELETE ON reports.children
+                 FOR EACH ROW EXECUTE FUNCTION reports.on_child_delete();
+             INSERT INTO reports.parents VALUES ('00000000-0000-0000-0000-000000000001');
+             INSERT INTO reports.children VALUES ('00000000-0000-0000-0000-000000000001');
+             GRANT SELECT, DELETE ON reports.parents TO {GATEWAY_ROLE};
+             RESET ROLE;
+             ALTER TABLE reports.children OWNER TO {deleter};"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems_of(&db).await,
+        vec![cascade_action("reports.children", &deleter)]
+    );
+    a_receipt(&db).await;
+    gateway
+        .batch_execute("DELETE FROM reports.parents")
+        .await
+        .unwrap();
+    assert_eq!(receipts(&db).await, 0);
+
+    // The owner of receipt_moves can drop it, and the trigger with it, though it holds nothing
+    // on either table.
+    let db = TestDatabase::create().await.unwrap();
+    let function_owner = db.new_role("NOLOGIN", &[]).await;
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "CREATE SCHEMA reports AUTHORIZATION {OWNER_ROLE};
+             GRANT USAGE ON SCHEMA reports TO PUBLIC;
+             GRANT USAGE ON SCHEMA switchboard_audit TO {function_owner};
+             ALTER FUNCTION switchboard_audit.receipt_moves() OWNER TO {function_owner};
+             CREATE FUNCTION reports.loosen() RETURNS void
+                 LANGUAGE sql SECURITY DEFINER
+                 AS 'DROP FUNCTION switchboard_audit.receipt_moves() CASCADE';
+             ALTER FUNCTION reports.loosen() OWNER TO {function_owner};
+             REVOKE EXECUTE ON FUNCTION reports.loosen() FROM PUBLIC;
+             GRANT EXECUTE ON FUNCTION reports.loosen() TO {GATEWAY_ROLE};"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems_of(&db).await,
+        vec![definer(
+            "reports.loosen()",
+            &function_owner,
+            "EXECUTE on it"
+        )]
+    );
+    // What the check refuses is real: the trigger that moves a receipt only as its state table
+    // allows is gone.
+    db.connect_as(GATEWAY_ROLE)
+        .await
+        .batch_execute("SELECT reports.loosen()")
+        .await
+        .unwrap();
+    assert!(
+        problems_of(&db).await.contains(&missing("receipt_moves")),
+        "receipt_moves is still on the table"
     );
 }
