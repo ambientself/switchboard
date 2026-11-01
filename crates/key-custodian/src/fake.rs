@@ -15,7 +15,8 @@
 //! It can be told to refuse, fail, hang, widen what it issues, write the names of the
 //! repositories it issues for in capitals, or issue tokens that expire sooner than GitHub's hour
 //! (see [`Behaviour`]), and to fail the next revocations with 500
-//! (see [`FakeGitHub::fail_revocations`]). An administrator can add a repository to the
+//! (see [`FakeGitHub::fail_revocations`]), or to revoke and still answer 500
+//! ([`FakeGitHub::apply_and_fail_revocations`]). An administrator can add a repository to the
 //! installation or drop one from it ([`FakeGitHub::add_repository`],
 //! [`FakeGitHub::drop_repository`]), which changes what a token asked for with no repositories
 //! reaches, and what the fake GitHub REST API reports as the installation's repositories. It keeps every token it issued and revoked, when
@@ -107,6 +108,7 @@ struct FakeState {
     issued: Vec<IssuedToken>,
     revoked: Vec<String>,
     revocations_to_fail: usize,
+    revocations_to_apply_and_fail: usize,
     revocation_attempts: Vec<u64>,
     /// The repositories the installation is on now.
     installed: BTreeSet<String>,
@@ -148,6 +150,7 @@ impl FakeGitHub {
                 issued: Vec::new(),
                 revoked: Vec::new(),
                 revocations_to_fail: 0,
+                revocations_to_apply_and_fail: 0,
                 revocation_attempts: Vec::new(),
                 installed,
             }),
@@ -201,6 +204,13 @@ impl FakeGitHub {
     /// Answers the next `count` revocations with 500, revoking nothing.
     pub fn fail_revocations(&self, count: usize) {
         self.shared.lock().revocations_to_fail = count;
+    }
+
+    /// Revokes the token of each of the next `count` revocations and answers it 500, as GitHub
+    /// may when it applies a revocation and fails before it answers. Asked again, it answers
+    /// 401: the token no longer authenticates.
+    pub fn apply_and_fail_revocations(&self, count: usize) {
+        self.shared.lock().revocations_to_apply_and_fail = count;
     }
 
     /// When each revocation arrived, failed or not, in seconds since the epoch.
@@ -432,5 +442,9 @@ async fn revoke(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respon
         return error(StatusCode::UNAUTHORIZED, "Bad credentials");
     }
     state.revoked.push(token.to_owned());
+    if state.revocations_to_apply_and_fail > 0 {
+        state.revocations_to_apply_and_fail -= 1;
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "failed after revoking");
+    }
     StatusCode::NO_CONTENT.into_response()
 }
