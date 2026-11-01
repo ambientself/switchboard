@@ -1,6 +1,6 @@
 //! What the gateway logs of a turn grant it refuses (decision 0012, design section 11): an
 //! audience or pod failure at `ERROR`, to be investigated, with the grant's digest; a lifetime
-//! failure not at all, only counted; any other failure at `WARN`, with no digest unless the
+//! failure not at all, only counted; any other failure at `WARN`, with no digest even when its
 //! signature verified; and nothing from any refused grant's claims. The counters export each
 //! failure by kind and each accepted grant by key ID.
 //!
@@ -143,6 +143,14 @@ async fn grant_failures_are_logged_by_kind_with_nothing_from_their_claims() {
         &gateway_otto::minter::parts(&stranger.mint(&claims(now)))[3],
     );
     send(forged, POD).send(&server).await.denial();
+    // Signed, so its signature verifies, and its claims are malformed: not a binding's failure,
+    // so it is logged with no digest.
+    let mut negative_epoch = claims(now);
+    negative_epoch["epoch"] = json!(-7);
+    send(minter.mint(&negative_epoch), POD)
+        .send(&server)
+        .await
+        .denial();
     let good = minter.mint(&claims(now));
     let answer = send(good, POD).send(&server).await;
     assert_eq!(answer.result()["isError"], json!(false));
@@ -163,6 +171,7 @@ async fn grant_failures_are_logged_by_kind_with_nothing_from_their_claims() {
             ("wrong_audience", "ERROR"),
             ("wrong_pod", "ERROR"),
             ("signature", "WARN"),
+            ("malformed", "WARN"),
         ],
         "an expired grant is counted, not logged: {refusals:#?}"
     );
@@ -173,6 +182,12 @@ async fn grant_failures_are_logged_by_kind_with_nothing_from_their_claims() {
         refusals[2]["fields"].get("digest").is_none(),
         "a failure before the signature verified is logged with a digest: {:#}",
         refusals[2]
+    );
+    assert!(
+        refusals[3]["fields"].get("digest").is_none(),
+        "a failure after the signature verified that is not a binding's is logged with a \
+         digest: {:#}",
+        refusals[3]
     );
     let text = captured.text();
     for canary in CANARIES {
@@ -187,7 +202,10 @@ async fn grant_failures_are_logged_by_kind_with_nothing_from_their_claims() {
         "switchboard_grant_failures_total{kind=\"wrong_pod\"} 1",
         "switchboard_grant_failures_total{kind=\"expired\"} 1",
         "switchboard_grant_failures_total{kind=\"signature\"} 1",
+        "switchboard_grant_failures_total{kind=\"malformed\"} 1",
         "switchboard_grant_failures_total{kind=\"version\"} 0",
+        // The lifetime failure's label is the name the audit row records.
+        "switchboard_grant_failures_total{kind=\"lifetime_over_ceiling\"} 0",
         &format!(
             "switchboard_grants_accepted_total{{key_id=\"{}\"}} 1",
             minter.key_id()

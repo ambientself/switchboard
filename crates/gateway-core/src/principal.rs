@@ -346,9 +346,14 @@ pub struct UnverifiedDelegation {
     digest: Option<DelegationDigest>,
 }
 
-/// A digest offered with a failure found before the delegation's signature verified.
+/// A digest offered with a failure that is not a binding's: one found before the delegation's
+/// signature verified, or after it but before any binding was checked (`encoding` and
+/// `malformed`). See [`DelegationFailure::follows_signature`].
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
-#[error("a delegation that failed `{0}` has no verified signature, so it has no digest to record")]
+#[error(
+    "a delegation that failed `{0}` failed no binding, so it has no digest to record: only a \
+     failure of the audience, the lifetime or the pod is recorded with one"
+)]
 pub struct DigestBeforeSignature(pub DelegationFailure);
 
 impl UnverifiedDelegation {
@@ -361,8 +366,9 @@ impl UnverifiedDelegation {
     }
 
     /// A delegation whose signature verified and which then failed `failure`, a binding, with
-    /// its digest. Refused for a failure found before the signature verified, which has no
-    /// digest to record: see [`DelegationFailure::follows_signature`].
+    /// its digest. Refused for any other failure, which has no digest to record, whether it was
+    /// found before the signature verified or after: see
+    /// [`DelegationFailure::follows_signature`].
     pub fn after_signature(
         failure: DelegationFailure,
         digest: DelegationDigest,
@@ -527,6 +533,12 @@ mod tests {
             let plain = UnverifiedDelegation::new(failure);
             assert_eq!((plain.failure(), plain.digest()), (failure, None));
         }
+        // The refusal says why for a failure found after the signature verified too.
+        assert_eq!(
+            DigestBeforeSignature(DelegationFailure::Malformed).to_string(),
+            "a delegation that failed `malformed` failed no binding, so it has no digest to \
+             record: only a failure of the audience, the lifetime or the pod is recorded with one"
+        );
     }
 
     #[test]

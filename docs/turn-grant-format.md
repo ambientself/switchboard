@@ -88,7 +88,8 @@ likes, and nothing re-serializes it after signing.
 More precisely:
 
 - An integer is written as digits only: no sign, fraction or exponent, and at most
-  2^63 − 1. `1800000000` is an integer; `1.8e9`, `1800000000.0` and `"1800000000"` are not.
+  2^63 − 1. `1800000000` is an integer; `1.8e9`, `1800000000.0` and `"1800000000"` are not, and
+  neither is `-0`, which a JSON parser may read as zero.
 - A claim in the table is never `null`, and never appears twice in one object. `pod` and `egress`
   may be left out until the issuer requires them; when present, they must be valid.
 - A member the table does not name is ignored, whatever its value, so a claim can be added later
@@ -139,7 +140,7 @@ failure kind, which Switchboard records, logs and counts, and never tells the ca
 | 9 | `aud` includes this deployment. | `wrong_audience` |
 | 10 | `iat` ≤ now + 30. | `not_yet_valid` |
 | 11 | `exp` > now − 30. | `expired` |
-| 12 | `exp − iat` ≤ 900. | `lifetime` |
+| 12 | `exp − iat` ≤ 900. | `lifetime_over_ceiling` |
 | 13 | Once the issuer requires `pod`: it equals the caller's proved pod UID. A caller whose token proves no pod fails. | `wrong_pod` |
 
 Now is the gateway's clock in whole seconds since 1970-01-01T00:00:00Z, rounded down. The 30
@@ -149,9 +150,10 @@ timeouts past it.
 
 A grant that passes is identified by its digest: the SHA-256 of the grant as presented, all four
 parts and the dots, written as 64 lowercase hexadecimal digits. Canonical encoding makes that one
-value per grant. A failure at step 7 or later also carries the digest, since the signature
-verified; a failure before it carries nothing of the grant. No failure carries anything from the
-claims.
+value per grant. A failure at step 9 or later, of a binding (the audience, the lifetime or the
+pod), also carries the digest, since the signature verified and the claims were read. Any other
+failure carries nothing of the grant: one before step 7, and one at step 7 or 8 too, though the
+signature verified there. No failure carries anything from the claims.
 
 A grant may be verified any number of times within these bounds. There is no replay cache.
 
@@ -245,7 +247,7 @@ unused bits, which are zero. `1`, `2` or `3` in its place would decode to the sa
 signature covers the characters, so that grant fails at step 6. The signature part is not covered
 by the signature: its last character, `w`, has 4 unused bits, and any of `x`, `y`, `z`, `0` to
 `9`, `-` or `_` in its place decodes to the same signature, which verifies, so that grant is
-refused at step 7, with the digest of the grant as presented.
+refused at step 7, with no digest.
 
 ## Compared with `v1`
 

@@ -157,6 +157,21 @@ async fn a_token_broader_than_asked_is_revoked_and_not_handed_out() {
     );
 }
 
+#[tokio::test]
+async fn a_token_whose_names_github_writes_in_another_case_is_handed_out() {
+    // GitHub writes each repository's full name as its owner cased it; its names are not
+    // case-sensitive, so the token is the one asked for.
+    let world = World::new().await;
+    world.fake.set_behaviour(Behaviour::Recase);
+    let mut asked = request();
+    asked.repositories = vec![format!("{ACCOUNT}/atlas"), format!("{ACCOUNT}/borealis")];
+    let token = world.client.token(&asked).await.unwrap();
+    assert_eq!(token.expose(), world.fake.issued()[0].token);
+    assert_eq!(world.record.lines()[0]["outcome"], "issued");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(world.fake.revoked().is_empty());
+}
+
 /// Waits up to `seconds` for `done`.
 async fn until(done: impl Fn() -> bool, seconds: u64) {
     for _ in 0..seconds * 10 {
@@ -183,6 +198,43 @@ async fn a_revocation_github_fails_is_tried_again_until_it_is_accepted() {
     );
     assert!(
         metrics.contains("switchboard_custodian_revocations_total{result=\"revoked\"} 1"),
+        "{metrics}"
+    );
+}
+
+#[tokio::test]
+async fn a_revocation_github_applied_but_failed_to_answer_is_done_at_the_401() {
+    // GitHub revokes the token and answers 500. The retry finds a token that no longer
+    // authenticates: GitHub answers 401, which is what revoking is for, and the custodian stops.
+    let world = World::with(|config| config.limits.token_lifetime_seconds = 1).await;
+    world.fake.apply_and_fail_revocations(1);
+    let token = world.client.token(&request()).await.unwrap();
+    let counted = [
+        "switchboard_custodian_revocations_total{result=\"failed\"} 1",
+        "switchboard_custodian_revocations_total{result=\"revoked\"} 1",
+    ];
+    // The first attempt comes at the end of the lifetime, the retry a second later.
+    let mut metrics = String::new();
+    for _ in 0..60 {
+        metrics = world.metrics().await;
+        if counted.iter().all(|series| metrics.contains(series)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(world.fake.revoked(), vec![token.expose().to_owned()]);
+    assert_eq!(world.fake.revocation_attempts().len(), 2);
+    assert!(
+        counted.iter().all(|series| metrics.contains(series)),
+        "{metrics}"
+    );
+    // Past when a third attempt would have come, two seconds after the second, had it not
+    // stopped.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(world.fake.revocation_attempts().len(), 2);
+    let metrics = world.metrics().await;
+    assert!(
+        counted.iter().all(|series| metrics.contains(series)),
         "{metrics}"
     );
 }

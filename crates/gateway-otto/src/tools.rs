@@ -137,6 +137,17 @@ impl ToolMapping {
     }
 }
 
+/// The mapping as a member of a larger document, such as the gateway's JSON configuration: one
+/// object of Otto names to this gateway's, read as [`ToolMapping::from_json`] reads a mapping
+/// file. A name given twice is refused, not overwritten, which reading it through
+/// `serde_json::Value` first would not do.
+impl<'de> Deserialize<'de> for ToolMapping {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let entries = Entries::<String>::deserialize(deserializer)?;
+        Self::from_pairs(entries.0).map_err(serde::de::Error::custom)
+    }
+}
+
 fn parse<T: DeserializeOwned>(text: &str) -> Result<T, MappingError> {
     serde_json::from_str(text).map_err(|error| MappingError::Shape(error.to_string()))
 }

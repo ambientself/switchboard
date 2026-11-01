@@ -222,7 +222,10 @@ record and an entry here.
   - Atlassian's hosted `addOrEditJiraIssueComment` gets no exception.
 - **In force:** not yet. It comes into force only when both hold: milestone 4 has built the
   core's way to express an exception (issue 12), and the security owner has signed this entry.
-  Until then both tools stay denied to Otto's callers.
+  The mechanism is built: a profile's list of excepted tools, check 5 reading only the calling
+  profile's list, the loader's refusals and the row's column. The security owner has not signed
+  this entry, so it is not in force: no deployment, demo or example registry lists the
+  exception, this gateway serves neither tool yet, and both stay denied to Otto's callers.
 - **Next review:** before each milestone's rollout, so before milestone 4, when it would first
   come into force; when Otto's cutover (issue 13) completes; and by 2027-01-05.
 - **Ends when:** the review ends it.

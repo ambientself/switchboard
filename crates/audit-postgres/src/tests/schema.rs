@@ -6,8 +6,8 @@ use tokio::time::{Instant, sleep};
 use tokio_postgres::Client;
 
 use super::{
-    ADDED_BY_0010, CHECK_VIOLATION, INSUFFICIENT_PRIVILEGE, NOT_NULL_VIOLATION, SETUP,
-    TestDatabase, code, message,
+    ADDED_BY_0010, CHECK_VIOLATION, EXCEPTION_COLUMN, INSUFFICIENT_PRIVILEGE, NOT_NULL_VIOLATION,
+    SETUP, TestDatabase, code, message,
 };
 use crate::{GATEWAY_ROLE, MIGRATIONS, MigrateError, OWNER_ROLE, ROLES, migrate};
 
@@ -143,7 +143,10 @@ async fn migrating_again_applies_nothing() {
         .iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(recorded, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    assert_eq!(
+        recorded,
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    );
 }
 
 #[tokio::test]
@@ -184,7 +187,7 @@ async fn two_migrators_at_once_take_turns() {
         applied.sort_unstable();
         assert_eq!(
             applied,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
             "each migration is applied once"
         );
     }
@@ -322,6 +325,7 @@ async fn the_gateway_holds_exactly_its_column_grants() {
         .collect();
     let mut expected: Vec<(String, String)> = [
         ("INSERT", "allowance_ms"),
+        ("INSERT", "allowed_by_exception"),
         ("INSERT", "classification"),
         ("INSERT", "claimed_acting_person"),
         ("INSERT", "claimed_team"),
@@ -1006,7 +1010,7 @@ async fn the_deadline_migration_keeps_the_rows_already_written() {
 
     assert_eq!(
         migrate(&mut owner).await.unwrap(),
-        vec![3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        vec![3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     );
     for (id, due) in [
         (&open, "begun_at"),
@@ -1594,7 +1598,7 @@ async fn rows_without_error_kind(client: &Client) -> Vec<(String, serde_json::Va
             &format!(
                 "SELECT id::text,
                     to_jsonb(r) - 'error_kind' - 'credential_mode' - 'credential_principal'
-                        - 'duplicate_of' - {ADDED_BY_0010}
+                        - 'duplicate_of' - {ADDED_BY_0010} - '{EXCEPTION_COLUMN}'
                  FROM switchboard_audit.call_rows AS r ORDER BY id"
             ),
             &[],
@@ -1654,7 +1658,7 @@ async fn the_error_kind_migration_marks_the_errors_already_written() {
 
     assert_eq!(
         migrate(&mut owner).await.unwrap(),
-        vec![6, 7, 8, 9, 10, 11, 12, 13]
+        vec![6, 7, 8, 9, 10, 11, 12, 13, 14]
     );
     assert_eq!(rows_without_error_kind(&owner).await, before);
     for (id, kind) in [
@@ -1877,7 +1881,7 @@ async fn the_reach_and_credential_migration_keeps_the_rows_already_written() {
 
     assert_eq!(
         migrate(&mut owner).await.unwrap(),
-        vec![7, 8, 9, 10, 11, 12, 13]
+        vec![7, 8, 9, 10, 11, 12, 13, 14]
     );
     for (id, resources) in [&named, &unknown, &listed].into_iter().zip(before) {
         let row = owner.query_one(&read(id), &[]).await.unwrap();
@@ -2125,6 +2129,116 @@ async fn the_delegation_columns_hold_decision_0012s_shapes_and_no_others() {
     assert_eq!(code(&error), Some(INSUFFICIENT_PRIVILEGE), "{error}");
 }
 
+/// The exception that allowed a call (decision 0011, section 9; migration 0012) holds the
+/// shape the core writes and no other, whoever writes it: a name of lowercase letters, digits
+/// and `-`, of at most 64 characters, on an allowed call row of a `write` or `destructive` tool
+/// only. Never on a denial, a read, a proposal or a list row. The gateway's role writes it at
+/// begin and never again, and cannot read it back.
+#[tokio::test]
+async fn the_exception_column_holds_an_allowed_writes_exception_and_nothing_else() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let owner = db.connect_as(OWNER_ROLE).await;
+    let gateway = db.connect_as(GATEWAY_ROLE).await;
+    let longest = format!("'{}'", "a".repeat(64));
+    let too_long = format!("'{}'", "a".repeat(65));
+    let write = ("classification", "'write'");
+    for accepted in [
+        insert(&[write, ("allowed_by_exception", "'otto-comment-tools'")]),
+        insert(&[write, ("allowed_by_exception", longest.as_str())]),
+        insert(&[write, ("allowed_by_exception", "'7'")]),
+        insert(&[
+            ("classification", "'destructive'"),
+            ("allowed_by_exception", "'otto-comment-tools'"),
+        ]),
+        insert(&[write]),
+    ] {
+        insert_row(&gateway, &accepted).await;
+    }
+    for (constraint, sql) in [
+        (
+            "allowed_by_exception_known",
+            insert(&[write, ("allowed_by_exception", "'Otto'")]),
+        ),
+        (
+            "allowed_by_exception_known",
+            insert(&[write, ("allowed_by_exception", "'-otto'")]),
+        ),
+        (
+            "allowed_by_exception_known",
+            insert(&[write, ("allowed_by_exception", "'otto-'")]),
+        ),
+        (
+            "allowed_by_exception_known",
+            insert(&[write, ("allowed_by_exception", "'otto comment'")]),
+        ),
+        (
+            "allowed_by_exception_known",
+            insert(&[write, ("allowed_by_exception", "''")]),
+        ),
+        (
+            "allowed_by_exception_known",
+            insert(&[write, ("allowed_by_exception", too_long.as_str())]),
+        ),
+        (
+            "allowed_by_exception_shape",
+            insert(&[("allowed_by_exception", "'otto-comment-tools'")]),
+        ),
+        (
+            "allowed_by_exception_shape",
+            insert(&[
+                ("classification", "'propose'"),
+                ("allowed_by_exception", "'otto-comment-tools'"),
+            ]),
+        ),
+        (
+            "allowed_by_exception_shape",
+            insert(&[
+                write,
+                ("decision", "'deny'"),
+                ("reason", "'not_current'"),
+                ("sentence", "'Denied.'"),
+                ("allowed_by_exception", "'otto-comment-tools'"),
+            ]),
+        ),
+        (
+            "allowed_by_exception_shape",
+            list(&[("allowed_by_exception", "'otto-comment-tools'")]),
+        ),
+    ] {
+        for client in [&gateway, &owner] {
+            let error = client.query_one(&sql, &[]).await.unwrap_err();
+            assert!(refused_by(&error, constraint), "{sql}: {error}");
+        }
+    }
+
+    let id = insert_row(
+        &gateway,
+        &insert(&[write, ("allowed_by_exception", "'otto-comment-tools'")]),
+    )
+    .await;
+    let error = gateway
+        .execute(
+            &format!(
+                "UPDATE switchboard_audit.call_rows SET allowed_by_exception = 'other'
+                  WHERE id = '{id}'"
+            ),
+            &[],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(&error), Some(INSUFFICIENT_PRIVILEGE), "{error}");
+    let error = gateway
+        .query(
+            "SELECT allowed_by_exception FROM switchboard_audit.call_rows",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(&error), Some(INSUFFICIENT_PRIVILEGE), "{error}");
+}
+
 /// Rows written before 0010 keep every value they had, and record none of decision 0012's
 /// columns: NULL, not recorded. The migration's checks hold for each, a row with a delegation's
 /// team and person among them.
@@ -2169,7 +2283,8 @@ async fn the_delegation_migration_keeps_the_rows_already_written() {
         insert_row(&owner, &list(&delegated)).await,
     ];
     let compared = format!(
-        "SELECT to_jsonb(r) - {ADDED_BY_0010} FROM switchboard_audit.call_rows r WHERE id::text = $1"
+        "SELECT to_jsonb(r) - {ADDED_BY_0010} - '{EXCEPTION_COLUMN}'
+           FROM switchboard_audit.call_rows r WHERE id::text = $1"
     );
     let mut before = Vec::new();
     for id in &rows {
@@ -2177,7 +2292,7 @@ async fn the_delegation_migration_keeps_the_rows_already_written() {
         before.push(row.get::<_, serde_json::Value>(0));
     }
 
-    assert_eq!(migrate(&mut owner).await.unwrap(), vec![10, 11, 12, 13]);
+    assert_eq!(migrate(&mut owner).await.unwrap(), vec![10, 11, 12, 13, 14]);
     for (id, before) in rows.iter().zip(before) {
         let row = owner.query_one(&compared, &[id]).await.unwrap();
         assert_eq!(row.get::<_, serde_json::Value>(0), before, "{id}");

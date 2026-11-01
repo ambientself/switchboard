@@ -187,10 +187,28 @@ pub fn refused(verifier: &GrantVerifier, grant: &str) -> GrantFailure {
     }
 }
 
-/// Asserts a grant fails with `kind`, with the digest only if its signature verified.
+/// The failures of a binding, found once the signature verified and the claims were read: the
+/// only ones that carry the grant's digest (decision 0012, "Failures").
+pub const BINDINGS: [FailureKind; 5] = [
+    FailureKind::WrongAudience,
+    FailureKind::NotYetValid,
+    FailureKind::Expired,
+    FailureKind::LifetimeOverCeiling,
+    FailureKind::WrongPod,
+];
+
+/// Whether a failure of `kind` carries the grant's digest when its signature verified.
+pub fn carries_digest(kind: FailureKind) -> bool {
+    BINDINGS.contains(&kind)
+}
+
+/// Asserts a grant fails with `kind`, `signed` saying whether its signature verified. The
+/// failure carries the grant's digest only if it did and `kind` is a binding's: a grant refused
+/// for its encoding or its claims' shape after a verified signature carries none.
 pub fn refused_as(verifier: &GrantVerifier, grant: &str, kind: FailureKind, signed: bool) {
     let failure = refused(verifier, grant);
     assert_eq!(failure.kind(), kind, "{grant}");
-    let digest = signed.then(|| gateway_otto::GrantDigest::of(grant.as_bytes()));
+    let digest =
+        (signed && carries_digest(kind)).then(|| gateway_otto::GrantDigest::of(grant.as_bytes()));
     assert_eq!(failure.digest(), digest, "the digest of {grant}");
 }

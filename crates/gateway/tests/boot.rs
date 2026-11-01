@@ -568,7 +568,7 @@ fn with_audit_disabled_an_allowed_call_runs_and_nothing_is_recorded() {
         },
         tool: RequestedTool::new(READ_TOOL),
         resources: FixtureConnector::resources_of(READ_TOOL, &arguments),
-        key: None,
+        key: gateway_core::CallKey::Absent,
         currency: gateway_core::Currency::NotAsked,
     };
     let decision = decide(&gates.snapshot(), &call);

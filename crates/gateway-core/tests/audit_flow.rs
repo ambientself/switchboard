@@ -18,14 +18,15 @@ use gateway_core::audit::{
 };
 use gateway_core::receipt::EstablishedBy;
 use gateway_core::{
-    ApprovedTool, ArgumentDigest, AuditRecord, AuditStore, BoxFuture, CallContext, CallerContext,
-    Claimed, Classification, Connector, ConnectorEntry, ConnectorName, CredentialIdentity,
-    CredentialMode, Currency, CurrencyAnswer, Decision, Delegation, DelegationDigest,
-    DelegationFailure, Egress, EntryKind, IdempotencyKey, InstanceName, KeyScope, Narrowing,
-    PolicySnapshot, Principal, PrincipalId, PrincipalKind, PrincipalRestriction, Profile, Reason,
-    ReasonKind, Receipt, ReceiptState, RequestedTool, Resource, ResourceDeclaration,
-    ResourceLimits, ResourceProblem, Resources, Reuse, Settlement, SnapshotData, Surface, TeamId,
-    ToolCall, ToolOutcome, TurnId, UnverifiedDelegation, VendorReference, decide, list_tools,
+    ApprovedTool, ArgumentDigest, AuditRecord, AuditStore, BoxFuture, CallContext, CallKey,
+    CallerContext, Claimed, Classification, Connector, ConnectorEntry, ConnectorName,
+    CredentialIdentity, CredentialMode, Currency, CurrencyAnswer, Decision, Delegation,
+    DelegationDigest, DelegationFailure, Egress, EntryKind, IdempotencyKey, InstanceName, KeyScope,
+    Narrowing, PolicySnapshot, Principal, PrincipalId, PrincipalKind, PrincipalRestriction,
+    Profile, Reason, ReasonKind, Receipt, ReceiptState, RequestedTool, Resource,
+    ResourceDeclaration, ResourceLimits, ResourceProblem, Resources, Reuse, Settlement,
+    SnapshotData, Surface, TeamId, ToolCall, ToolOutcome, TurnId, UnverifiedDelegation,
+    VendorReference, decide, list_tools,
 };
 use serde_json::json;
 
@@ -111,6 +112,7 @@ fn snapshot_data(elsewhere: bool) -> SnapshotData {
                 requires_delegation: true,
                 requires_currency: false,
                 idempotency_key_header: false,
+                exceptions: Vec::new(),
             },
             Profile {
                 name: "proposers".into(),
@@ -118,6 +120,7 @@ fn snapshot_data(elsewhere: bool) -> SnapshotData {
                 requires_delegation: true,
                 requires_currency: false,
                 idempotency_key_header: false,
+                exceptions: Vec::new(),
             },
         ],
         limits: limits(),
@@ -187,7 +190,7 @@ fn call(tool: &str) -> CallContext {
         },
         tool: RequestedTool::new(tool),
         resources: Resources::Named(Vec::new()),
-        key: None,
+        key: CallKey::Absent,
         currency: Currency::NotAsked,
     }
 }
@@ -960,6 +963,7 @@ fn snapshot_with_entry() -> PolicySnapshot {
             requires_delegation: true,
             requires_currency: false,
             idempotency_key_header: false,
+            exceptions: Vec::new(),
         }],
         limits: limits(),
         entries: Vec::new(),
@@ -1363,7 +1367,7 @@ impl Connector for SlowConnector {
 fn allowed_proposing(store: &dyn AuditStore, tool: &str) -> gateway_core::AuditGuard {
     let mut context = call(tool);
     context.caller.profile = "proposers".into();
-    context.key = Some(common::fresh_key());
+    context.key = CallKey::Valid(common::fresh_key());
     match begin(store, decide(&snapshot(), &context)) {
         Begun::Allowed(guard) => guard,
         Begun::Denied(refusal) => panic!("expected a guard, got {refusal:?}"),
@@ -1492,7 +1496,7 @@ fn a_side_effect_runs_to_completion_though_its_caller_has_gone() {
 fn proposing(tool: &str, key: Option<&IdempotencyKey>) -> CallContext {
     let mut context = call(tool);
     context.caller.profile = "proposers".into();
-    context.key = key.cloned();
+    context.key = key.cloned().into();
     context
 }
 
@@ -1926,6 +1930,226 @@ fn an_unverified_delegation_is_recorded_by_its_failure_alone() {
         let written = serde_json::to_string(&row).unwrap();
         assert!(!written.contains("requester@example.test"), "{written}");
         assert!(store.receipts().is_empty(), "a denial reserved a receipt");
+    }
+}
+
+/// A store that hands the test store each record `change`d, as a core that wrote the wrong
+/// delegation columns would. Every call it forwards is ready at once.
+struct Changing<'a> {
+    store: &'a MemoryStore,
+    change: &'a (dyn Fn(&mut AuditRecord) + Sync),
+}
+
+impl AuditStore for Changing<'_> {
+    fn begin<'a>(
+        &'a self,
+        row: &'a audit::AuditRowId,
+        record: &'a AuditRecord,
+    ) -> BoxFuture<'a, Result<(), audit::StoreError>> {
+        let mut changed = record.clone();
+        (self.change)(&mut changed);
+        Box::pin(ready(common::ready(self.store.begin(row, &changed))))
+    }
+
+    fn begin_with_receipt<'a>(
+        &'a self,
+        row: &'a audit::AuditRowId,
+        record: &'a AuditRecord,
+        receipt: &'a gateway_core::receipt::ReceiptRequest,
+    ) -> BoxFuture<'a, Result<gateway_core::receipt::Reservation, audit::StoreError>> {
+        let mut changed = record.clone();
+        (self.change)(&mut changed);
+        Box::pin(ready(common::ready(
+            self.store.begin_with_receipt(row, &changed, receipt),
+        )))
+    }
+
+    fn finish<'a>(
+        &'a self,
+        completion: &'a audit::RowCompletion,
+    ) -> BoxFuture<'a, Result<(), audit::StoreError>> {
+        self.store.finish(completion)
+    }
+
+    fn list<'a>(
+        &'a self,
+        row: &'a audit::AuditRowId,
+        record: &'a ListRecord,
+    ) -> BoxFuture<'a, Result<(), audit::StoreError>> {
+        self.store.list(row, record)
+    }
+}
+
+/// The test store refuses the delegation shapes the testkit's store and Postgres refuse
+/// (migration 0010), and writes nothing for them, so a test here fails if the core ever writes
+/// one: a failure beside anything from the delegation's claims, a digest with a failure that is
+/// not a binding's, a failure on a row check 3 did not deny for it, a denial at check 3 with no
+/// failure, and a verified delegation without its team or person or with an epoch past a
+/// `bigint`, on a call row, on one begun with a receipt, or on a list row. What the core writes
+/// itself, it accepts.
+#[test]
+fn the_test_store_refuses_the_delegation_shapes_the_other_stores_refuse() {
+    let digest = DelegationDigest::of(b"a grant as presented");
+    let failure = |failure, digest| Some(RecordedFailure { failure, digest });
+
+    // What the core writes: an allowed call with a verified delegation, and a call check 3
+    // denied for one that did not verify.
+    let written = MemoryStore::default();
+    let _ = allowed(&written, "fixture__read");
+    let allowed_row = written.last();
+    assert!(allowed_row.delegation.is_some());
+    let mut unverified = proposing("fixture__propose", Some(&common::fresh_key()));
+    unverified.caller.delegation =
+        Some(UnverifiedDelegation::new(DelegationFailure::Signature).into());
+    let _ = begin_as(&written, common::start(), &unverified);
+    let at_check_3 = written.last();
+    assert_eq!(at_check_3.reason, Some(ReasonKind::DelegationUnverified));
+    assert_eq!(written.rows().len(), 2);
+
+    let verified = allowed_row.delegation.clone();
+    let cannot_hold = [
+        // Something from the delegation's claims beside its failure.
+        AuditRecord {
+            claimed_acting_person: allowed_row.claimed_acting_person.clone(),
+            ..at_check_3.clone()
+        },
+        AuditRecord {
+            proved_delegation_team: allowed_row.proved_delegation_team.clone(),
+            ..at_check_3.clone()
+        },
+        AuditRecord {
+            delegation: verified.clone(),
+            proved_delegation_team: allowed_row.proved_delegation_team.clone(),
+            claimed_acting_person: allowed_row.claimed_acting_person.clone(),
+            ..at_check_3.clone()
+        },
+        // A digest with a failure that is not a binding's.
+        AuditRecord {
+            delegation_failure: failure(DelegationFailure::Signature, Some(digest)),
+            ..at_check_3.clone()
+        },
+        AuditRecord {
+            delegation_failure: failure(DelegationFailure::Malformed, Some(digest)),
+            ..at_check_3.clone()
+        },
+        // A failure on a row check 3 did not deny for it, and such a denial with none.
+        AuditRecord {
+            reason: Some(ReasonKind::ClassificationNotPermitted),
+            ..at_check_3.clone()
+        },
+        AuditRecord {
+            proved_delegation_team: None,
+            claimed_acting_person: None,
+            delegation: None,
+            delegation_failure: failure(DelegationFailure::Expired, Some(digest)),
+            ..allowed_row.clone()
+        },
+        AuditRecord {
+            delegation_failure: None,
+            ..at_check_3.clone()
+        },
+        // A verified delegation without its team or its person.
+        AuditRecord {
+            proved_delegation_team: None,
+            ..allowed_row.clone()
+        },
+        AuditRecord {
+            claimed_acting_person: None,
+            ..allowed_row.clone()
+        },
+        // An epoch past a bigint.
+        AuditRecord {
+            delegation: verified.clone().map(|delegation| RecordedDelegation {
+                epoch: u64::MAX,
+                ..delegation
+            }),
+            ..allowed_row.clone()
+        },
+    ];
+    for record in &cannot_hold {
+        let store = MemoryStore::default();
+        let begun = common::ready(store.begin(&common::start().row, record));
+        assert!(begun.is_err(), "the test store accepted {record:?}");
+        assert!(store.rows().is_empty(), "{record:?}");
+    }
+    // A binding's failure keeps its digest.
+    let binding = AuditRecord {
+        delegation_failure: failure(DelegationFailure::WrongPod, Some(digest)),
+        ..at_check_3.clone()
+    };
+    assert!(common::ready(MemoryStore::default().begin(&common::start().row, &binding)).is_ok());
+
+    // An allowed proposal, begun with a receipt, with a failure on it or its delegation
+    // without its person: refused, with no row and no receipt.
+    let changes: [&(dyn Fn(&mut AuditRecord) + Sync); 2] = [
+        &|record| {
+            record.delegation = None;
+            record.proved_delegation_team = None;
+            record.claimed_acting_person = None;
+            record.delegation_failure = failure(DelegationFailure::Expired, Some(digest));
+        },
+        &|record| record.claimed_acting_person = None,
+    ];
+    for change in changes {
+        let store = MemoryStore::default();
+        let changing = Changing {
+            store: &store,
+            change,
+        };
+        let context = proposing("fixture__propose", Some(&common::fresh_key()));
+        let begun = common::ready(audit::begin(
+            &changing,
+            common::start(),
+            decide(&snapshot(), &context),
+            json!({"path": "README.md"}),
+            metadata(),
+        ));
+        assert!(begun.is_err(), "the test store accepted a changed proposal");
+        assert!(store.rows().is_empty());
+        assert!(store.receipts().is_empty());
+    }
+
+    // A list row with a verified delegation without its team or its person, or with an epoch
+    // past a bigint.
+    let caller = call("fixture__read").caller;
+    let _ = common::ready(audit::listed(
+        &written,
+        common::start(),
+        &caller,
+        "audit-1".into(),
+        Vec::new(),
+        None,
+    ))
+    .unwrap();
+    let (_, listed) = written.list_rows().pop().unwrap();
+    assert!(listed.delegation.is_some());
+    for record in [
+        ListRecord {
+            proved_delegation_team: None,
+            ..listed.clone()
+        },
+        ListRecord {
+            claimed_acting_person: None,
+            ..listed.clone()
+        },
+        ListRecord {
+            delegation: listed
+                .delegation
+                .clone()
+                .map(|delegation| RecordedDelegation {
+                    epoch: u64::MAX,
+                    ..delegation
+                }),
+            ..listed.clone()
+        },
+    ] {
+        let store = MemoryStore::default();
+        let row = common::start().row;
+        assert!(
+            common::ready(store.list(&row, &record)).is_err(),
+            "{record:?}"
+        );
+        assert!(store.list_rows().is_empty(), "{record:?}");
     }
 }
 

@@ -9,8 +9,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use gateway_core::{
-    Classification, ConnectorName, CredentialMode, GroupId, Issuer, Narrowing, ProfileName,
-    Settlement, Subject, SurfaceName, TeamId, ToolName,
+    Classification, ConnectorName, CredentialMode, Exception, GroupId, Issuer, Narrowing,
+    ProfileName, Settlement, Subject, SurfaceName, TeamId, ToolName,
 };
 use serde::Deserialize;
 use toml::value::Datetime;
@@ -250,6 +250,11 @@ pub(crate) struct ProfileFile {
     /// false, so a file written before the setting existed keeps its meaning.
     #[serde(default)]
     pub idempotency_key_header: bool,
+    /// The profile's exceptions (decision 0011, section 9), each written
+    /// `{ name = "...", tools = [...] }`, refusing any other key. Absent is none, so a file
+    /// written before the list existed keeps its meaning. The snapshot loader checks them.
+    #[serde(default)]
+    pub exceptions: Vec<Exception>,
 }
 
 #[derive(Debug, Deserialize)]

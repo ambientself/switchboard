@@ -118,6 +118,7 @@ contract!(
     a_delegation_and_its_currency_are_stored_as_begin_was_given_them,
     an_unverified_delegation_denied_before_check_3_is_stored_as_that_denial_alone,
     a_delegation_of_the_wrong_shape_is_refused_and_leaves_no_row,
+    an_exception_is_stored_on_an_allowed_write_and_refused_elsewhere,
     a_repeated_begin_compares_the_decision_and_not_the_reach_or_credential,
     finish_completes_once_accepts_an_identical_repeat_and_refuses_a_different_one,
     finish_touches_only_the_completion,
@@ -146,4 +147,5 @@ contract!(
     a_receipt_settled_by_reconciliation_is_not_moved_by_a_late_finish,
     each_claim_is_counted_as_an_attempt,
     a_receipt_held_for_its_call_is_not_due_and_no_one_else_claims_it,
+    an_unknown_receipt_is_not_due_before_its_rows_deadline,
 );

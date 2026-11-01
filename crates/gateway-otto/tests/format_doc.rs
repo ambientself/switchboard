@@ -68,6 +68,14 @@ fn the_document_states_the_constants() {
     assert!(
         DOC.contains("SHA-256( \"otto/gateway-turn-grant/kid/v3\" || 0x00 || public key )[0..16]")
     );
+    // The verification order's failure kinds are the names this crate gives them, which the
+    // gateway logs and counts and the audit row records.
+    for kind in gateway_otto::FailureKind::ALL {
+        assert!(
+            DOC.contains(&format!(" | `{kind}` |\n")),
+            "the verification order does not name `{kind}`"
+        );
+    }
 }
 
 #[test]
@@ -143,7 +151,7 @@ fn the_example_verifies() {
         );
     }
     // The last character of the signature part, likewise: the signature still verifies, and the
-    // grant is refused for its encoding, with its digest.
+    // grant is refused for its encoding, with no digest: only a binding's failure carries one.
     assert!(grant.ends_with('w'));
     for replacement in "xyz0123456789-_".chars() {
         let changed = format!("{}{replacement}", &grant[..grant.len() - 1]);
@@ -155,6 +163,6 @@ fn the_example_verifies() {
             gateway_otto::FailureKind::Encoding,
             "{replacement}"
         );
-        assert_eq!(failure.digest(), Some(GrantDigest::of(changed.as_bytes())));
+        assert_eq!(failure.digest(), None, "{replacement}");
     }
 }

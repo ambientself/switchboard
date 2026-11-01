@@ -56,7 +56,7 @@ async fn begin(
         resources: FixtureConnector::resources_of(READ_TOOL, &arguments),
         caller: fixture.caller_context(caller, SURFACE_ALL).unwrap(),
         tool: RequestedTool::new(READ_TOOL),
-        key: None,
+        key: gateway_core::CallKey::Absent,
         currency: gateway_core::Currency::NotAsked,
     };
     let start = RowStart {

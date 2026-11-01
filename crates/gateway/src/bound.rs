@@ -50,14 +50,23 @@
 //! the task runs, and the first lookup comes at least a full lease after the side effect ended.
 //! The queue, holder and lease are those of the instance's reconciliation, which
 //! [`Gates::reconciler`](crate::Gates::reconciler) sets; an instance with no reconciliation
-//! holds nothing. A hold that is not written, because the store fails or another holder has
-//! the receipt, is logged as [`LATE_SIDE_EFFECT_UNHELD_EVENT`], and tried again at the next
-//! renewal. This holds only while the instance can write to the store: one cut off from it for
-//! a whole lease, or stopped, lets its lease run out.
+//! holds nothing. A hold that is not written, because the store fails, the hold's
+//! [`HOLD_BUDGET`] runs out or another holder has the receipt, is logged as
+//! [`LATE_SIDE_EFFECT_UNHELD_EVENT`] and tried again [`HOLD_RETRY`] later, not a quarter of a
+//! lease later, and so on until one is written. Meanwhile this instance's own reconciliation
+//! still never claims the receipt: it skips every receipt whose late side effect runs here
+//! ([`LateCalls::runs`]). Another instance is kept off by the lease and, until the first hold
+//! is written, by the row's deadline: no receipt is due on any instance before its row's
+//! deadline has passed ([`ReceiptQueue`]), and that deadline includes the store's finish
+//! deadline, so a first hold that is not written has most of that to be written again, as a
+//! renewal that is not written has the rest of the lease. The guarantee across instances holds
+//! only while this one can write to the store: an instance cut off from the store past its
+//! row's deadline or its lease, or stopped, lets the receipt be looked up.
 //!
 //! Running a call needs a Tokio runtime, for the deadline's timer and the task a late side
 //! effect moves to.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -109,14 +118,21 @@ pub const OVER_QUOTA_EVENT: &str = "call_over_quota";
 
 /// The `event` field of the error logged when a late side effect's task could not hold its
 /// receipt's lease, with the `receipt`, and the `cause`: `store_failed`, `timed_out` or
-/// `not_held` (another holder has it, or it is settled or handed to a person). Until a hold is
-/// written again, another instance may look the receipt up while the side effect may still act.
+/// `not_held` (another holder has it, or it is settled or handed to a person). Logged once for
+/// each run of holds not written, at its first. Once the row's deadline or the last lease written
+/// has passed, and until a hold is written again, another instance may look the receipt up
+/// while the side effect may still act.
 pub const LATE_SIDE_EFFECT_UNHELD_EVENT: &str = "in_process_late_side_effect_unheld";
 
 /// How long one hold of a late side effect's receipt may take before it counts as not written.
 /// The first is made before the call is answered, so this bounds how much later than its
 /// deadline a late side effect is answered `unknown`.
 pub const HOLD_BUDGET: Duration = Duration::from_secs(2);
+
+/// How long a late side effect's task waits before trying again a hold of its receipt that was
+/// not written. Until one is, only the row's deadline keeps another instance off the receipt,
+/// so this is far shorter than the quarter of a lease between renewals.
+pub const HOLD_RETRY: Duration = Duration::from_secs(1);
 
 /// A connector in the gateway's own process's bounds on each call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,6 +169,8 @@ impl InProcessLimits {
 pub struct LateCalls {
     holding: Mutex<Option<Holding>>,
     running: AtomicUsize,
+    /// The receipt of each late side effect running, with how many run under it.
+    rows: Mutex<HashMap<AuditRowId, usize>>,
     ended: Notify,
 }
 
@@ -189,6 +207,15 @@ impl LateCalls {
         self.running.load(Ordering::SeqCst)
     }
 
+    /// Whether a late side effect whose receipt is `row` still runs in this process. This
+    /// instance's reconciliation never claims such a receipt, whether or not its lease is held.
+    pub fn runs(&self, row: &AuditRowId) -> bool {
+        self.rows
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(row)
+    }
+
     /// Waits, at most `within`, for every late side effect to end, and returns how many still
     /// run. Never cancels one: a gateway shutting down calls this within its grace period, and
     /// one still running when the grace runs out leaves its receipt `unknown`.
@@ -216,35 +243,61 @@ impl LateCalls {
             .clone()
     }
 
-    /// Counts one late side effect running until the returned guard is dropped.
-    fn started(self: &Arc<Self>) -> Running {
+    /// Counts one late side effect, whose receipt is `row`, running until the returned guard
+    /// is dropped.
+    fn started(self: &Arc<Self>, row: &AuditRowId) -> Running {
+        *self
+            .rows
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(row.clone())
+            .or_default() += 1;
         self.running.fetch_add(1, Ordering::SeqCst);
-        Running(Arc::clone(self))
+        Running(Arc::clone(self), row.clone())
     }
 }
 
 /// One late side effect running, counted until dropped, however its task ends.
-struct Running(Arc<LateCalls>);
+struct Running(Arc<LateCalls>, AuditRowId);
 
 impl Drop for Running {
     fn drop(&mut self) {
+        {
+            let mut rows = self.0.rows.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(count) = rows.get_mut(&self.1) {
+                *count -= 1;
+                if *count == 0 {
+                    rows.remove(&self.1);
+                }
+            }
+        }
         self.0.running.fetch_sub(1, Ordering::SeqCst);
         self.0.ended.notify_waiters();
     }
 }
 
 impl Holding {
-    /// Holds the receipt `row` for a lease, within [`HOLD_BUDGET`], and logs a hold not
-    /// written.
-    async fn hold(&self, row: &AuditRowId, connector: &ConnectorName, tool: &ToolName) {
+    /// Holds the receipt `row` for a lease, within [`HOLD_BUDGET`], and returns whether the
+    /// hold was written. A hold not written is logged when the last one, `held_before`, was
+    /// written, so a run of them is logged once.
+    async fn hold(
+        &self,
+        row: &AuditRowId,
+        connector: &ConnectorName,
+        tool: &ToolName,
+        held_before: bool,
+    ) -> bool {
         let held =
             tokio::time::timeout(HOLD_BUDGET, self.queue.hold(row, &self.holder, self.lease)).await;
         let cause = match held {
-            Ok(Ok(true)) => return,
+            Ok(Ok(true)) => return true,
             Ok(Ok(false)) => "not_held",
             Ok(Err(_)) => "store_failed",
             Err(_) => "timed_out",
         };
+        if !held_before {
+            return false;
+        }
         tracing::error!(
             event = LATE_SIDE_EFFECT_UNHELD_EVENT,
             receipt = row.as_str(),
@@ -254,22 +307,27 @@ impl Holding {
             "a side effect answered unknown still runs, and its receipt's lease could not be \
              held; another instance may look it up before it ends"
         );
+        false
     }
 
     /// Runs `running` to its end, holding the receipt `row` again every quarter of the lease
     /// meanwhile, and once more when it ends, so the first lookup waits a full lease after it.
+    /// `held` is whether the hold made before the call was answered was written. A hold not
+    /// written is tried again [`HOLD_RETRY`] later, until one is.
     async fn while_running(
         &self,
         row: &AuditRowId,
         connector: &ConnectorName,
         tool: &ToolName,
+        held: bool,
         running: Pin<Box<dyn Future<Output = ToolOutcome> + Send + 'static>>,
     ) -> ToolOutcome {
         let every = self.lease / 4;
+        let mut held = held;
         let renewing = async {
             loop {
-                tokio::time::sleep(every).await;
-                self.hold(row, connector, tool).await;
+                tokio::time::sleep(if held { every } else { HOLD_RETRY }).await;
+                held = self.hold(row, connector, tool, held).await;
             }
         };
         let outcome = tokio::select! {
@@ -277,7 +335,7 @@ impl Holding {
             outcome = running => outcome,
             () = renewing => unreachable!("holding again never ends"),
         };
-        self.hold(row, connector, tool).await;
+        self.hold(row, connector, tool, held).await;
         outcome
     }
 }
@@ -414,22 +472,24 @@ impl Connector for Bounded {
             if !read {
                 // A side effect is never cancelled once it may have been sent (decision 0009,
                 // "Where a call runs"): it runs to its end on a task of its own, holding its
-                // receipt so that no instance looks it up meanwhile. The first hold is made
-                // before the answer, while the receipt is still pending within its row's
-                // deadline and so not due anywhere.
+                // receipt so that no instance looks it up meanwhile. It is counted as running
+                // first, so this instance's reconciliation skips its receipt from here on. The
+                // first hold is made before the answer, while the receipt is still pending
+                // within its row's deadline and so not due anywhere.
                 let connector = self.name.clone();
                 let late_tool = tool.clone();
+                let counted = self.late.started(&row);
                 let holding = self.late.holding();
-                if let Some(holding) = &holding {
-                    holding.hold(&row, &connector, &late_tool).await;
-                }
-                let counted = self.late.started();
+                let held = match &holding {
+                    Some(holding) => holding.hold(&row, &connector, &late_tool, true).await,
+                    None => false,
+                };
                 runtime.spawn(async move {
                     let _counted = counted;
                     let outcome = match &holding {
                         Some(holding) => {
                             holding
-                                .while_running(&row, &connector, &late_tool, running)
+                                .while_running(&row, &connector, &late_tool, held, running)
                                 .await
                         }
                         None => running.await,

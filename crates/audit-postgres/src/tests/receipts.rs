@@ -18,7 +18,10 @@ use serde_json::{Value, json};
 use tokio_postgres::Client;
 
 use super::schema::{complete, denied, insert, insert_row, list};
-use super::{ADDED_BY_0010, GATEWAY_ROLE, INSUFFICIENT_PRIVILEGE, TestDatabase, code, message};
+use super::{
+    ADDED_BY_0010, EXCEPTION_COLUMN, GATEWAY_ROLE, INSUFFICIENT_PRIVILEGE, TestDatabase, code,
+    message,
+};
 use crate::{MIGRATIONS, OWNER_ROLE, PgAuditError, PgAuditStore, PoolSizes, migrate};
 
 const STATES: [(&str, ReceiptState); 4] = [
@@ -264,7 +267,7 @@ fn proposal(
         caller: fixture.caller_context(Caller::TeamA, SURFACE_ALL).unwrap(),
         tool: RequestedTool::new(DRAFT_TOOL),
         resources: FixtureConnector::resources_of(DRAFT_TOOL, &arguments),
-        key: Some(key.clone()),
+        key: gateway_core::CallKey::Valid(key.clone()),
         currency: gateway_core::Currency::NotAsked,
     };
     let decision = decide(&fixture.policy, &context);
@@ -529,7 +532,7 @@ async fn values(client: &Client, sql: &str) -> Vec<Value> {
         .collect()
 }
 
-/// Migration 0013 is additive: a receipt reserved before it keeps every value it had and reads
+/// Migration 0014 is additive: a receipt reserved before it keeps every value it had and reads
 /// no team, so a lookup of it fails and it goes to a person. The team is written once, at the
 /// insert: the gateway's role may not update it, and the trigger refuses any role that tries.
 #[tokio::test]
@@ -538,22 +541,22 @@ async fn the_receipt_team_migration_keeps_the_receipts_already_reserved() {
         return;
     };
     let admin = db.admin().await;
-    // The database as 0012 left it.
+    // The database as 0013 left it.
     admin
         .batch_execute(
             "ALTER TABLE switchboard_audit.receipts DROP COLUMN team;
-             DELETE FROM switchboard_audit.migrations WHERE version = 13;",
+             DELETE FROM switchboard_audit.migrations WHERE version = 14;",
         )
         .await
         .unwrap();
     let id = fresh_id(&admin).await;
-    receipt_in(&admin, &id, "key-before-0013", "unknown", false).await;
+    receipt_in(&admin, &id, "key-before-0014", "unknown", false).await;
     let read =
         format!("SELECT to_jsonb(r) FROM switchboard_audit.receipts r WHERE row_id = '{id}'");
     let before = values(&admin, &read).await;
 
     let mut owner = db.connect_as(OWNER_ROLE).await;
-    assert_eq!(migrate(&mut owner).await.unwrap(), vec![13]);
+    assert_eq!(migrate(&mut owner).await.unwrap(), vec![14]);
     let after = values(
         &admin,
         &format!(
@@ -657,12 +660,12 @@ async fn the_receipts_migration_keeps_the_rows_already_written() {
 
     assert_eq!(
         migrate(&mut owner).await.unwrap(),
-        vec![8, 9, 10, 11, 12, 13]
+        vec![8, 9, 10, 11, 12, 13, 14]
     );
     let after = values(
         &owner,
         &format!(
-            "SELECT to_jsonb(r) - 'duplicate_of' - {ADDED_BY_0010}
+            "SELECT to_jsonb(r) - 'duplicate_of' - {ADDED_BY_0010} - '{EXCEPTION_COLUMN}'
                FROM switchboard_audit.call_rows r ORDER BY id"
         ),
     )
