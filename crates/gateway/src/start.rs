@@ -43,7 +43,10 @@
 //! approval must match. An entry that serves a write tool also has the connector registered as
 //! its lookup by marker ([`Wiring::lookup`]), which reconciliation asks to settle an `unknown`
 //! receipt of the entry's tools. The gateway reads no GitHub key: the connector asks the key
-//! custodian at `[github] custodian_socket` for every token, a lookup's included. The drift pass
+//! custodian at `[github] custodian_socket` for every token, a lookup's included. Once the audit
+//! store has connected, the connector is given its receipts to read
+//! ([`GitHubConnector::read_receipts_from`]): the proposal tools tell a pull request the gateway
+//! opened for the caller from them, and send nothing without them. The drift pass
 //! gives a reach report's call the deadline `[connectors.<name>]` sets for the entry that serves
 //! the report's tool.
 //!
@@ -101,7 +104,7 @@ use connector_proxy::{
     CredentialFileError, FileCredentials, Loopback, ProxyConnector, Refusal, Upstream,
     UpstreamError,
 };
-use gateway_core::{ConnectorName, CredentialMode, InstanceName, Issuer};
+use gateway_core::{ConnectorName, CredentialMode, InstanceName, Issuer, ReceiptAttribution};
 use gateway_identity::Clock;
 use gateway_otto::HttpResolver;
 use gateway_otto::resolver::ResolverConfigError;
@@ -441,14 +444,14 @@ async fn prepare_with(
         },
         Wiring::new(clock),
     )?;
-    let mut wiring = github(
+    let (wiring, github_connector) = github(
         &registry,
         &github_entries,
         deployment.github.as_ref(),
         &deployment.connectors,
         wiring.instance(instance.clone()),
-    )?
-    .quotas(deployment.limits.quotas);
+    )?;
+    let mut wiring = wiring.quotas(deployment.limits.quotas);
     // Otto's resolver, before a key is fetched or the audit store connected: its URL is
     // checked, and its files read, as the client is built.
     if let Some(section) = &deployment.resolver {
@@ -464,6 +467,10 @@ async fn prepare_with(
     };
     if let Some(store) = &store {
         wiring = wiring.audit_store(store.clone());
+        // The proposal tools read the gateway's receipts (decision 0011, section 6).
+        if let Some(connector) = &github_connector {
+            connector.read_receipts_from(store.clone());
+        }
     }
 
     let (issuers, subjects) = identity_counts(&identity);
@@ -779,21 +786,39 @@ pub fn wire_github(
     wiring: Wiring,
 ) -> Result<Wiring, StartError> {
     let entries = github_entries(registry, settings.is_some())?;
-    github(registry, &entries, settings, bounds, wiring)
+    Ok(github(registry, &entries, settings, bounds, wiring)?.0)
+}
+
+/// [`wire_github`], with the connector given `receipts` to read, as [`prepare`] gives it the
+/// audit store's once it has connected: a test's in-memory store, for the proposal tools.
+pub fn wire_github_reading(
+    registry: &Registry,
+    settings: Option<&GitHubSettings>,
+    bounds: &BTreeMap<ConnectorName, InProcessLimits>,
+    receipts: Arc<dyn ReceiptAttribution>,
+    wiring: Wiring,
+) -> Result<Wiring, StartError> {
+    let entries = github_entries(registry, settings.is_some())?;
+    let (wiring, connector) = github(registry, &entries, settings, bounds, wiring)?;
+    if let Some(connector) = connector {
+        connector.read_receipts_from(receipts);
+    }
+    Ok(wiring)
 }
 
 /// `wiring` with the GitHub connector, built from `settings` and the registry's `entries`,
 /// registered under each entry's name with the bounds `bounds` sets for it, and with the
-/// definition of every tool it serves. Unchanged when there are no entries.
+/// definition of every tool it serves; and the connector, to be given the audit store's
+/// receipts once it connects. Unchanged, and no connector, when there are no entries.
 fn github(
     registry: &Registry,
     entries: &BTreeSet<ConnectorName>,
     settings: Option<&GitHubSettings>,
     bounds: &BTreeMap<ConnectorName, InProcessLimits>,
     mut wiring: Wiring,
-) -> Result<Wiring, StartError> {
+) -> Result<(Wiring, Option<Arc<GitHubConnector>>), StartError> {
     let Some(settings) = settings.filter(|_| !entries.is_empty()) else {
-        return Ok(wiring);
+        return Ok((wiring, None));
     };
     let connector = Arc::new(GitHubConnector::new(
         settings,
@@ -830,7 +855,7 @@ fn github(
         github_entries = %named(&entries.iter().cloned().collect::<Vec<_>>()),
         "the GitHub connector serves these entries, asking the key custodian for every token"
     );
-    Ok(wiring)
+    Ok((wiring, Some(connector)))
 }
 
 /// Refuses bounds in `bounds`, the deployment file's `[connectors.<name>]`, for a connector not

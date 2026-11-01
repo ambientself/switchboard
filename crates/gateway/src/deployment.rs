@@ -97,6 +97,7 @@
 //! ca_file = "github-ca.pem"      # needed for https; the only CAs trusted
 //! custodian_socket = "/run/switchboard-custodian/custodian.sock"
 //! custodian_deadline_seconds = 5 # 5 if left out; 1 to 30
+//! bot_login = "example-app[bot]" # optional: the App's own login; github__amend_change needs it
 //!
 //! [drift]
 //! interval_seconds = 300      # 300 if left out; 5 to 900
@@ -230,7 +231,10 @@
 //!   its `ca_file`, the PEM bundle of the only CAs its certificate may chain to, and
 //!   `custodian_socket`, the Unix socket of the key custodian (`switchboard-custodian`), which
 //!   issues every token. `custodian_deadline_seconds` bounds each token request: 5 unless
-//!   given, and 1 to 30. The URL is `https`, which needs `ca_file`; a development build may use
+//!   given, and 1 to 30. `bot_login`, optional, is the App's own GitHub login, such as
+//!   `example-app[bot]`: `github__amend_change` refuses a pull request anyone else opened,
+//!   and answers every call with an error without it, and a lookup by marker looks only at pull
+//!   requests it opened. The URL is `https`, which needs `ca_file`; a development build may use
 //!   plain `http` to a loopback address, with no `ca_file`, for the tests' fakes. The gateway
 //!   reads no GitHub key, and the table names none. The connector is wired for each GitHub
 //!   entry of the registry that declares its credential, and the gateway refuses to start with
@@ -517,6 +521,10 @@ pub struct GitHubSection {
     /// refused.
     #[serde(default)]
     pub job_log_hosts: Vec<String>,
+    /// The App's own GitHub login, such as `example-app[bot]`, if given. The connector refuses
+    /// one that is not a GitHub login.
+    #[serde(default)]
+    pub bot_login: Option<String>,
 }
 
 /// The longest the key custodian may be given to answer a token request.
@@ -539,6 +547,7 @@ impl GitHubSection {
             custodian_socket: base.join(self.custodian_socket),
             custodian_deadline: deadline,
             job_log_hosts: self.job_log_hosts,
+            bot_login: self.bot_login,
         })
     }
 }
