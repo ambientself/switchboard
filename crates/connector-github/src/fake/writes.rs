@@ -153,17 +153,19 @@ impl FakeRest {
     /// might: each field of `changes` replaces the pull request's, an object's fields one by
     /// one, such as `{"state": "closed"}`, `{"draft": false}`, `{"merged_at": "..."}`,
     /// `{"user": {"login": "someone"}}` or `{"body": "..."}`. It is the most recently updated
-    /// from then on.
+    /// from then on. Nothing changes for a pull request the fake did not open.
     pub fn set_pull(&self, repo: &str, number: u64, changes: Value) {
         let mut content = lock(&self.shared.writes);
         content.clock += 1;
         let clock = content.clock;
         content.updated.insert((repo.to_owned(), number), clock);
-        let pull = content
+        let Some(pull) = content
             .opened
             .get_mut(repo)
             .and_then(|opened| opened.get_mut(&number))
-            .expect("the pull request was opened through the fake");
+        else {
+            return;
+        };
         merge(pull, &changes);
         let changed = pull.clone();
         drop(content);
@@ -379,7 +381,7 @@ async fn edit(
             .get_mut(repo)
             .and_then(|opened| opened.get_mut(&number))
         else {
-            return Err(error(StatusCode::NOT_FOUND, "Not Found", token));
+            return Err((StatusCode::NOT_FOUND, "Not Found"));
         };
         merge(pull, &Value::Object(changes));
         let changed = pull.clone();
@@ -394,11 +396,11 @@ async fn edit(
 }
 
 /// A write's answer, meeting the next fault given, if any (see [`Fault`]): `apply` makes the
-/// write and gives its status and answer, or the answer of a write it refused.
+/// write and gives its status and answer, or the status and message of a write it refused.
 pub(super) async fn faulted(
     shared: &Shared,
     token: Option<&str>,
-    apply: impl FnOnce() -> Result<(StatusCode, Value), Response>,
+    apply: impl FnOnce() -> Result<(StatusCode, Value), (StatusCode, &'static str)>,
 ) -> Response {
     let fault = lock(&shared.writes).faults.pop_front();
     if let Some(Fault::Status(status)) = fault {
@@ -410,7 +412,7 @@ pub(super) async fn faulted(
     }
     let (status, made) = match apply() {
         Ok(made) => made,
-        Err(refused) => return refused,
+        Err((status, message)) => return error(status, message, token),
     };
     match fault {
         Some(Fault::AppliedThen(status)) => {

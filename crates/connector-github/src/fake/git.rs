@@ -183,13 +183,11 @@ impl FakeRest {
         lock(&self.shared.git).repos.insert(repo.to_owned(), found);
     }
 
-    /// Commits `files` on top of `branch` of `repo`, as someone else pushing; its object name.
-    pub fn git_push(&self, repo: &str, branch: &str, files: &[(&str, &str)]) -> String {
+    /// Commits `files` on top of `branch` of `repo`, as someone else pushing; its object name,
+    /// or `None` when `repo` has no git data.
+    pub fn git_push(&self, repo: &str, branch: &str, files: &[(&str, &str)]) -> Option<String> {
         let mut git = lock(&self.shared.git);
-        let found = git
-            .repos
-            .get_mut(repo)
-            .expect("the repository has git data");
+        let found = git.repos.get_mut(repo)?;
         let changes = files
             .iter()
             .map(|(path, text)| {
@@ -197,27 +195,28 @@ impl FakeRest {
                 ((*path).to_owned(), Entry::File(blob))
             })
             .collect();
-        found.commit_on(branch, changes, "Pushed by someone else")
+        Some(found.commit_on(branch, changes, "Pushed by someone else"))
     }
 
     /// Makes the branch `branch` of `repo` at the default branch's head, as someone else might.
+    /// Nothing changes when `repo` has no git data.
     pub fn git_branch(&self, repo: &str, branch: &str) {
         let mut git = lock(&self.shared.git);
-        let found = git
-            .repos
-            .get_mut(repo)
-            .expect("the repository has git data");
-        let head = found.refs[&found.default].clone();
-        found.refs.insert(branch.to_owned(), head);
+        let Some(found) = git.repos.get_mut(repo) else {
+            return;
+        };
+        if let Some(head) = found.refs.get(&found.default).cloned() {
+            found.refs.insert(branch.to_owned(), head);
+        }
     }
 
-    /// Commits `special` at `path` on the default branch of `repo`.
+    /// Commits `special` at `path` on the default branch of `repo`. Nothing changes when `repo`
+    /// has no git data.
     pub fn git_special(&self, repo: &str, path: &str, special: Special) {
         let mut git = lock(&self.shared.git);
-        let found = git
-            .repos
-            .get_mut(repo)
-            .expect("the repository has git data");
+        let Some(found) = git.repos.get_mut(repo) else {
+            return;
+        };
         let default = found.default.clone();
         found.commit_on(
             &default,
@@ -366,9 +365,8 @@ pub(super) async fn answer(
             let found = git
                 .repos
                 .get_mut(&repo)
-                .ok_or_else(|| error(StatusCode::NOT_FOUND, "Not Found", token))?;
-            written(found, endpoint, &sent)
-                .map_err(|why| error(StatusCode::UNPROCESSABLE_ENTITY, why, token))
+                .ok_or((StatusCode::NOT_FOUND, "Not Found"))?;
+            written(found, endpoint, &sent).map_err(|why| (StatusCode::UNPROCESSABLE_ENTITY, why))
         })
         .await,
     )
