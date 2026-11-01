@@ -4,7 +4,9 @@ use std::collections::VecDeque;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use gateway_core::audit::{AuditRowId, RecordedResources};
-use gateway_core::{BoxFuture, Lookup, LookupAnswer, LookupRequest, Resource, ToolName};
+use gateway_core::{
+    BoxFuture, Lookup, LookupAnswer, LookupRequest, PolicyRevision, Resource, TeamId, ToolName,
+};
 
 use crate::gate::Gate;
 
@@ -19,6 +21,10 @@ pub struct LookedUp {
     pub tool: ToolName,
     /// The resources the call named.
     pub resources: RecordedResources,
+    /// The team the receipt recorded.
+    pub team: Option<TeamId>,
+    /// The policy revision in force.
+    pub revision: PolicyRevision,
 }
 
 struct State {
@@ -88,6 +94,8 @@ impl Lookup for FakeLookup {
                 target: request.target.clone(),
                 tool: request.tool.clone(),
                 resources: request.resources.clone(),
+                team: request.team.cloned(),
+                revision: request.revision.clone(),
             });
             let answer = state
                 .next
