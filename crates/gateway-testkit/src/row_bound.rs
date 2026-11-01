@@ -159,7 +159,7 @@ pub fn reached_bytes(reached: &ReachedResources) -> usize {
 
 /// Each column of the call row begin writes for `record` as the row `id`, and its bytes, as
 /// `audit_postgres`'s `BeginRow::sizes` counts them, in the same order.
-pub fn call_row_sizes(id: &AuditRowId, record: &AuditRecord) -> [(&'static str, usize); 38] {
+pub fn call_row_sizes(id: &AuditRowId, record: &AuditRecord) -> [(&'static str, usize); 39] {
     let principal = record.proved_principal.get();
     let [proved_kind, proved_team, proved_groups] = principal_sizes(principal);
     let reason = record
@@ -280,6 +280,15 @@ pub fn call_row_sizes(id: &AuditRowId, record: &AuditRecord) -> [(&'static str, 
         (
             "currency",
             optional_bytes(record.currency.map(CurrencyAnswer::as_str)),
+        ),
+        (
+            "allowed_by_exception",
+            optional_bytes(
+                record
+                    .allowed_by_exception
+                    .as_ref()
+                    .map(|exception| exception.as_str()),
+            ),
         ),
     ]
 }

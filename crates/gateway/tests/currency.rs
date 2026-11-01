@@ -6,7 +6,9 @@
 //! control-plane surface, both read from `docs/examples/otto-profiles.toml`. A read is never
 //! asked about and is allowed whatever the resolver says or does; a proposal is asked about
 //! once, every time, and allowed only when current. Every failure is unconfirmed and denied,
-//! with the row recording the answer.
+//! with the row recording the answer. A `write` tool the sandbox profile's own exception names
+//! (decision 0011, section 9) is fenced the same way, and denied under the control-plane
+//! profile, whose list does not name it.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod support;
@@ -27,7 +29,7 @@ use gateway_otto::resolver::{Answer, BUDGET, MAX_TOKEN_BYTES};
 use gateway_testkit::{
     AUDIENCE, CONNECTOR, Caller, DRAFT_TOOL, Fixture, FixtureConnector, InMemoryAuditStore,
     READ_TOOL, SURFACE_ALL, TEAM_A, TEAM_A_SUBJECT, TEAM_B, TEAM_B_SUBJECT, WORKLOAD_ISSUER,
-    WRITE_TOOL, fresh_key,
+    WRITE_TOOL, draft_lookup, fresh_key,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -81,6 +83,27 @@ fn otto(config: &mut Value, minter: &TestMinter) {
         }],
         "tool_mapping": {"otto_read": READ_TOOL, "otto_draft": DRAFT_TOOL, "otto_write": WRITE_TOOL},
     }});
+}
+
+/// The exception the test gives the sandbox profile.
+const EXCEPTION: &str = "fixture-writes";
+
+/// Otto's profiles as [`otto`] gives them, with the sandbox profile's own list of exceptions
+/// naming the fixture's `write` tool, which is settled by a lookup, as the loader requires of an
+/// excepted `write` tool. The example file lists no exception and is not changed: the test adds
+/// the list to the profile it read from it.
+fn otto_excepting_the_write_tool(config: &mut Value, minter: &TestMinter) {
+    otto(config, minter);
+    for tool in config["policy"]["tools"].as_array_mut().unwrap() {
+        if tool["name"] == WRITE_TOOL {
+            tool["settlement"] = draft_lookup();
+        }
+    }
+    for profile in config["policy"]["profiles"].as_array_mut().unwrap() {
+        if profile["name"] == SANDBOX {
+            profile["exceptions"] = json!([{"name": EXCEPTION, "tools": [WRITE_TOOL]}]);
+        }
+    }
 }
 
 /// The client for `fake`, over plain HTTP to loopback.
@@ -281,6 +304,80 @@ async fn a_current_proposal_with_a_key_runs_and_reserves_its_receipt() {
     assert_eq!(receipts.len(), 1, "{receipts:?}");
     assert_eq!(receipts[0].tool.as_str(), DRAFT_TOOL);
     assert_eq!(receipts[0].state, ReceiptState::Completed);
+}
+
+// --- A write tool under an exception ------------------------------------------------------------
+
+/// A `write` tool the sandbox profile's own exception names is allowed only while the resolver
+/// says the turn is current: it is asked once per call, like a proposal, and every other answer
+/// denies it. Its allowed row records the exception, a denied row none, and its receipt is
+/// reserved and completed. Under the control-plane profile, whose list does not name it, it is
+/// denied at check 5 without asking, with a grant or without one.
+#[tokio::test]
+async fn an_excepted_write_is_allowed_only_when_current_and_its_row_names_the_exception() {
+    let minter = TestMinter::generate();
+    let fake = FakeResolver::start(FakeReply::Answer(Answer::Current))
+        .await
+        .unwrap();
+    let server = Server::start_wired(
+        |config| otto_excepting_the_write_tool(config, &minter),
+        |wiring| wiring.resolver(client(&fake)),
+    )
+    .await;
+    let grant = grant(&server, &minter, json!({}));
+    for answer in Answer::ALL {
+        fake.set(FakeReply::Answer(answer));
+        let before = asked(&fake);
+        let request = call(&server, Caller::TeamA, WRITE_TOOL, Some(&grant));
+        if answer == Answer::Current {
+            assert_allowed(&server, request, Some(CurrencyAnswer::Current)).await;
+            let row = last_row(&server);
+            assert_eq!(
+                row.allowed_by_exception.as_ref().map(|name| name.as_str()),
+                Some(EXCEPTION),
+                "{row:?}"
+            );
+        } else {
+            assert_denied(
+                &server,
+                request,
+                ReasonKind::NotCurrent,
+                Some(answer.currency()),
+            )
+            .await;
+            assert_eq!(last_row(&server).allowed_by_exception, None);
+        }
+        assert_eq!(asked(&fake), before + 1, "{answer:?}");
+    }
+    let receipts = server.store.receipts();
+    assert_eq!(receipts.len(), 1, "{receipts:?}");
+    assert_eq!(receipts[0].tool.as_str(), WRITE_TOOL);
+    assert_eq!(receipts[0].state, ReceiptState::Completed);
+
+    let before = asked(&fake);
+    let control = grant_for_team_b(&server, &minter);
+    for grant in [Some(control.as_str()), None] {
+        assert_denied(
+            &server,
+            call(&server, Caller::TeamB, WRITE_TOOL, grant),
+            ReasonKind::ClassificationNotPermitted,
+            None,
+        )
+        .await;
+        let row = last_row(&server);
+        assert_eq!(row.profile.as_str(), CONTROL_PLANE);
+        assert_eq!(row.allowed_by_exception, None);
+    }
+    assert_eq!(
+        asked(&fake),
+        before,
+        "a call under the control-plane profile was asked about"
+    );
+}
+
+/// A grant for team B's turn, under the control-plane profile.
+fn grant_for_team_b(server: &Server, minter: &TestMinter) -> String {
+    grant(server, minter, json!({"team": TEAM_B}))
 }
 
 // --- Unconfirmed --------------------------------------------------------------------------------
@@ -520,6 +617,9 @@ fn the_example_profiles_are_the_decisions() {
             profile.name
         );
         assert!(!profile.idempotency_key_header, "{}", profile.name);
+        // The comment-tool exception is not in force until its register entry is signed
+        // (decision 0011, section 9), so the example shows the list only in a comment.
+        assert!(profile.exceptions.is_empty(), "{}", profile.name);
     }
     assert!(profiles[0].requires_delegation && profiles[0].requires_currency);
     assert!(!profiles[1].requires_delegation && !profiles[1].requires_currency);

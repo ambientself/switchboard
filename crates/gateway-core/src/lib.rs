@@ -44,15 +44,15 @@ pub use decision::{
     Reason, ReasonKind, ResourceProblem, Verdict, decide, list_tools,
 };
 pub use names::{
-    ConnectorName, DelegationIssuer, DeploymentName, ExecutionId, GroupId, InstanceName,
-    InvalidPodUid, InvalidToolName, Issuer, KeyId, MAX_TOOL_NAME, Person, PodUid, PolicyRevision,
-    ProfileName, RequestedTool, SessionId, Subject, SurfaceName, TeamId, ToolName, ToolUseId,
-    TurnId,
+    ConnectorName, DelegationIssuer, DeploymentName, ExceptionName, ExecutionId, GroupId,
+    InstanceName, InvalidExceptionName, InvalidPodUid, InvalidToolName, Issuer, KeyId,
+    MAX_EXCEPTION_NAME, MAX_TOOL_NAME, Person, PodUid, PolicyRevision, ProfileName, RequestedTool,
+    SessionId, Subject, SurfaceName, TeamId, ToolName, ToolUseId, TurnId,
 };
 pub use policy::{
-    Admitted, ApprovedTool, ConnectorEntry, CredentialMode, DeclaredFrom, EntryKind, Narrowing,
-    PolicySnapshot, PrincipalRestriction, Profile, Resource, ResourceDeclaration, ResourceLimits,
-    Resources, SnapshotData, SnapshotError, Surface,
+    Admitted, ApprovedTool, ConnectorEntry, CredentialMode, DeclaredFrom, EntryKind, Exception,
+    Narrowing, PolicySnapshot, PrincipalRestriction, Profile, Resource, ResourceDeclaration,
+    ResourceLimits, Resources, SnapshotData, SnapshotError, Surface,
 };
 pub use principal::{
     Delegation, DelegationDigest, DelegationFailure, DigestBeforeSignature, Egress,

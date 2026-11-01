@@ -16,11 +16,11 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use gateway_core::{
     ApprovedTool, CallContext, CallKey, CallerContext, Classification, ConnectorEntry,
     CredentialMode, Currency, CurrencyAnswer, Decision, DeclaredFrom, Delegation,
-    DelegationFailure, EntryKind, GroupId, IdempotencyKey, Issuer, Narrowing, PodUid,
-    PolicySnapshot, Principal, PrincipalId, PrincipalKind, PrincipalRestriction, Profile,
-    ProfileName, Reason, ReasonKind, Resource, ResourceDeclaration, ResourceLimits,
-    ResourceProblem, Resources, Settlement, SnapshotData, Subject, Surface, SurfaceName, TeamId,
-    ToolName, UnverifiedDelegation, Verdict, decide, list_tools,
+    DelegationFailure, EntryKind, Exception, ExceptionName, GroupId, IdempotencyKey, Issuer,
+    Narrowing, PodUid, PolicySnapshot, Principal, PrincipalId, PrincipalKind, PrincipalRestriction,
+    Profile, ProfileName, Reason, ReasonKind, Resource, ResourceDeclaration, ResourceLimits,
+    ResourceProblem, Resources, Settlement, SnapshotData, Subject, Surface, SurfaceName,
+    TargetKind, TeamId, ToolName, UnverifiedDelegation, Verdict, decide, list_tools,
 };
 
 use gateway_core::AuditRecord;
@@ -74,11 +74,34 @@ struct World {
 
 impl World {
     fn snapshot(&self) -> PolicySnapshot {
+        self.snapshot_beside(&[])
+    }
+
+    /// The world's snapshot, holding `others` beside the world's own profile.
+    fn snapshot_beside(&self, others: &[Profile]) -> PolicySnapshot {
         let mut data = self.data.clone();
         data.profiles = vec![self.profile.clone()];
+        data.profiles.extend(others.iter().cloned());
         serve_proposals_as_rules_8_and_9_allow(&mut data, &self.principal);
         settle_every_side_effect(&mut data);
+        except_as_the_loader_allows(&mut data);
         PolicySnapshot::new(data).expect("a generated snapshot is invalid")
+    }
+
+    /// The world's profile as its snapshot holds it, with the exceptions the loader allows.
+    fn loaded_profile(&self) -> Profile {
+        self.snapshot()
+            .profile(&self.profile.name)
+            .cloned()
+            .expect("the snapshot holds the world's profile")
+    }
+
+    /// Adds the world's tool to its profile's exceptions, as a list of its own.
+    fn except_the_tool(&mut self) {
+        self.profile.exceptions.push(Exception {
+            name: ExceptionName::parse("named-tool").unwrap(),
+            tools: [self.tool.clone()].into(),
+        });
     }
 
     fn caller(&self) -> CallerContext {
@@ -130,6 +153,48 @@ fn settle_every_side_effect(data: &mut SnapshotData) {
     for tool in &mut data.tools {
         tool.settlement =
             (tool.classification != Classification::Read).then_some(Settlement::Person);
+    }
+}
+
+/// Decision 0011, section 9: the loader refuses an exception on a profile that does not
+/// require currency, one naming a tool that is not approved or not `write`, a `write` tool in
+/// two exceptions of one profile, and an excepted `write` tool settled by a person. A property
+/// may change a tool's classification after the world is drawn, so each profile's list follows
+/// the rules here, as a person writing the policy would have to: a profile that does not require
+/// currency lists none, a list keeps only the approved `write` tools it names and not one named
+/// before, a list left empty is dropped, and each tool a list keeps is settled by a lookup. This
+/// never switches a profile's currency on, so what a property tests is the profile it drew.
+/// Nothing a decision or a listing reads looks at a settlement.
+fn except_as_the_loader_allows(data: &mut SnapshotData) {
+    let writes: BTreeSet<ToolName> = data
+        .tools
+        .iter()
+        .filter(|tool| tool.classification == Classification::Write)
+        .map(|tool| tool.name.clone())
+        .collect();
+    let mut excepted = BTreeSet::new();
+    for profile in &mut data.profiles {
+        if !profile.requires_currency {
+            profile.exceptions.clear();
+        }
+        let mut named = BTreeSet::new();
+        for exception in &mut profile.exceptions {
+            exception
+                .tools
+                .retain(|tool| writes.contains(tool) && named.insert(tool.clone()));
+        }
+        profile
+            .exceptions
+            .retain(|exception| !exception.tools.is_empty());
+        excepted.extend(named);
+    }
+    for tool in &mut data.tools {
+        if excepted.contains(&tool.name) {
+            tool.settlement = Some(Settlement::Lookup(TargetKind {
+                system: "github".into(),
+                kind: "repository".into(),
+            }));
+        }
     }
 }
 
@@ -416,14 +481,22 @@ fn any_world() -> impl Strategy<Value = World> {
         subset(Classification::ALL.to_vec()),
         any::<bool>(),
         any::<bool>(),
+        proptest::option::weighted(0.5, subset(callable.clone())),
     )
         .prop_map(
-            |(classifications, requires_delegation, requires_currency)| Profile {
+            |(classifications, requires_delegation, requires_currency, excepted)| Profile {
                 name: "profile".into(),
                 classifications: classifications.into_iter().collect(),
                 requires_delegation,
                 requires_currency,
                 idempotency_key_header: false,
+                exceptions: excepted
+                    .map(|tools| Exception {
+                        name: ExceptionName::parse("generated").unwrap(),
+                        tools: tool_names(tools),
+                    })
+                    .into_iter()
+                    .collect(),
             },
         );
     let resources = prop_oneof![
@@ -506,17 +579,75 @@ proptest! {
         prop_assert!(!list_tools(&world.snapshot(), &world.caller()).iter().any(|listed| listed.name == tool));
     }
 
+    /// Decision 0011, section 9, restating decision 0006's: a `write` or `destructive` tool is
+    /// never allowed or listed, except a `write` tool named in the calling profile's own list of
+    /// exceptions. A call it allows is fenced (its profile requires currency, and the turn is
+    /// current), carries a key, and its decision names the exception. A destructive tool is
+    /// never allowed: no list can name one.
     #[test]
-    fn a_write_or_destructive_tool_is_never_allowed(
+    fn a_write_or_destructive_tool_is_never_allowed_or_listed_unless_its_own_profile_excepts_it(
+        mut world in world(),
+        classification in select(vec![Classification::Write, Classification::Destructive]),
+        named in any::<bool>(),
+    ) {
+        if let Some(approved) = world.approved_tool_mut() {
+            approved.classification = classification;
+        }
+        if named {
+            world.except_the_tool();
+        }
+        let snapshot = world.snapshot();
+        let decision = decide(&snapshot, &world.call());
+        let calling = snapshot.profile(&world.profile_name);
+        if decision.is_allowed() {
+            let profile = calling.expect("an allowed call has a profile");
+            let excepted = profile.excepting(&world.tool);
+            prop_assert!(excepted.is_some(), "allowed a {} tool its profile does not name: {:?}", classification, decision);
+            prop_assert_eq!(classification, Classification::Write);
+            prop_assert_eq!(decision.exception(), excepted);
+            prop_assert!(profile.requires_currency);
+            prop_assert_eq!(world.currency, Currency::Asked(CurrencyAnswer::Current));
+            prop_assert!(world.key.is_some());
+        } else {
+            prop_assert_eq!(decision.exception(), None);
+        }
+        for listed in list_tools(&snapshot, &world.caller()) {
+            if matches!(listed.classification, Classification::Write | Classification::Destructive) {
+                prop_assert_eq!(listed.classification, Classification::Write);
+                prop_assert!(
+                    calling.and_then(|profile| profile.excepting(&listed.name)).is_some(),
+                    "listed {} its profile does not name", listed.name
+                );
+            }
+        }
+    }
+
+    /// An exception in another profile's list never allows or lists a tool: check 5 reads only
+    /// the calling profile's own list, whatever another profile of the snapshot names.
+    #[test]
+    fn an_exception_in_another_profile_never_allows(
         mut world in world(),
         classification in select(vec![Classification::Write, Classification::Destructive]),
     ) {
         if let Some(approved) = world.approved_tool_mut() {
             approved.classification = classification;
         }
-        let decision = world.decide();
-        prop_assert!(!decision.is_allowed(), "allowed a {classification} tool: {decision:?}");
-        let snapshot = world.snapshot();
+        world.profile.exceptions.clear();
+        let other = Profile {
+            name: "other".into(),
+            classifications: Classification::ALL.into_iter().collect(),
+            requires_delegation: false,
+            requires_currency: true,
+            idempotency_key_header: false,
+            exceptions: vec![Exception {
+                name: ExceptionName::parse("elsewhere").unwrap(),
+                tools: [world.tool.clone()].into(),
+            }],
+        };
+        let snapshot = world.snapshot_beside(&[other]);
+        let decision = decide(&snapshot, &world.call());
+        prop_assert!(!decision.is_allowed(), "another profile's exception allowed {:?}", decision);
+        prop_assert_eq!(decision.exception(), None);
         prop_assert!(list_tools(&snapshot, &world.caller())
             .iter()
             .all(|listed| !matches!(listed.classification, Classification::Write | Classification::Destructive)));
@@ -533,11 +664,19 @@ proptest! {
         }
         world.profile.classifications = others.into_iter().filter(|other| *other != classification).collect();
         let decision = world.decide();
-        prop_assert!(!decision.is_allowed(), "allowed a {classification} tool the profile does not list: {decision:?}");
+        // The one way past is a `write` tool its own profile's exception names (decision 0011).
+        let excepted = |tool: &ToolName| world.loaded_profile().excepting(tool).is_some();
+        if decision.is_allowed() {
+            prop_assert!(
+                classification == Classification::Write && excepted(&world.tool),
+                "allowed a {} tool the profile does not list: {:?}", classification, decision
+            );
+        }
         let snapshot = world.snapshot();
         prop_assert!(list_tools(&snapshot, &world.caller())
             .iter()
-            .all(|listed| world.profile.classifications.contains(&listed.classification)));
+            .all(|listed| world.profile.classifications.contains(&listed.classification)
+                || (listed.classification == Classification::Write && excepted(&listed.name))));
     }
 
     #[test]
@@ -669,6 +808,23 @@ proptest! {
         }
         let decision = world.decide();
         prop_assert!(decision.is_allowed(), "open_up left a check closed: {decision:?}");
+    }
+
+    /// `open_up` with the world's tool `write`, named in its profile's exceptions, under a
+    /// profile that requires currency, is allowed, and the decision names the exception: the
+    /// restated property's allowed side is reached.
+    #[test]
+    fn an_opened_world_whose_profile_excepts_its_write_tool_is_allowed_by_the_exception(mut world in any_world()) {
+        open_up(&mut world);
+        if let Some(approved) = world.approved_tool_mut() {
+            approved.classification = Classification::Write;
+        }
+        world.profile.requires_currency = true;
+        world.profile.exceptions.clear();
+        world.except_the_tool();
+        let decision = world.decide();
+        prop_assert!(decision.is_allowed(), "open_up left a check closed: {:?}", decision);
+        prop_assert_eq!(decision.exception().map(ExceptionName::as_str), Some("named-tool"));
     }
 
     /// Decision 0012: under a profile that requires currency, a call of a tool not classified
@@ -1306,7 +1462,12 @@ proptest! {
         }
         for name in &withdrawn {
             prop_assert!(derived.tool(name).is_none());
+            // A profile's exception that names a withdrawn tool allows nothing: check 2 denies it.
+            let mut withdrawn_call = world.call();
+            withdrawn_call.tool = name.clone().into();
+            prop_assert!(!decide(&derived, &withdrawn_call).is_allowed());
         }
+        prop_assert!(derived.profiles().eq(snapshot.profiles()));
         let call = world.call();
         if decide(&derived, &call).is_allowed() {
             prop_assert!(decide(&snapshot, &call).is_allowed());

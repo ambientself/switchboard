@@ -1,5 +1,5 @@
 {
-  "about": "The decision table. Each case names a snapshot, a principal and a delegation defined below, the profile, surface, tool and resources of one call, its key and its currency answer when it has them, and the decision expected, with the exact sentence for a denial. tests/decision_table.rs runs every case and reports every one that fails. To add a policy rule, add cases here first and watch them fail.",
+  "about": "The decision table. Each case names a snapshot, a principal and a delegation defined below, the profile, surface, tool and resources of one call, its key and its currency answer when it has them, and the decision expected, with the exact sentence for a denial and, for an allow by an exception in the profile's own list (decision 0011, section 9), the exception's name, which the row records. tests/decision_table.rs runs every case and reports every one that fails. To add a policy rule, add cases here first and watch them fail.",
   "deployment": "test",
   "principals": {
     "payments-sandbox": {
@@ -69,10 +69,10 @@
     }
   },
   "delegations": {
-    "payments-turn": { "acting_person": "requester@example.test", "team": "payments", "tools": ["github__get_file", "github__search_code", "github__list_org_repos", "github__open_pull_request", "github__comment_on_own_proposal", "github__delete_branch", "jira__get_issue", "jira__create_issue", "jira__add_comment", "jira__transition_issue"] },
+    "payments-turn": { "acting_person": "requester@example.test", "team": "payments", "tools": ["github__get_file", "github__search_code", "github__list_org_repos", "github__open_pull_request", "github__comment_on_own_proposal", "github__delete_branch", "jira__get_issue", "jira__create_issue", "jira__add_comment", "jira__transition_issue", "github__pr_comment", "jira__comment", "atlassian__addOrEditJiraIssueComment"] },
     "payments-turn-narrow": { "acting_person": "requester@example.test", "team": "payments", "tools": ["github__get_file"] },
     "payments-turn-empty": { "acting_person": "requester@example.test", "team": "payments", "tools": [] },
-    "search-turn": { "acting_person": "requester@example.test", "team": "search", "tools": ["github__get_file", "github__search_code", "github__list_org_repos", "github__open_pull_request", "github__delete_branch", "jira__get_issue", "jira__create_issue", "jira__add_comment", "jira__transition_issue"] },
+    "search-turn": { "acting_person": "requester@example.test", "team": "search", "tools": ["github__get_file", "github__search_code", "github__list_org_repos", "github__open_pull_request", "github__delete_branch", "jira__get_issue", "jira__create_issue", "jira__add_comment", "jira__transition_issue", "github__pr_comment", "jira__comment"] },
     "search-turn-narrow": { "acting_person": "requester@example.test", "team": "search", "tools": ["github__get_file"] },
     "inventory-turn": { "acting_person": "requester@example.test", "team": "inventory", "tools": ["docs__search", "jira__get_issue", "jira__create_issue", "jira__add_comment", "jira__transition_issue"] },
     "inventory-turn-narrow": { "acting_person": "requester@example.test", "team": "inventory", "tools": ["jira__get_issue"] },
@@ -100,12 +100,15 @@
         { "name": "jira__add_comment", "classification": "write", "connector": "jira", "resources": "declared", "settlement": { "lookup": { "system": "jira", "kind": "project" } } },
         { "name": "jira__transition_issue", "classification": "write", "connector": "jira", "resources": "declared", "settlement": { "lookup": { "system": "jira", "kind": "project" } } },
         { "name": "docs__search", "classification": "read", "connector": "docs", "resources": "no_resources" },
-        { "name": "otto__post_status", "classification": "propose", "connector": "otto", "resources": "no_resources", "settlement": "person" }
+        { "name": "otto__post_status", "classification": "propose", "connector": "otto", "resources": "no_resources", "settlement": "person" },
+        { "name": "github__pr_comment", "classification": "write", "connector": "github", "resources": "declared", "settlement": { "lookup": { "system": "github", "kind": "repository" } } },
+        { "name": "jira__comment", "classification": "write", "connector": "jira", "resources": "declared", "settlement": { "lookup": { "system": "jira", "kind": "project" } } },
+        { "name": "atlassian__addOrEditJiraIssueComment", "classification": "write", "connector": "jira", "resources": "declared", "settlement": { "lookup": { "system": "jira", "kind": "project" } } }
       ],
       "surfaces": [
         {
           "name": "otto-sandbox",
-          "tools": ["github__get_file", "github__search_code", "github__list_org_repos", "github__open_pull_request", "github__comment_on_own_proposal", "github__delete_branch", "jira__get_issue", "jira__create_issue", "jira__add_comment", "jira__transition_issue"],
+          "tools": ["github__get_file", "github__search_code", "github__list_org_repos", "github__open_pull_request", "github__comment_on_own_proposal", "github__delete_branch", "jira__get_issue", "jira__create_issue", "jira__add_comment", "jira__transition_issue", "github__pr_comment", "jira__comment", "atlassian__addOrEditJiraIssueComment"],
           "teams": ["payments", "search"],
           "principals": "any_in_teams_and_groups"
         },
@@ -130,7 +133,8 @@
       ],
       "profiles": [
         { "name": "otto", "classifications": ["read", "propose"], "requires_delegation": true },
-        { "name": "otto-fenced", "classifications": ["read", "propose"], "requires_delegation": true, "requires_currency": true },
+        { "name": "otto-fenced", "classifications": ["read", "propose"], "requires_delegation": true, "requires_currency": true,
+          "exceptions": [{ "name": "otto-comment-tools", "tools": ["github__pr_comment", "jira__comment"] }] },
         { "name": "employee", "classifications": ["read", "propose"], "requires_delegation": false },
         { "name": "service", "classifications": ["read", "propose"], "requires_delegation": false },
         { "name": "lists-everything", "classifications": ["read", "propose", "write", "destructive"], "requires_delegation": false },
@@ -1189,6 +1193,349 @@
       "resources": { "named": [] },
       "expect": { "decision": "deny", "reason": "unknown_tool",
         "sentence": "Tool `github__force_push` is not available on surface `otto-sandbox`. Call `tools/list` to see the tools this surface serves." }
+    },
+    {
+      "name": "exception: github__pr_comment is allowed under otto-fenced while the turn is current, and its row names the exception",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__pr_comment",
+      "resources": {"named": [{"system": "github", "kind": "repository", "identifier": "example-org/payments-api"}]},
+      "key": "toolu_exception_200",
+      "currency": "current",
+      "expect": {"decision": "allow", "exception": "otto-comment-tools"}
+    },
+    {
+      "name": "exception: jira__comment is allowed under otto-fenced while the turn is current, and its row names the exception",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "jira__comment",
+      "resources": {"named": [{"system": "jira", "kind": "project", "identifier": "PAY"}]},
+      "key": "toolu_exception_201",
+      "currency": "current",
+      "expect": {"decision": "allow", "exception": "otto-comment-tools"}
+    },
+    {
+      "name": "exception: github__pr_comment is denied at check 5 under otto, whose own list does not name it",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__pr_comment",
+      "resources": {"named": [{"system": "github", "kind": "repository", "identifier": "example-org/payments-api"}]},
+      "key": "toolu_exception_202",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `github__pr_comment` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it." }
+    },
+    {
+      "name": "exception: github__pr_comment is denied at check 5 under employee, whose own list does not name it",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "employee", "surface": "otto-sandbox", "tool": "github__pr_comment",
+      "resources": {"named": [{"system": "github", "kind": "repository", "identifier": "example-org/payments-api"}]},
+      "key": "toolu_exception_203",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `github__pr_comment` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it." }
+    },
+    {
+      "name": "exception: github__pr_comment is denied at check 5 under service, whose own list does not name it",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "service", "surface": "otto-sandbox", "tool": "github__pr_comment",
+      "resources": {"named": [{"system": "github", "kind": "repository", "identifier": "example-org/payments-api"}]},
+      "key": "toolu_exception_204",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `github__pr_comment` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it." }
+    },
+    {
+      "name": "exception: github__pr_comment is denied at check 5 under lists-everything, whose own list does not name it",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "lists-everything", "surface": "otto-sandbox", "tool": "github__pr_comment",
+      "resources": {"named": [{"system": "github", "kind": "repository", "identifier": "example-org/payments-api"}]},
+      "key": "toolu_exception_205",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `github__pr_comment` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it." }
+    },
+    {
+      "name": "exception: github__pr_comment is denied at check 5 under reads-only, whose own list does not name it",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "reads-only", "surface": "otto-sandbox", "tool": "github__pr_comment",
+      "resources": {"named": [{"system": "github", "kind": "repository", "identifier": "example-org/payments-api"}]},
+      "key": "toolu_exception_206",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `github__pr_comment` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it." }
+    },
+    {
+      "name": "exception: github__pr_comment is denied at check 5 under proposals-only, whose own list does not name it",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "proposals-only", "surface": "otto-sandbox", "tool": "github__pr_comment",
+      "resources": {"named": [{"system": "github", "kind": "repository", "identifier": "example-org/payments-api"}]},
+      "key": "toolu_exception_207",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `github__pr_comment` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it." }
+    },
+    {
+      "name": "exception: github__pr_comment is denied at check 5 under permits-nothing, whose own list does not name it",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "permits-nothing", "surface": "otto-sandbox", "tool": "github__pr_comment",
+      "resources": {"named": [{"system": "github", "kind": "repository", "identifier": "example-org/payments-api"}]},
+      "key": "toolu_exception_208",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `github__pr_comment` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it." }
+    },
+    {
+      "name": "exception: jira__comment is denied at check 5 under otto, whose own list does not name it",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "jira__comment",
+      "resources": {"named": [{"system": "jira", "kind": "project", "identifier": "PAY"}]},
+      "key": "toolu_exception_209",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `jira__comment` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it." }
+    },
+    {
+      "name": "exception: jira__comment is denied at check 5 under employee, whose own list does not name it",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "employee", "surface": "otto-sandbox", "tool": "jira__comment",
+      "resources": {"named": [{"system": "jira", "kind": "project", "identifier": "PAY"}]},
+      "key": "toolu_exception_210",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `jira__comment` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it." }
+    },
+    {
+      "name": "exception: jira__comment is denied at check 5 under service, whose own list does not name it",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "service", "surface": "otto-sandbox", "tool": "jira__comment",
+      "resources": {"named": [{"system": "jira", "kind": "project", "identifier": "PAY"}]},
+      "key": "toolu_exception_211",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `jira__comment` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it." }
+    },
+    {
+      "name": "exception: jira__comment is denied at check 5 under lists-everything, whose own list does not name it",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "lists-everything", "surface": "otto-sandbox", "tool": "jira__comment",
+      "resources": {"named": [{"system": "jira", "kind": "project", "identifier": "PAY"}]},
+      "key": "toolu_exception_212",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `jira__comment` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it." }
+    },
+    {
+      "name": "exception: jira__comment is denied at check 5 under reads-only, whose own list does not name it",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "reads-only", "surface": "otto-sandbox", "tool": "jira__comment",
+      "resources": {"named": [{"system": "jira", "kind": "project", "identifier": "PAY"}]},
+      "key": "toolu_exception_213",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `jira__comment` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it." }
+    },
+    {
+      "name": "exception: jira__comment is denied at check 5 under proposals-only, whose own list does not name it",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "proposals-only", "surface": "otto-sandbox", "tool": "jira__comment",
+      "resources": {"named": [{"system": "jira", "kind": "project", "identifier": "PAY"}]},
+      "key": "toolu_exception_214",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `jira__comment` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it." }
+    },
+    {
+      "name": "exception: jira__comment is denied at check 5 under permits-nothing, whose own list does not name it",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "permits-nothing", "surface": "otto-sandbox", "tool": "jira__comment",
+      "resources": {"named": [{"system": "jira", "kind": "project", "identifier": "PAY"}]},
+      "key": "toolu_exception_215",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `jira__comment` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it." }
+    },
+    {
+      "name": "exception: github__pr_comment under otto-fenced is denied when the turn is superseded, and its row names no exception",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__pr_comment",
+      "resources": {"named": [{"system": "github", "kind": "repository", "identifier": "example-org/payments-api"}]},
+      "key": "toolu_exception_216",
+      "currency": "superseded",
+      "expect": { "decision": "deny", "reason": "not_current",
+        "sentence": "Tool `github__pr_comment` is classified `write`, so a call to it is allowed only while the control plane that issued this call's delegation says its turn is current. It says the turn is no longer current, so the call was refused and nothing ran. Do not retry it under this delegation." }
+    },
+    {
+      "name": "exception: github__pr_comment under otto-fenced is denied when the turn is revoked, and its row names no exception",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__pr_comment",
+      "resources": {"named": [{"system": "github", "kind": "repository", "identifier": "example-org/payments-api"}]},
+      "key": "toolu_exception_217",
+      "currency": "revoked",
+      "expect": { "decision": "deny", "reason": "not_current",
+        "sentence": "Tool `github__pr_comment` is classified `write`, so a call to it is allowed only while the control plane that issued this call's delegation says its turn is current. It says the turn is no longer current, so the call was refused and nothing ran. Do not retry it under this delegation." }
+    },
+    {
+      "name": "exception: github__pr_comment under otto-fenced is denied when the turn is unconfirmed, and its row names no exception",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__pr_comment",
+      "resources": {"named": [{"system": "github", "kind": "repository", "identifier": "example-org/payments-api"}]},
+      "key": "toolu_exception_218",
+      "currency": "unconfirmed",
+      "expect": { "decision": "deny", "reason": "currency_unconfirmed",
+        "sentence": "Tool `github__pr_comment` is classified `write`, so a call to it is allowed only while the control plane that issued this call's delegation says its turn is current. That could not be confirmed, so the call was refused and nothing ran. Try again shortly." }
+    },
+    {
+      "name": "exception: github__pr_comment under otto-fenced whose currency was not asked is denied as unconfirmed",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__pr_comment",
+      "resources": {"named": [{"system": "github", "kind": "repository", "identifier": "example-org/payments-api"}]},
+      "key": "toolu_exception_219",
+      "expect": { "decision": "deny", "reason": "currency_unconfirmed",
+        "sentence": "Tool `github__pr_comment` is classified `write`, so a call to it is allowed only while the control plane that issued this call's delegation says its turn is current. That could not be confirmed, so the call was refused and nothing ran. Try again shortly." }
+    },
+    {
+      "name": "exception: jira__comment under otto-fenced is denied when the turn is superseded, and its row names no exception",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "jira__comment",
+      "resources": {"named": [{"system": "jira", "kind": "project", "identifier": "PAY"}]},
+      "key": "toolu_exception_220",
+      "currency": "superseded",
+      "expect": { "decision": "deny", "reason": "not_current",
+        "sentence": "Tool `jira__comment` is classified `write`, so a call to it is allowed only while the control plane that issued this call's delegation says its turn is current. It says the turn is no longer current, so the call was refused and nothing ran. Do not retry it under this delegation." }
+    },
+    {
+      "name": "exception: jira__comment under otto-fenced is denied when the turn is revoked, and its row names no exception",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "jira__comment",
+      "resources": {"named": [{"system": "jira", "kind": "project", "identifier": "PAY"}]},
+      "key": "toolu_exception_221",
+      "currency": "revoked",
+      "expect": { "decision": "deny", "reason": "not_current",
+        "sentence": "Tool `jira__comment` is classified `write`, so a call to it is allowed only while the control plane that issued this call's delegation says its turn is current. It says the turn is no longer current, so the call was refused and nothing ran. Do not retry it under this delegation." }
+    },
+    {
+      "name": "exception: jira__comment under otto-fenced is denied when the turn is unconfirmed, and its row names no exception",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "jira__comment",
+      "resources": {"named": [{"system": "jira", "kind": "project", "identifier": "PAY"}]},
+      "key": "toolu_exception_222",
+      "currency": "unconfirmed",
+      "expect": { "decision": "deny", "reason": "currency_unconfirmed",
+        "sentence": "Tool `jira__comment` is classified `write`, so a call to it is allowed only while the control plane that issued this call's delegation says its turn is current. That could not be confirmed, so the call was refused and nothing ran. Try again shortly." }
+    },
+    {
+      "name": "exception: jira__comment under otto-fenced whose currency was not asked is denied as unconfirmed",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "jira__comment",
+      "resources": {"named": [{"system": "jira", "kind": "project", "identifier": "PAY"}]},
+      "key": "toolu_exception_223",
+      "expect": { "decision": "deny", "reason": "currency_unconfirmed",
+        "sentence": "Tool `jira__comment` is classified `write`, so a call to it is allowed only while the control plane that issued this call's delegation says its turn is current. That could not be confirmed, so the call was refused and nothing ran. Try again shortly." }
+    },
+    {
+      "name": "exception: github__pr_comment under otto-fenced is still held to the limit at check 6",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__pr_comment",
+      "resources": {"named": [{"system": "github", "kind": "repository", "identifier": "example-org/handbook"}]},
+      "key": "toolu_exception_224",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "resource_outside_limit",
+        "sentence": "Tool `github__pr_comment` names github repository `example-org/handbook`, which is outside what workload `system:serviceaccount:otto:sandbox-payments` of team `payments` from issuer `https://cluster-a.example.test` may reach. Name only resources within that limit." }
+    },
+    {
+      "name": "exception: jira__comment under otto-fenced is still held to the limit at check 6",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "jira__comment",
+      "resources": {"named": [{"system": "jira", "kind": "project", "identifier": "ENG"}]},
+      "key": "toolu_exception_225",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "resource_outside_limit",
+        "sentence": "Tool `jira__comment` names jira project `ENG`, which is outside what workload `system:serviceaccount:otto:sandbox-payments` of team `payments` from issuer `https://cluster-a.example.test` may reach. Name only resources within that limit." }
+    },
+    {
+      "name": "exception: github__pr_comment under otto-fenced that carries no key is denied at the key check",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__pr_comment",
+      "resources": {"named": [{"system": "github", "kind": "repository", "identifier": "example-org/payments-api"}]},
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "key_missing",
+        "sentence": "Tool `github__pr_comment` is classified `write`, so a call to it must carry a key that identifies this one call: a retry under the same key is then answered without making the change again. This call carried none, so it was refused and nothing ran. Send the call with its tool-use identifier, which is its key, or with a key of its own in `_meta` under `switchboard/idempotencyKey`." }
+    },
+    {
+      "name": "exception: github__pr_comment under otto-fenced is denied at check 4 when the delegation does not list it",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn-narrow",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__pr_comment",
+      "resources": {"named": [{"system": "github", "kind": "repository", "identifier": "example-org/payments-api"}]},
+      "key": "toolu_exception_226",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "tool_not_in_delegation",
+        "sentence": "Tool `github__pr_comment` is not among the tools this delegation permits. Call only the tools the delegation lists." }
+    },
+    {
+      "name": "exception: jira__comment under otto-fenced that carries no key is denied at the key check",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "jira__comment",
+      "resources": {"named": [{"system": "jira", "kind": "project", "identifier": "PAY"}]},
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "key_missing",
+        "sentence": "Tool `jira__comment` is classified `write`, so a call to it must carry a key that identifies this one call: a retry under the same key is then answered without making the change again. This call carried none, so it was refused and nothing ran. Send the call with its tool-use identifier, which is its key, or with a key of its own in `_meta` under `switchboard/idempotencyKey`." }
+    },
+    {
+      "name": "exception: jira__comment under otto-fenced is denied at check 4 when the delegation does not list it",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn-narrow",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "jira__comment",
+      "resources": {"named": [{"system": "jira", "kind": "project", "identifier": "PAY"}]},
+      "key": "toolu_exception_227",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "tool_not_in_delegation",
+        "sentence": "Tool `jira__comment` is not among the tools this delegation permits. Call only the tools the delegation lists." }
+    },
+    {
+      "name": "exception: Atlassian's addOrEditJiraIssueComment, which no exception names, is denied at check 5 under otto-fenced",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "atlassian__addOrEditJiraIssueComment",
+      "resources": {"named": [{"system": "jira", "kind": "project", "identifier": "PAY"}]},
+      "key": "toolu_exception_228",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `atlassian__addOrEditJiraIssueComment` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it." }
+    },
+    {
+      "name": "exception: jira__transition_issue, which no exception names, is still denied at check 5 under otto-fenced while the turn is current",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "jira__transition_issue",
+      "resources": {"named": [{"system": "jira", "kind": "project", "identifier": "PAY"}]},
+      "key": "toolu_exception_229",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `jira__transition_issue` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it." }
+    },
+    {
+      "name": "exception: a destructive tool is still denied at check 5 under otto-fenced while the turn is current",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__delete_branch",
+      "resources": {"named": [{"system": "github", "kind": "repository", "identifier": "example-org/payments-api"}]},
+      "key": "toolu_exception_230",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `github__delete_branch` is classified `destructive`, and destructive tools are denied in every profile. Ask a person to make this change." }
+    },
+    {
+      "name": "exception: a proposal under otto-fenced is allowed by its classification, and its row names no exception",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": {"named": [{"system": "github", "kind": "repository", "identifier": "example-org/payments-api"}]},
+      "key": "toolu_exception_231",
+      "currency": "current",
+      "expect": {"decision": "allow"}
+    },
+    {
+      "name": "exception: a sandbox of another team is allowed jira__comment only within its own limit",
+      "snapshot": "base", "principal": "search-sandbox", "delegation": "search-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox", "tool": "jira__comment",
+      "resources": {"named": [{"system": "jira", "kind": "project", "identifier": "PAY"}]},
+      "key": "toolu_exception_232",
+      "currency": "current",
+      "expect": { "decision": "deny", "reason": "resource_outside_limit",
+        "sentence": "Tool `jira__comment` names jira project `PAY`, which is outside what workload `system:serviceaccount:otto:sandbox-search` of team `search` from issuer `https://cluster-a.example.test` may reach. Name only resources within that limit." }
     }
   ],
   "lists": [
@@ -1274,7 +1621,31 @@
       "name": "the list skips the currency check, so a profile that requires currency still lists its proposals",
       "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
       "profile": "otto-fenced", "surface": "otto-sandbox",
+      "expect": ["github__comment_on_own_proposal", "github__get_file", "github__list_org_repos", "github__open_pull_request", "github__pr_comment", "github__search_code", "jira__comment", "jira__create_issue", "jira__get_issue"]
+    },
+    {
+      "name": "exception: a profile whose own list names the comment tools lists them, and no other write tool",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto-fenced", "surface": "otto-sandbox",
+      "expect": ["github__comment_on_own_proposal", "github__get_file", "github__list_org_repos", "github__open_pull_request", "github__pr_comment", "github__search_code", "jira__comment", "jira__create_issue", "jira__get_issue"]
+    },
+    {
+      "name": "exception: a profile whose list does not name the comment tools lists neither, though another profile's does",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox",
       "expect": ["github__comment_on_own_proposal", "github__get_file", "github__list_org_repos", "github__open_pull_request", "github__search_code", "jira__create_issue", "jira__get_issue"]
+    },
+    {
+      "name": "exception: a profile whose data lists write still lists neither comment tool",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "lists-everything", "surface": "otto-sandbox",
+      "expect": ["github__comment_on_own_proposal", "github__get_file", "github__list_org_repos", "github__open_pull_request", "github__search_code", "jira__create_issue", "jira__get_issue"]
+    },
+    {
+      "name": "exception: the list is still narrowed by the delegation",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn-narrow",
+      "profile": "otto-fenced", "surface": "otto-sandbox",
+      "expect": ["github__get_file"]
     }
   ]
 }

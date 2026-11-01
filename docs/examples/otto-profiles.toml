@@ -4,8 +4,15 @@
 
 # The profile for Otto's sandboxes: reads and proposals, each call carrying a verified turn
 # grant, and a side effect allowed only while Otto's resolver says the turn is current
-# (decision 0012, "Currency"). Decision 0011's exception for Otto's two comment tools will be
-# listed in this profile, and in no other, once #12 builds it.
+# (decision 0012, "Currency"). Decision 0011's exception for Otto's two comment tools belongs in
+# this profile, and in no other. The mechanism is built, but the exception is not in force until
+# the security owner signs its entry in docs/route-exceptions.md, and this gateway serves neither
+# tool yet, so the list is shown only as a comment. Once in force it would read:
+#
+#   exceptions = [{ name = "otto-comment-tools", tools = ["github__pr_comment", "jira__comment"] }]
+#
+# The loader refuses it on a profile that does not require currency, and refuses a tool that is
+# not an approved `write` tool settled by a lookup.
 [[profiles]]
 name = "otto-sandbox"
 classifications = ["read", "propose"]

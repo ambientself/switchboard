@@ -100,7 +100,7 @@ impl TestDatabase {
         let mut owner = database.connect_as(OWNER_ROLE).await;
         assert_eq!(
             migrate(&mut owner).await.unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         );
         Some(database)
     }
@@ -264,6 +264,11 @@ pub(crate) const ADDED_BY_0010: &str = "ARRAY['proved_pod', 'delegation_digest',
     'delegation_issuer', 'delegation_key_id', 'delegation_session', 'delegation_turn',
     'delegation_execution', 'delegation_epoch', 'delegation_egress', 'delegation_failure',
     'currency']";
+
+/// The column migration 0012 adds (decision 0011, section 9): a read-back reads it, and a
+/// test that a migration before it keeps the rows already written takes it out of what it
+/// compares.
+pub(crate) const EXCEPTION_COLUMN: &str = "allowed_by_exception";
 
 /// What a row read with [`DELEGATION_COLUMNS`] records of decision 0012, as the core's record
 /// writes it in JSON: the pod, the verified delegation, the failure and the currency answer.
