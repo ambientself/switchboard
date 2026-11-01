@@ -28,11 +28,15 @@
 //! row's deadline has passed, when a late finish completes the row and leaves the receipt
 //! `pending`, read as `unknown`, for reconciliation or a person; a key is unique
 //! in its scope under concurrent calls, and two delegations under one principal may each use
-//! it; a begin retried after a lost confirmation finds its own receipt and runs once, but once
-//! its row's deadline has passed with the receipt still `pending` it is refused and runs
+//! it; a key's scope over its cap is refused at begin; a begin retried after a lost
+//! confirmation finds its own receipt and runs once, but once its row's deadline has passed
+//! with the receipt still `pending` it is refused and runs
 //! nothing; a begin whose confirmation is lost on every attempt leaves its row `error` and its
-//! receipt `not_performed`; and each receipt state against each line of the reuse table. Both
-//! stores run every one of them.
+//! receipt `not_performed`, and one under a reused key leaves its row with its answer and gives
+//! nothing up; a retried begin of a `duplicate` is answered with the earlier receipt's
+//! reference, which Postgres reads as it is now and the in-memory store keeps from the first
+//! answer, and which cannot differ, since a `completed` receipt is final; and each receipt state
+//! against each line of the reuse table. Both stores run every one of them.
 //!
 //! It covers reconciliation (decision 0009, "Reconciliation") with the functions under "Item
 //! 7", through the store's [`ReceiptQueue`]: a receipt records the vendor target its tool's
@@ -79,11 +83,11 @@ use gateway_core::{
     ArgumentDigest, AttributionQuery, AuditGuard, AuditRecord, AuditStore, BoxFuture, CallContext,
     CallerContext, Claimed, Classification, Connector, CredentialIdentity, CredentialMode,
     Currency, CurrencyAnswer, Decision, Delegation, DelegationDigest, DelegationFailure,
-    DelegationKeyScope, Egress, ExceptionName, IdempotencyKey, KeyScope, LeaseHolder, LookupAnswer,
-    PodUid, PolicySnapshot, PresentedDelegation, Principal, PrincipalKind, Proved, Reason,
-    ReasonKind, Receipt, ReceiptAttribution, ReceiptQueue, ReceiptState, Recorded, RequestedTool,
-    Resource, Resources, Reuse, TeamId, ToolCall, ToolOutcome, ToolUseId, UnverifiedDelegation,
-    VendorReference, Verifier, WasProved, decide,
+    DelegationKeyScope, Egress, ExceptionName, IdempotencyKey, Issuer, KeyScope, LeaseHolder,
+    LookupAnswer, MAX_IDEMPOTENCY_KEY, PodUid, PolicySnapshot, PresentedDelegation, Principal,
+    PrincipalKind, Proved, Reason, ReasonKind, Receipt, ReceiptAttribution, ReceiptQueue,
+    ReceiptState, Recorded, RequestedTool, Resource, Resources, Reuse, Subject, TeamId, ToolCall,
+    ToolOutcome, ToolUseId, UnverifiedDelegation, VendorReference, Verifier, WasProved, decide,
 };
 use serde_json::{Value, json};
 
@@ -98,8 +102,8 @@ use crate::fixture::{
     TEAM_B_DOCUMENT, UNKNOWN_PROFILE, draft_lookup, policy_data, policy_data_with_draft_lookup,
 };
 use crate::row_bound::{
-    MAX_BEGUN_ROW_BYTES, MAX_OUTCOME_SENTENCE_BYTES, MAX_REACHED_BYTES, MAX_ROW_BYTES,
-    call_row_sizes, list_row_sizes,
+    MAX_BEGUN_ROW_BYTES, MAX_KEY_SCOPE_BYTES, MAX_OUTCOME_SENTENCE_BYTES, MAX_REACHED_BYTES,
+    MAX_ROW_BYTES, call_row_sizes, list_row_sizes,
 };
 
 /// What a contract function needs of a store: the store, a read-back, its budgets and its clock.
@@ -151,6 +155,11 @@ pub trait ContractStore {
     /// How many late finishes the store has counted as disagreeing with the state
     /// reconciliation settled their receipt in. For item 7's functions only.
     fn late_finish_disagreements(&self) -> u64;
+
+    /// How many completions of a lost begin's row the store has given up, once every completion
+    /// it has in flight has ended. The Postgres store counts them with every other finish it
+    /// gives up, so a function that asks gives up no other. For item 6's functions only.
+    fn lost_begins_given_up(&self) -> impl Future<Output = u64>;
 }
 
 /// The record a row holds.
@@ -2175,6 +2184,37 @@ impl Verifier for DelegationAsGiven {
     }
 }
 
+/// Proves a principal exactly as it is given, for item 6's key-scope case: the fixture's
+/// issuer names no principal that long. Private to this module, as [`DelegationAsGiven`] is.
+struct PrincipalAsGiven;
+
+impl Verifier for PrincipalAsGiven {
+    type Evidence = Principal;
+    type Fact = Principal;
+    type Error = Infallible;
+
+    fn verify(&self, evidence: &Principal) -> Result<Principal, Infallible> {
+        Ok(evidence.clone())
+    }
+}
+
+/// `length` letters and digits from `seed`, in no pattern Postgres's compression of a long
+/// value finds, so a value at a cap is held at its full length in an index entry.
+fn incompressible(length: usize, seed: u64) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let size = u64::try_from(ALPHABET.len()).expect("the alphabet is short");
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..length)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let at = usize::try_from(state % size).expect("an index into the alphabet");
+            char::from(ALPHABET[at])
+        })
+        .collect()
+}
+
 /// A proposal: team A calls the draft tool on its own document, with `text`.
 fn proposal(text: &str) -> Value {
     json!({ DOCUMENT_ARGUMENT: TEAM_A_DOCUMENT, "text": text })
@@ -2803,6 +2843,195 @@ pub async fn a_begin_whose_confirmation_is_lost_on_every_attempt_leaves_its_row_
         (receipt.state, receipt.established_by),
         (ReceiptState::NotPerformed, EstablishedBy::Call)
     );
+}
+
+/// A key's scope, the principal's issuer and subject and the delegation's scope, is held with
+/// the key in the unique index that makes a key unique in its scope, and Postgres's index holds
+/// an entry of at most 2,704 bytes. So each of the three is held to
+/// [`MAX_KEY_SCOPE_BYTES`] at begin: a longer one is
+/// refused, rather than cut, and leaves no row and no receipt (#203). Values Postgres cannot
+/// compress, each at its cap, with a key at its own, are reserved.
+pub async fn a_key_scope_over_its_cap_is_refused_at_begin_and_one_at_it_is_reserved(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let fixture = fixture();
+    let arguments = proposal("Scoped.");
+    // A delegation's scope is `["session-1","execution-1","<turn>"]`: 30 bytes and the turn.
+    let cap = MAX_KEY_SCOPE_BYTES;
+    let turn_at_cap = cap - r#"["session-1","execution-1",""]"#.len();
+    let caller = |issuer: usize, subject: usize, turn: usize| {
+        let mut caller = fixture
+            .caller_context(Caller::TeamA, SURFACE_ALL)
+            .expect("the fixture knows team A");
+        let mut principal = caller.principal.get().clone();
+        principal.id.issuer = Issuer::new(format!("https://{}", incompressible(issuer - 8, 1)));
+        principal.id.subject = Subject::new(incompressible(subject, 2));
+        caller.principal = match Proved::verify(&PrincipalAsGiven, &principal) {
+            Ok(proved) => proved,
+            Err(never) => match never {},
+        };
+        caller.delegation = Some(turn_delegation(&incompressible(turn, 3)));
+        caller
+    };
+
+    let key = IdempotencyKey::parse(&incompressible(MAX_IDEMPOTENCY_KEY, 4)).expect("a key");
+    let start = row_start();
+    let decision = keyed_decision(
+        &fixture,
+        caller(cap, cap, turn_at_cap),
+        &arguments,
+        Some(&key),
+    );
+    let begun = begin_keyed(store, &start, decision, &arguments, Some(key.as_str())).await;
+    assert!(
+        matches!(&begun, Ok(Begun::Allowed(guard)) if guard.row() == &start.row),
+        "a key's scope at its cap was not reserved: {begun:?}"
+    );
+    let reserved = receipts_for(contract, &key).await;
+    assert_eq!(reserved.len(), 1, "{reserved:?}");
+    assert_eq!(
+        (
+            reserved[0].scope.principal.issuer.as_str().len(),
+            reserved[0].scope.principal.subject.as_str().len(),
+            reserved[0]
+                .scope
+                .delegation
+                .as_ref()
+                .map(|scope| scope.as_str().len()),
+        ),
+        (cap, cap, Some(cap))
+    );
+
+    for (over, (issuer, subject, turn)) in [
+        ("issuer", (cap + 1, cap, turn_at_cap)),
+        ("subject", (cap, cap + 1, turn_at_cap)),
+        ("delegation scope", (cap, cap, turn_at_cap + 1)),
+    ] {
+        let key = fresh_key();
+        let start = row_start();
+        let decision = keyed_decision(
+            &fixture,
+            caller(issuer, subject, turn),
+            &arguments,
+            Some(&key),
+        );
+        let begun = begin_keyed(store, &start, decision, &arguments, Some(key.as_str())).await;
+        assert!(begun.is_err(), "{over} over its cap: {begun:?}");
+        assert_eq!(contract.stored(&start.row).await, None, "{over}");
+        assert_eq!(receipts_for(contract, &key).await, Vec::new(), "{over}");
+    }
+}
+
+/// A begin under a reused key whose confirmation was lost on every attempt leaves its row as its
+/// begin wrote it, complete with the answer to its key, and the store gives nothing up (#203).
+/// The completion the store then tries finds the row complete with the answer to its own key:
+/// nothing was lost, so that is settled, not a completion that failed. A duplicate and a
+/// refusal are each tried, and the earlier receipt is left as it was.
+pub async fn a_reused_keys_begin_whose_confirmation_is_lost_keeps_its_answer_and_gives_nothing_up(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let fixture = fixture();
+    let key = fresh_key();
+    let arguments = proposal("Done once.");
+    let first = row_start();
+    let guard = proposal_guard(store, &fixture, &first, &arguments, &key).await;
+    let connector = Answering::with(ToolOutcome::Completed(
+        json!({"draft": "d-1"}),
+        VendorReference::new("d-1"),
+    ));
+    let ran = audit::run(&connector, guard).await;
+    let finished = audit::finish(store, ran, 1).await;
+    assert!(finished.failure().is_none(), "{:?}", finished.failure());
+    let earlier = receipt_under(contract, &first.row).await;
+
+    contract.lose_every_begin_confirmation();
+    for (tool_use_id, expected) in [
+        (
+            key.as_str(),
+            Reuse::Duplicate {
+                key: key.clone(),
+                receipt: first.row.clone(),
+                reference: Some(VendorReference::new("d-1")),
+            },
+        ),
+        (
+            "toolu_another_call",
+            Reuse::DifferentCall { key: key.clone() },
+        ),
+    ] {
+        let start = row_start();
+        let begun = begin_keyed(
+            store,
+            &start,
+            keyed_proposal(&fixture, &arguments, Some(&key)),
+            &arguments,
+            Some(tool_use_id),
+        )
+        .await;
+        assert!(
+            begun.is_err(),
+            "{tool_use_id}: a begin whose confirmation was lost succeeded: {begun:?}"
+        );
+        assert_eq!(
+            stored(contract, &start.row).await.completion,
+            Some(expected.completion()),
+            "{tool_use_id}"
+        );
+    }
+    assert_eq!(receipts_for(contract, &key).await, vec![earlier]);
+    assert_eq!(contract.lost_begins_given_up().await, 0);
+    assert_eq!(connector.calls(), 1);
+}
+
+/// A retried begin of a row written as a `duplicate` is answered with the earlier receipt's
+/// reference, as the first begin was (#203). The stores reach it differently, and the Postgres
+/// store is the reference: it keeps no reference on the duplicate's row, and reads the earlier
+/// receipt's as it is now, where the in-memory store keeps the answer it wrote. They cannot
+/// differ: a `duplicate` answers only a `completed` receipt, which is final, so nothing moves it
+/// again and its reference never changes.
+pub async fn a_retried_begin_of_a_duplicate_answers_with_the_earlier_receipts_reference(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let fixture = fixture();
+    let key = fresh_key();
+    let arguments = proposal("Done once.");
+    let first = row_start();
+    let guard = proposal_guard(store, &fixture, &first, &arguments, &key).await;
+    let connector = Answering::with(ToolOutcome::Completed(
+        json!({"draft": "d-1"}),
+        VendorReference::new("d-1"),
+    ));
+    let finished = audit::finish(store, audit::run(&connector, guard).await, 1).await;
+    assert!(finished.failure().is_none(), "{:?}", finished.failure());
+
+    let duplicate = Reuse::Duplicate {
+        key: key.clone(),
+        receipt: first.row.clone(),
+        reference: Some(VendorReference::new("d-1")),
+    };
+    let start = row_start();
+    for attempt in ["first", "retried"] {
+        let begun = begin_keyed(
+            store,
+            &start,
+            keyed_proposal(&fixture, &arguments, Some(&key)),
+            &arguments,
+            Some(key.as_str()),
+        )
+        .await;
+        let Ok(Begun::Reused(reused)) = begun else {
+            panic!("the {attempt} begin was not answered from the receipt: {begun:?}");
+        };
+        assert_eq!(reused.reuse(), &duplicate, "{attempt}");
+    }
+    assert_eq!(
+        stored(contract, &start.row).await.completion,
+        Some(duplicate.completion())
+    );
+    assert_eq!(connector.calls(), 1);
 }
 
 /// Each receipt state against each line of the reuse table (decision 0009, "Reuse"). For an

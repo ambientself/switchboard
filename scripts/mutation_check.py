@@ -1985,7 +1985,15 @@ mutate("testkit-list-wrong-clock", "the in-memory store reads the system clock, 
 mutate("testkit-clock-ignored", "the in-memory store keeps its default clock, not the one it was given", A,
        "        self.clock = clock;\n        self\n", "        let _ = clock;\n        self\n")
 mutate("testkit-lost-confirmation-left-open", "an allowed row whose begin confirmation was lost is left open", A,
-       "                let _ = state.complete(row, &error, self.clock.now());", "                let _ = &error;")
+       "                let refused = state.complete(row, &error, self.clock.now()).is_err();",
+       "                let refused = {\n                    let _ = &error;\n                    false\n                };")
+# #203: as the Postgres store, the in-memory store counts a lost begin's completion that its row
+# refuses as given up, but not one of a row written with the answer to its own reused key. The
+# contract suite's a_reused_keys_begin_whose_confirmation_is_lost_keeps_its_answer_and_gives_nothing_up
+# catches this.
+mutate("testkit-lost-begin-own-answer-given-up", "a lost begin's row written with the answer to its own key is counted as given up", A,
+       "                if refused && record.decision == DecisionKind::Allow && !answered {",
+       "                if refused && record.decision == DecisionKind::Allow && answered | true {")
 mutate("testkit-lost-confirmation-ignored", "a begin told to lose its confirmation succeeds", A,
        "            if state.confirmation_lost.take() {\n                // As the Postgres store",
        "            if false {\n                // As the Postgres store")
@@ -2003,6 +2011,11 @@ mutate("testkit-lost-list-confirmation-ignored", "a list told to lose its confir
 mutate("testkit-lost-confirmation-before-write", "a lost confirmation writes no row", A,
        "            if state.begin_failing.take() {\n                return Err(down());\n            }\n            if state.list_rows",
        "            if state.begin_failing.take() || state.confirmation_lost.take() {\n                return Err(down());\n            }\n            if state.list_rows")
+# #203: as the Postgres store, the in-memory store refuses a receipt whose issuer, subject or
+# delegation scope is over the cap. The contract suite's
+# a_key_scope_over_its_cap_is_refused_at_begin_and_one_at_it_is_reserved catches this.
+mutate("testkit-key-scope-uncapped", "a receipt's key scope over its cap is reserved", A,
+       "            && value.len() > MAX_KEY_SCOPE_BYTES\n", "            && false\n")
 mutate("testkit-answer-budget-written-at-once", "a finish past the answer budget is written before its gate opens", A,
        "state.answer_gate.clone().filter(|gate| !gate.is_open())", "None::<Gate>")
 mutate("testkit-answer-budget-never-written", "a finish past the answer budget is never written", A,
@@ -4491,8 +4504,8 @@ mutate("pg-finish-same-again-refused", "the same completion written again is an 
        "        Some(outcome)\n            if finish.is(\n",
        "        Some(outcome)\n            if false && finish.is(\n")
 mutate("pg-finish-different-accepted", "a different second completion is accepted", PG_STORE,
-       "        Some(_) => Err(PgAuditError::CompletedDifferently {\n            row: row.to_owned(),\n        }),",
-       "        Some(_) => Ok(()),")
+       "            _ => Err(PgAuditError::CompletedDifferently {\n                row: row.to_owned(),\n            }),",
+       "            _ => Ok(None),")
 mutate("pg-finish-missing-row-accepted", "finishing a row that is not there succeeds", PG_STORE,
        "        return Err(PgAuditError::NoSuchRow {\n            row: row.to_owned(),\n        });",
        "        return Ok(());")
@@ -4702,8 +4715,11 @@ mutate("pg-retry-slow-attempt-final", "an attempt that ran out of time is not re
 mutate("pg-finish-given-up-not-counted", "a finish that gave up is not counted", PG_STORE,
        "        self.in_flight.0.given_up.count(error);\n", "")
 mutate("pg-finish-given-up-not-reported", "a finish that gave up is not reported", PG_STORE,
-       "        (self.report)(GivenUp {\n            row: &self.row,\n            outcome: self.outcome,\n            error,\n        });\n",
+       "        (self.report)(GivenUp {\n            row: &self.row,\n            outcome: self.outcome,\n"
+       "            reference: self.reference.as_ref(),\n            error,\n        });\n",
        "        let _ = error;\n")
+mutate("pg-given-up-reference-dropped", "a finish given up is reported without the vendor's reference it was to keep", PG_STORE,
+       "            reference: self.reference.as_ref(),\n", "            reference: None,\n")
 mutate("pg-finish-dropped-task-not-reported", "a finish dropped with its runtime is not counted or reported", PG_STORE,
        "        if !self.settled {", "        if false {")
 mutate("pg-finish-unstorable-not-settled", "a completion the row cannot hold is not counted or reported", PG_STORE,
@@ -4749,9 +4765,19 @@ mutate_all("pg-begin-retry-new-identifier", "begin is retried under a new identi
             "                call.id.replace_range(..1, first);\n"
             "            }\n        };"))
 mutate("pg-lost-confirmation-left-open", "a row whose begin confirmation was lost is left open", PG_STORE,
-       "            self.complete_lost_begin(AuditRowId::new(call.id.clone()));\n", "            let _ = call;\n")
+       "                self.complete_lost_begin(AuditRowId::new(call.id), key);\n", "                let _ = (call, key);\n")
 mutate("pg-lost-confirmation-for-denial", "a lost confirmation for a denial starts a completion", PG_STORE,
-       '            && call.decision == "allow"\n', "            && !call.decision.is_empty()\n")
+       '                && call.decision == "allow"\n', "                && !call.decision.is_empty()\n")
+# #203: a lost begin with a receipt whose row it finds complete with the answer to its own key is
+# settled, not given up, and any other completion it finds is given up. The contract suite's
+# a_reused_keys_begin_whose_confirmation_is_lost_keeps_its_answer_and_gives_nothing_up and
+# tests/receipts.rs's a_lost_begins_row_completed_otherwise_is_given_up catch these.
+mutate("pg-lost-begin-own-answer-given-up", "a lost begin's row found complete with the answer to its own key is given up", PG_STORE,
+       "            Some(key) if holds_its_answer(&transaction, row, key).await? => Ok(None),\n",
+       "            Some(key) if false && holds_its_answer(&transaction, row, key).await? => Ok(None),\n")
+mutate("pg-lost-begin-any-completion-settled", "a lost begin's row found complete with any completion is settled", PG_STORE,
+       "            Some(key) if holds_its_answer(&transaction, row, key).await? => Ok(None),\n",
+       "            Some(_key) => Ok(None),\n")
 mutate("pg-lost-confirmation-after-refusal", "a begin the database refused starts a completion of the row under its identifier", PG_STORE,
        "            may_be_written |= sent && unanswered;", "            may_be_written |= sent;")
 mutate("pg-lost-confirmation-forgotten-on-later-error", "a later attempt's error undoes an earlier lost confirmation", PG_STORE,
@@ -4985,14 +5011,13 @@ for server_role in ["pg_execute_server_program", "pg_read_server_files", "pg_wri
            f'        "{server_role}",\n', '        "pg_monitor",\n')
 
 mutate("pg-check-rule-ignored", "a rule on the table passes the check", PG_CHECK,
-       "            .map(|row| Problem::Rule { rule: row.get(0) }),",
-       "            .filter(|_| false)\n            .map(|row| Problem::Rule { rule: row.get(0) }),")
+       "            rules(client, table, CALL_ROWS, &mut problems).await?;\n", "")
 mutate("pg-check-reaching-ignored", "a grant on a view or rule outside the schema that reaches the table passes the check", PG_CHECK,
        "                 WHERE n.nspname <> 'switchboard_audit'\n                     AND ({}",
        "                 WHERE false\n                     AND ({}")
 mutate("pg-check-reaching-direct-only", "a view over a view over the table is not followed", PG_CHECK,
        "            JOIN pg_catalog.pg_depend d ON d.refobjid = x.oid\n",
-       "            JOIN pg_catalog.pg_depend d ON d.refobjid = x.oid AND x.oid = $1::oid\n")
+       "            JOIN pg_catalog.pg_depend d ON d.refobjid = x.oid AND x.oid = x.root\n")
 mutate("pg-check-reaching-views-only", "a rule on another table that writes the table is not followed", PG_CHECK,
        "            JOIN pg_catalog.pg_rewrite rw ON rw.oid = d.objid\n",
        "            JOIN pg_catalog.pg_rewrite rw ON rw.oid = d.objid AND rw.rulename = '_RETURN'\n")
@@ -5004,7 +5029,7 @@ mutate("pg-check-definer-column-owner-ignored", "a definer function whose owner 
        "OR has_any_column_privilege({owner}, x.oid,", "OR false AND has_any_column_privilege({owner}, x.oid,")
 mutate("pg-check-definer-view-owner-ignored", "a definer function whose owner holds privileges only on a view over the table passes the check", PG_CHECK,
        "        FROM reaching x\n            JOIN pg_catalog.pg_class c ON c.oid = x.oid\n",
-       "        FROM (SELECT $1::oid AS oid) x\n            JOIN pg_catalog.pg_class c ON c.oid = x.oid\n")
+       "        FROM unnest($1::oid[]) AS x(oid)\n            JOIN pg_catalog.pg_class c ON c.oid = x.oid\n")
 mutate("pg-check-definer-schema-owner-ignored", "a definer function of the schema's owner passes the check", PG_CHECK,
        "OR EXISTS (SELECT FROM schema_owner s", "OR false AND EXISTS (SELECT FROM schema_owner s")
 mutate("pg-check-definer-chain-not-followed", "a definer function that reaches the table through another passes the check", PG_CHECK,
@@ -5101,8 +5126,34 @@ mutate("pg-check-cascade-partition-copy-judged", "a partitioned table's foreign 
        "WHERE k.contype = 'f' AND (k.conparentid <> 0 OR NOT EXISTS (SELECT FROM pg_catalog.pg_inherits i WHERE i.inhparent = k.conrelid))\n")
 mutate("pg-check-cascade-partition-copies-refused", "a partition's copy of a foreign key is refused for the partition's owner, which the action does not run as", PG_CHECK,
        "WHERE k.contype = 'f' AND k.conparentid = 0\n", "WHERE k.contype = 'f'\n")
-mutate("pg-check-cascade-references-call-rows-refused", "a cascading foreign key that references call_rows is refused", PG_CHECK,
-       "AND k.conrelid <> $1::oid AND k.confrelid <> $1::oid", "AND k.conrelid <> $1::oid")
+mutate("pg-check-cascade-references-call-rows-refused", "a foreign key that references call_rows and cascades on delete is refused", PG_CHECK,
+       "AND k.confrelid <> $1::oid\n", "AND $1::oid IS NOT NULL\n")
+# #203: the routes around the grants that the check follows to call_rows, followed to receipts
+# too: a rule or a foreign key's action on receipts, a view or rule elsewhere that reaches it, a
+# definer function or a cascading table whose owner can change it, and one whose owner owns
+# receipt_moves; a rule on receipt_lookups, which the gateway appends to; a foreign key's action
+# on update of a key on call_rows, whose resources a completion changes; and a receipt or
+# lookup table that does not stand alone. tests/check.rs's receipt route tests catch these.
+mutate("pg-check-receipt-rule-ignored", "a rule on the receipt table passes the check", PG_CHECK,
+       "    rules(client, table, RECEIPTS_TABLE, problems).await?;\n", "")
+mutate("pg-check-lookup-rule-ignored", "a rule on the lookup table passes the check", PG_CHECK,
+       "    rules(client, table, LOOKUPS_TABLE, problems).await?;\n", "")
+mutate("pg-check-receipt-referential-action-ignored", "a foreign key on the receipt table with ON DELETE CASCADE passes the check", PG_CHECK,
+       "    referential_actions(client, table, RECEIPTS_TABLE, problems).await?;\n", "")
+mutate("pg-check-reaching-receipts-ignored", "a grant on a view or rule outside the schema that reaches receipts passes the check", PG_CHECK,
+       "reaching_privileges(client, &audited, version", "reaching_privileges(client, &audited[..1], version")
+mutate("pg-check-able-receipts-ignored", "a definer function or cascading table whose owner can delete receipts passes the check", PG_CHECK,
+       "able(client, &audited, version)", "able(client, &audited[..1], version)")
+mutate("pg-check-cascade-update-of-call-rows-ignored", "a foreign key that references call_rows' resources with ON UPDATE CASCADE, on a table owned by a role that can delete receipts, passes the check", PG_CHECK,
+       "OR k.confupdtype NOT IN ('a', 'r'))", "OR k.confupdtype NOT IN ('a', 'r') AND k.confrelid <> $1::oid)")
+mutate("pg-check-receipt-inheritance-ignored", "a receipt table that inherits from a table elsewhere passes the check", PG_CHECK,
+       "    inheritance(client, table, problems).await?;\n    unlogged(client, table, problems).await?;\n    columns(client, table, RECEIPTS,",
+       "    unlogged(client, table, problems).await?;\n    columns(client, table, RECEIPTS,")
+mutate("pg-check-lookup-inheritance-ignored", "a lookup table that inherits from a table elsewhere passes the check", PG_CHECK,
+       "    inheritance(client, table, problems).await?;\n    unlogged(client, table, problems).await?;\n    columns(client, table, LOOKUPS,",
+       "    unlogged(client, table, problems).await?;\n    columns(client, table, LOOKUPS,")
+mutate("pg-check-definer-ignores-receipt-trigger-function-owner", "a definer function whose owner owns receipt_moves passes the check", PG_CHECK,
+       "WHERE g.tgrelid = ANY($1::oid[])", "WHERE g.tgrelid = ($1::oid[])[1]")
 # Receipts (decision 0009, part 2): migration 0008's table, grants and trigger receipt_moves, the
 # begin with a receipt in one transaction, a retried begin refused once its own receipt is pending
 # past the row's deadline, finish settling the receipt only before the deadline, the boot check's
@@ -5149,6 +5200,12 @@ mutate("pg-finish-settles-past-deadline", "finish moves a receipt whatever its r
        "            AND NOT EXISTS (SELECT FROM switchboard_audit.call_rows c\n"
        "                            WHERE c.id = r.row_id AND c.deadline < clock_timestamp())\";",
        "        WHERE r.row_id = ($1::text)::uuid AND r.state = 'pending'\";")
+# #203: the deadline can pass between the settle's own test and the trigger's, which refuses with
+# SB001; the store completes the row again and leaves the receipt pending. tests/receipts.rs's
+# a_deadline_that_passes_during_the_settle_leaves_the_receipt_pending catches this.
+mutate("pg-settle-past-deadline-not-made-again", "a settle the trigger refuses as past the deadline fails the finish", PG_STORE,
+       "            if error.code().map(|code| code.code()) == Some(RECEIPT_PAST_DEADLINE) =>",
+       "            if false && error.code().map(|code| code.code()) == Some(RECEIPT_PAST_DEADLINE) =>")
 mutate("pg-check-receipt-trigger-skipped", "the boot check does not look for the receipt trigger", PG_CHECK,
        "    Trigger {\n        table: RECEIPTS,\n        name: \"receipt_moves\",\n"
        "        purpose: \"moves a receipt only as its state table allows, by the database's clock\",\n"
@@ -5195,7 +5252,8 @@ mutate("pg-check-lookup-trigger-skipped", "the boot check does not look for the 
        "        fires: \"before each insert, update or delete\",\n        tgtype: 1 | 2 | 4 | 8 | 16,\n    },\n",
        "")
 mutate("pg-check-receipts-unchecked", "the boot check does not check the receipt table: that it is there, logged, and the role's grants on its columns", PG_CHECK,
-       "            receipts(client, &mut problems).await?;\n", "")
+       "            if let Some(receipts) = receipts(client, &mut problems).await? {\n",
+       "            if let Some(receipts) = None {\n")
 mutate("pg-unknown-receipts-only-state-unknown", "the count of receipts in unknown leaves out those pending past their row's deadline", PG_STORE,
        "     WHERE r.state = 'unknown' OR (r.state = 'pending' AND c.deadline < clock_timestamp())\";",
        "     WHERE r.state = 'unknown'\";")
@@ -5370,6 +5428,15 @@ mutate("pg-columns-exception-not-written", "begin writes no exception", PG_COLUM
        "            allowed_by_exception: { let _ = &record.allowed_by_exception; None },\n")
 mutate("pg-check-misses-exception", "the boot check does not require the exception column", PG_CHECK,
        '    ("allowed_by_exception", "text"),\n];', "];")
+# #203: a receipt's issuer, subject and delegation scope are held to MAX_KEY_SCOPE_BYTES, so the
+# unique index on a key in its scope can always hold its entry. The contract suite's
+# a_key_scope_over_its_cap_is_refused_at_begin_and_one_at_it_is_reserved, on Postgres, catches
+# these; a cap past what the index holds fails its case at the cap.
+mutate("pg-columns-key-scope-uncapped", "a receipt's issuer, subject or delegation scope over its cap is reserved", PG_COLUMNS,
+       "    within_cap(column, stored(column, text)?, MAX_KEY_SCOPE_BYTES)\n", "    stored(column, text)\n")
+mutate_all("pg-columns-key-scope-cap-past-the-index", "a receipt's key scope is capped, in both stores, past what the unique index can hold",
+           (PG_COLUMNS, "pub const MAX_KEY_SCOPE_BYTES: usize = 768;", "pub const MAX_KEY_SCOPE_BYTES: usize = 1024;"),
+           (TESTKIT_SRC + "row_bound.rs", "pub const MAX_KEY_SCOPE_BYTES: usize = 768;", "pub const MAX_KEY_SCOPE_BYTES: usize = 1024;"))
 
 # Migration 0011: what a tool that checks its own scope reached replaces the row's unknown
 # resources in finish's own statement (decision 0011, #12). The schema test

@@ -286,6 +286,13 @@ impl ContractStore for Postgres {
         self.store.stats().late_finish_disagreements
     }
 
+    /// Every finish the store has given up, once its completions in flight have ended: it
+    /// counts a lost begin's completion with the others.
+    async fn lost_begins_given_up(&self) -> u64 {
+        self.settled().await;
+        self.store.stats().finishes_given_up.total()
+    }
+
     /// Ends the receipt's lease a second ago by the database's clock, as the superuser, in a
     /// session whose `session_replication_role` turns off the trigger that writes a lease only
     /// on a receipt not yet settled or handed to a person.
@@ -380,9 +387,12 @@ contract!(
     a_late_finish_completes_its_row_and_leaves_its_receipt_pending,
     a_key_is_unique_in_its_scope_under_concurrent_calls,
     two_delegations_under_one_principal_may_use_the_same_key,
+    a_key_scope_over_its_cap_is_refused_at_begin_and_one_at_it_is_reserved,
     a_begin_retried_after_a_lost_confirmation_finds_its_own_receipt_and_runs_once,
     a_retried_begin_of_a_receipt_pending_past_its_deadline_is_refused_and_runs_nothing,
     a_begin_whose_confirmation_is_lost_on_every_attempt_leaves_its_row_error_and_its_receipt_not_performed,
+    a_reused_keys_begin_whose_confirmation_is_lost_keeps_its_answer_and_gives_nothing_up,
+    a_retried_begin_of_a_duplicate_answers_with_the_earlier_receipts_reference,
     each_receipt_state_is_answered_by_the_first_line_of_the_reuse_table_that_matches,
     // Item 7: reconciliation.
     a_receipt_records_the_vendor_target_its_settlement_takes,
