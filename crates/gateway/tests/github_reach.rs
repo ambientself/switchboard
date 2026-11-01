@@ -8,8 +8,9 @@
 //! A matching report holds, with an installation-wide `metadata: read` token; a repository added
 //! to the installation, or dropped from it, withdraws the entry's tools within the interval; a
 //! report that cannot be read is logged, tried again and withdraws nothing; a new approval
-//! clears a withdrawal, and nothing else does; and the start is refused with a reach report and
-//! no reach settings.
+//! clears a withdrawal, and nothing else does; the start is refused with a reach report and no
+//! reach settings; a report's call is given the deadline of the report tool's connector; and
+//! the schedule never runs two of one entry's reports at once.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod files;
@@ -316,6 +317,11 @@ fn my_uid() -> u32 {
 
 impl World {
     async fn new() -> Self {
+        Self::with_bounds("").await
+    }
+
+    /// A world whose deployment file has `bounds`, its `[connectors.<name>]`, as written.
+    async fn with_bounds(bounds: &str) -> Self {
         let dir = scratch();
         let app = Arc::new(
             FakeGitHub::start(FakeApp {
@@ -350,7 +356,7 @@ impl World {
         let socket = dir.join("c.sock");
         write(
             &dir.join("gateway.toml"),
-            &deployment_text(&rest.url(), &socket, &log_host.url(), ""),
+            &deployment_text(&rest.url(), &socket, &log_host.url(), bounds),
             0o644,
         );
         let record = Buffer::default();
@@ -796,6 +802,56 @@ async fn a_new_approval_clears_a_withdrawal_and_a_matching_report_does_not() {
         assert!(world.withdrawn(world.drift()).is_empty());
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// The deployment file's bound for the reach-report entry: a deadline longer than the default.
+const LONG_REPORT_DEADLINE: &str = "[connectors.github-reach-report]\ndeadline_seconds = 12\n";
+
+/// A report's call is given the call deadline of the connector that serves the report's tool,
+/// `[connectors.github-reach-report]`, not the default: a report GitHub answers after the
+/// default deadline plus the allowance, and within that connector's, holds.
+#[tokio::test]
+async fn a_reports_call_is_given_the_deadline_of_its_tools_connector() {
+    let world = World::with_bounds(LONG_REPORT_DEADLINE).await;
+    // Past the default deadline, 5 s, and the allowance, 5 s, and within the connector's 12 s.
+    world
+        .rest
+        .set_mode(Mode::Late(Duration::from_millis(10_500)));
+    let started = tokio::time::Instant::now();
+    world.drift().reach_pass().await;
+    assert!(
+        started.elapsed() >= Duration::from_millis(10_500),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(World::checks(world.drift(), "failed"), 0);
+    assert_eq!(World::checks(world.drift(), "held"), 1);
+    assert!(world.withdrawn(world.drift()).is_empty());
+}
+
+/// The schedule never runs two of one entry's reports at once: a tick that comes while the
+/// last report is still out makes none, however many ticks pass before it ends.
+#[tokio::test]
+async fn a_tick_while_a_report_is_out_makes_none() {
+    let mut world = World::with_bounds(LONG_REPORT_DEADLINE).await;
+    // Each report takes three and a half intervals.
+    world
+        .rest
+        .set_mode(Mode::Late(Duration::from_millis(3_500)));
+    let reports = |world: &World| {
+        world
+            .rest
+            .requests()
+            .iter()
+            .filter(|request| request.path == "/installation/repositories")
+            .count()
+    };
+    world.run();
+    // Six intervals: the first report at once, the second at the first tick after it ends, at
+    // 4 s. A schedule that ran one every tick would have made six or seven.
+    tokio::time::sleep(INTERVAL * 6 + Duration::from_millis(500)).await;
+    let made = reports(&world);
+    assert!((1..=2).contains(&made), "{made} reports in six intervals");
 }
 
 /// Start refuses a registry with a reach report when the deployment file gives no `[drift]
