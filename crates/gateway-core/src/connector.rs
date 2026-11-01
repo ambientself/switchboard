@@ -5,6 +5,7 @@ use std::pin::Pin;
 
 use serde::{Deserialize, Serialize};
 
+use crate::audit::AuditRowId;
 use crate::decision::CallContext;
 use crate::names::PolicyRevision;
 use crate::policy::{ApprovedTool, Resource};
@@ -34,13 +35,14 @@ pub trait Connector: Send + Sync {
 }
 
 /// What the decision that allowed a call grants its connector beside the call itself: the
-/// policy revision it was made under, and the limit to narrow its credential to. Taken from the
-/// decision by [`audit::begin`](crate::audit::begin), so a connector reads them from the same
-/// snapshot the checks read.
+/// policy revision it was made under, the limit to narrow its credential to, and the row begun
+/// for it. Taken from the decision by [`audit::begin`](crate::audit::begin), so a connector
+/// reads them from the same snapshot the checks read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Granted {
     pub(crate) policy_revision: PolicyRevision,
     pub(crate) caller_limit: Option<Vec<Resource>>,
+    pub(crate) row: AuditRowId,
 }
 
 /// One allowed call, handed to its connector. Made only by consuming an audit guard.
@@ -80,6 +82,14 @@ impl ToolCall {
     /// resources of its system.
     pub fn caller_limit(&self) -> Option<&[Resource]> {
         self.granted.caller_limit.as_deref()
+    }
+
+    /// The audit row begun for the call. For a tool not classified `read` it is also the
+    /// identifier of the call's receipt, which a lookup finds the effect by (decision 0009,
+    /// "Reconciliation"), and which the gateway's bound holds while a side effect it answered
+    /// `unknown` runs on past its deadline ([`ReceiptQueue::hold`](crate::ReceiptQueue::hold)).
+    pub fn row(&self) -> &AuditRowId {
+        &self.granted.row
     }
 
     /// The decided call: who is calling, under which profile, on which surface.

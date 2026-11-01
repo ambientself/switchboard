@@ -824,6 +824,7 @@ pub async fn begin(
     let granted = Granted {
         policy_revision: policy_revision.clone(),
         caller_limit,
+        row: start.row.clone(),
     };
     // The sentence is rendered once, and the same string goes to the row and to the caller.
     let decided = match verdict {
