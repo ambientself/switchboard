@@ -421,6 +421,7 @@ struct State {
     leases: Vec<(AuditRowId, LeaseHolder, SystemTime)>,
     claim_gate: Option<Gate>,
     claims_failing: Failing,
+    holds_failing: Failing,
     records_failing: Failing,
     /// Late finishes that disagreed with the state reconciliation had settled their receipt in.
     late_finish_disagreements: u64,
@@ -1104,6 +1105,16 @@ impl InMemoryAuditStore {
         self.state().claims_failing = Failing::Next;
     }
 
+    /// The next [`hold`](ReceiptQueue::hold) fails, writing nothing, and later ones work.
+    pub fn fail_next_hold(&self) {
+        self.state().holds_failing = Failing::Next;
+    }
+
+    /// Every [`hold`](ReceiptQueue::hold) from here on fails, writing nothing.
+    pub fn fail_all_holds(&self) {
+        self.state().holds_failing = Failing::Always;
+    }
+
     /// Every [`record_lookup`](ReceiptQueue::record_lookup) from here on fails, writing
     /// nothing, as a store that cannot save lookups would.
     pub fn fail_all_lookup_records(&self) {
@@ -1346,8 +1357,10 @@ impl AuditStore for InMemoryAuditStore {
 /// [`LookupAnswer::settles`] says, or hands it to a person on its last attempt; and nothing is
 /// written for a holder whose lease has ended. A claim can be held at a gate
 /// ([`hold_claims`](InMemoryAuditStore::hold_claims)) or told to fail
-/// ([`fail_next_claim`](InMemoryAuditStore::fail_next_claim)), and every record of a lookup
-/// told to fail ([`fail_all_lookup_records`](InMemoryAuditStore::fail_all_lookup_records)).
+/// ([`fail_next_claim`](InMemoryAuditStore::fail_next_claim)), a hold told to fail
+/// ([`fail_next_hold`](InMemoryAuditStore::fail_next_hold),
+/// [`fail_all_holds`](InMemoryAuditStore::fail_all_holds)), and every record of a lookup told
+/// to fail ([`fail_all_lookup_records`](InMemoryAuditStore::fail_all_lookup_records)).
 impl ReceiptQueue for InMemoryAuditStore {
     fn due<'a>(&'a self, limit: usize) -> BoxFuture<'a, Result<Vec<Receipt>, StoreError>> {
         Box::pin(async move {
@@ -1415,6 +1428,9 @@ impl ReceiptQueue for InMemoryAuditStore {
         Box::pin(async move {
             let now = self.clock.now();
             let mut state = self.state();
+            if state.holds_failing.take() {
+                return Err(down());
+            }
             let open = state.receipts.iter().any(|receipt| {
                 receipt.row == *row
                     && matches!(receipt.state, ReceiptState::Pending | ReceiptState::Unknown)

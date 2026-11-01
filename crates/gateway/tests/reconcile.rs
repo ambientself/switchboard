@@ -13,8 +13,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use gateway::{
-    Config, DEFAULT_IN_PROCESS_RESULT_BYTES, InProcessLimits, ReconcileSettings, Reconciler,
-    TELEMETRY_QUEUE, Telemetry, Timeouts, Wiring, boot, serve_with_telemetry,
+    Config, DEFAULT_IN_PROCESS_RESULT_BYTES, HOLD_BUDGET, HOLD_RETRY, InProcessLimits,
+    ReconcileSettings, Reconciler, TELEMETRY_QUEUE, Telemetry, Timeouts, Wiring, boot,
+    serve_with_telemetry,
 };
 use gateway_core::receipt::EstablishedBy;
 use gateway_core::{LookupAnswer, Receipt, ReceiptState, VendorReference};
@@ -462,6 +463,126 @@ async fn no_instance_looks_up_a_receipt_while_its_late_side_effect_runs() {
         (settled.state, &settled.established_by),
         (ReceiptState::Completed, &EstablishedBy::Reconciliation)
     );
+}
+
+/// A late side effect whose first hold of its receipt is not written tries again a second
+/// later, not a quarter of a lease later (#217): the receipt is held within one retry and one
+/// hold's budget of the answer, and from then neither this instance's reconciler nor another's
+/// claims it while the draft is on its way.
+#[tokio::test]
+async fn a_late_side_effects_first_hold_not_written_is_tried_again_within_a_second() {
+    let world = start_with(
+        policy_data_with_draft_lookup(),
+        LookupAnswer::NotFound {
+            authoritative: true,
+        },
+        Setup {
+            settings: SETTINGS,
+            real_time: true,
+            deadline: Some(Duration::from_millis(200)),
+        },
+    )
+    .await;
+    let store = &world.server.store;
+    store.fail_next_hold();
+    let draft = world.server.connector.hang_next();
+    let answer = world.propose(fresh_key().as_str()).await;
+    assert_eq!(answer.result()["isError"], json!(true), "{answer:?}");
+    let answered = Instant::now();
+    let receipt = store
+        .receipts()
+        .last()
+        .expect("a receipt was reserved")
+        .clone();
+
+    // A quarter of this lease is 15 s; the retry comes within HOLD_RETRY and a hold's budget.
+    loop {
+        if store
+            .lease_holder(&receipt.row)
+            .is_some_and(|holder| holder.as_str().ends_with("late-call"))
+        {
+            break;
+        }
+        assert!(
+            answered.elapsed() < HOLD_RETRY + HOLD_BUDGET,
+            "the hold not written was not tried again promptly"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for reconciler in [&world.reconciler, &world.other] {
+        let report = reconciler.pass().await;
+        assert_eq!((report.claimed, report.looked_up), (0, 0), "{report:?}");
+    }
+    assert!(world.lookup.looked_up().is_empty());
+    assert_eq!(world.receipt(&receipt).state, ReceiptState::Unknown);
+    draft.open();
+    eventually("the late side effect ran to its end", || {
+        world.server.connector.writes().len() == 1
+    })
+    .await;
+}
+
+/// This instance's reconciler never claims a receipt whose late side effect still runs in its
+/// own process, even when that side effect's holds of it are not written and its lease is free
+/// (#217): a lookup then would find nothing and settle it `not_performed` while the draft is
+/// on its way. Once the side effect ends, the receipt is looked up as any `unknown` receipt.
+#[tokio::test]
+async fn this_instance_never_claims_a_receipt_whose_late_side_effect_runs_here() {
+    let world = start_with(
+        policy_data_with_draft_lookup(),
+        LookupAnswer::NotFound {
+            authoritative: true,
+        },
+        Setup {
+            settings: SETTINGS,
+            real_time: true,
+            deadline: Some(Duration::from_millis(200)),
+        },
+    )
+    .await;
+    let store = &world.server.store;
+    store.fail_all_holds();
+    let draft = world.server.connector.hang_next();
+    let answer = world.propose(fresh_key().as_str()).await;
+    assert_eq!(answer.result()["isError"], json!(true), "{answer:?}");
+    let receipt = store
+        .receipts()
+        .last()
+        .expect("a receipt was reserved")
+        .clone();
+    assert_eq!(store.lease_holder(&receipt.row), None, "a hold was written");
+
+    for _ in 0..3 {
+        let report = world.reconciler.pass().await;
+        assert_eq!(
+            (report.due, report.claimed, report.looked_up),
+            (1, 0, 0),
+            "{report:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        world.lookup.looked_up().is_empty(),
+        "looked up while it ran"
+    );
+    assert_eq!(world.receipt(&receipt).state, ReceiptState::Unknown);
+
+    // It ends, and this instance then looks it up and finds the draft.
+    world.lookup.answer(LookupAnswer::Found {
+        reference: VendorReference::new("draft-1"),
+    });
+    draft.open();
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        let report = world.reconciler.pass().await;
+        if report.claimed == 1 {
+            assert_eq!((report.looked_up, report.settled), (1, 1), "{report:?}");
+            break;
+        }
+        assert!(Instant::now() < until, "never looked up once it ended");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(world.receipt(&receipt).state, ReceiptState::Completed);
 }
 
 /// A lookup whose record fails to save still uses up its attempt (#206): an attempt is counted
