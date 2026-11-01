@@ -45,8 +45,9 @@
 //!   key. An explicit key that is not valid, or a declared header sent twice or not as text,
 //!   is dropped with a warning and leaves the call with no key; it is not passed over for the
 //!   next carrier, so a side effect is then denied for want of a key, with a sentence saying
-//!   the key it sent is not valid. A key reused is answered from the earlier call's receipt,
-//!   and nothing runs (decision 0009, "Reuse").
+//!   the key it sent is not valid. The header is not read when the `_meta` field holds
+//!   anything. A key reused is answered from the earlier call's receipt, and nothing runs
+//!   (decision 0009, "Reuse").
 //! - While the policy is stale, `tools/list` and `tools/call` from a proved caller are refused
 //!   with [`POLICY_STALE`] before anything is decided, and no row is written: decision 0009
 //!   makes a request that reaches no decision telemetry, and each emits a `policy_stale` event.
@@ -652,7 +653,7 @@ impl RequestPath {
             .is_some_and(|profile| profile.idempotency_key_header);
         let key = call_key(
             meta_key(idempotency_key),
-            key_header.honoured(declares_header),
+            || key_header.honoured(declares_header),
             tool_use_id.as_ref(),
         );
         let asking = Instant::now();
@@ -987,15 +988,20 @@ fn bounded_tool_use_id(value: Option<String>) -> Option<ToolUseId> {
 /// with no key, [`CallKey::Invalid`], and is not passed over for the next carrier: a call keyed
 /// by its tool-use identifier in place of the key its caller chose would run again when a
 /// replayed turn sends that key with new tool-use identifiers. A side effect is then denied
-/// with a sentence saying the key it sent is not valid.
+/// with a sentence saying the key it sent is not valid. The header is read only when the
+/// `_meta` field holds nothing, so a header passed over is not read, and logs nothing.
 ///
 /// The tool-use identifier is recorded beside an explicit key, on the row and on the receipt,
 /// so the same key sent again with a different tool-use identifier is refused as a key reused
 /// for another call, as a key fixed in configuration would be. That order is also what lets a
 /// key that stays the same across a replayed turn cover it, though the turn's model makes new
 /// tool-use identifiers.
-fn call_key(meta: Explicit, header: Explicit, tool_use_id: Option<&ToolUseId>) -> CallKey {
-    match meta.or(header) {
+fn call_key(
+    meta: Explicit,
+    header: impl FnOnce() -> Explicit,
+    tool_use_id: Option<&ToolUseId>,
+) -> CallKey {
+    match meta.or_else(header) {
         Explicit::Valid(key) => CallKey::Valid(key),
         Explicit::Invalid => CallKey::Invalid,
         Explicit::Absent => tool_use_id
@@ -1016,10 +1022,12 @@ enum Explicit {
 }
 
 impl Explicit {
-    /// This carrier if it holds anything, valid or not, and otherwise `next`.
-    fn or(self, next: Self) -> Self {
+    /// This carrier if it holds anything, valid or not, and otherwise what `next` reads. The
+    /// next carrier is read only then: one that is passed over is never read, so it logs no
+    /// warning that the call carries no key when this one keys it.
+    fn or_else(self, next: impl FnOnce() -> Self) -> Self {
         match self {
-            Self::Absent => next,
+            Self::Absent => next(),
             carried => carried,
         }
     }
@@ -1218,6 +1226,38 @@ mod tests {
             headers.append(AUTHORIZATION, HeaderValue::from_str(value).unwrap());
         }
         headers
+    }
+
+    /// The `Idempotency-Key` header is read only when the `_meta` field holds nothing, so a
+    /// header passed over for a `_meta` key, valid or not, is never read, and never logs that
+    /// the call carries no key.
+    #[test]
+    fn the_header_is_read_only_when_meta_holds_nothing() {
+        let unread = || -> Explicit { panic!("the header was read") };
+        let meta = IdempotencyKey::parse("meta-key").unwrap();
+        assert_eq!(
+            call_key(Explicit::Valid(meta.clone()), unread, None),
+            CallKey::Valid(meta)
+        );
+        assert_eq!(call_key(Explicit::Invalid, unread, None), CallKey::Invalid);
+        let header = IdempotencyKey::parse("header-key").unwrap();
+        assert_eq!(
+            call_key(Explicit::Absent, || Explicit::Valid(header.clone()), None),
+            CallKey::Valid(header)
+        );
+        let tool_use_id = ToolUseId::new("toolu_one".to_owned());
+        assert_eq!(
+            call_key(Explicit::Absent, || Explicit::Invalid, Some(&tool_use_id)),
+            CallKey::Invalid
+        );
+        assert_eq!(
+            call_key(Explicit::Absent, || Explicit::Absent, Some(&tool_use_id)),
+            CallKey::Valid(IdempotencyKey::parse("toolu_one").unwrap())
+        );
+        assert_eq!(
+            call_key(Explicit::Absent, || Explicit::Absent, None),
+            CallKey::Absent
+        );
     }
 
     #[test]

@@ -1081,9 +1081,11 @@ receipt.
   chose would lose that key's cover of a replay. A side effect is then denied for want of a
   key, with the reason kind `key_missing` and a sentence of its own: the key the call sent is
   not valid, what a key is, and that the tool-use identifier is not used in its place; it does
-  not repeat what was sent. Its tool-use identifier is still recorded. A `_meta` value of `null`
-  is read as no key sent. A tool-use identifier outside that bound is dropped with a warning
-  too.
+  not repeat what was sent. Its tool-use identifier is still recorded. The header is read only
+  when the `_meta` field holds nothing, so a header passed over for a `_meta` key is not read,
+  and its warning never says the call carries no key when the `_meta` key keys it. A `_meta`
+  value of `null` is read as no key sent. A tool-use identifier outside that bound is dropped
+  with a warning too.
 - **A key is scoped** to the proved principal and, when a delegation is present, to its
   identifying fields. For Otto those are agreed with Otto's owners; the session and the turn
   are recommended, and whether the execution is needed too is asked.
