@@ -6545,16 +6545,21 @@ mutate("custodian-not-revoked-at-stop", "a stop revokes nothing", KT,
        "        let stopped = self.custodian.clone().revoke_outstanding(deadline).await;",
        "        let stopped = Stopped::default();\n        let _ = deadline;")
 mutate("custodian-stop-revocations-unbounded", "a stop waits for every revocation, however long GitHub takes", KS,
-       "            match tokio::time::timeout_at(until, revoking.join_next()).await {",
-       "            match Ok::<_, ()>(revoking.join_next().await) {")
+       "                () = &mut ends => break,",
+       "                () = &mut ends, if revoking.is_empty() => break,")
 mutate("custodian-stop-in-flight-unbounded", "a stop waits for every request in flight, however long GitHub takes", KS,
-       "        let settled = tokio::time::timeout_at(until, self.slots.acquire_many(MAX_CONNECTIONS))\n"
-       "            .await\n",
-       "        let settled = Ok::<_, ()>(self.slots.acquire_many(MAX_CONNECTIONS).await)\n")
+       "                () = &mut ends => break,",
+       "                () = &mut ends, if settled => break,")
+mutate("custodian-stop-revokes-after-in-flight", "a stop revokes nothing until every request in flight is answered, so one slow request uses up its deadline", KS,
+       "                received = landed.recv(), if open => match received {",
+       "                received = landed.recv(), if open && settled => match received {")
+mutate("custodian-stop-landed-token-not-revoked", "a token issued for a request in flight when the stop began is not revoked by the stop", KS,
+       "        let token = match &kept.stopping {",
+       "        let token = match &None::<UnboundedSender<ToRevoke>> {")
 mutate("custodian-revoked-token-kept", "a token revoked at the end of its lifetime is revoked again at the stop", KS,
        "            .tokens\n            .remove(&id);\n", "            .tokens\n            .len();\n")
 mutate("custodian-lapsed-token-revoked-at-stop", "a stop revokes a token already past GitHub's expiry", KS,
-       "            if each.lapses_at <= now {", "            if false {")
+       "        if each.lapses_at <= clock::now() {", "        if false {")
 mutate("custodian-gateway-links-server", "the GitHub connector, and so the gateway, links the custodian's server and key-reading code",
        "crates/connector-github/Cargo.toml",
        'key-custodian = { path = "../key-custodian", default-features = false, features = ["client"] }',
