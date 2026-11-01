@@ -41,8 +41,11 @@
 //! acting (design section 8; decision 0011, section 6), with one predicate for each that every
 //! write tool shares:
 //!
-//! - [`command_text`]: a text whose first word is `atlantis`, in any case, after any leading
-//!   whitespace, which Atlantis would read as a command. Otto refuses such a comment.
+//! - [`command_text`]: a text whose first word is one of [`ATLANTIS_COMMANDS`] (`atlantis`,
+//!   `@atlantis` or `/atlantis`), in any case, after any leading whitespace and Unicode format
+//!   characters, and with any format character in the word passed over: text Atlantis could
+//!   read as a command. Otto refuses such a comment; this is broader than Otto's rule, so that
+//!   no spelling Atlantis might take as its own name gets through.
 //! - [`refused_path`]: Otto's four refused path groups, with Otto's sentences, in any case: a
 //!   file named `AGENTS.md` in any directory and any path with a `.agents` segment, the
 //!   instruction-authority group; any path under `.github/workflows/` and a file named
@@ -77,13 +80,56 @@ pub fn holds_marker(text: &str) -> bool {
     text.to_ascii_lowercase().contains(MARKER_PREFIX)
 }
 
-/// Whether Atlantis would read `text` as a command: its first word, after any leading
-/// whitespace, is `atlantis`, in any case. Otto's rule for a comment (docs/otto-baseline.md,
-/// "Scope refusals").
+/// The first words Atlantis could read as a command addressed to it, compared in any case:
+/// its own name, and the name as a mention or a slash command.
+pub const ATLANTIS_COMMANDS: &[&str] = &["atlantis", "@atlantis", "/atlantis"];
+
+/// Whether Atlantis could read `text` as a command: its first word is one of
+/// [`ATLANTIS_COMMANDS`], in any case. Leading whitespace and Unicode format characters (a
+/// zero-width space or joiner, a byte order mark, a direction mark) are passed over, and so is
+/// any format character inside the word, which a reader does not see. Otto's rule for a comment
+/// (docs/otto-baseline.md, "Scope refusals"), made broader.
 pub fn command_text(text: &str) -> bool {
-    text.split_whitespace()
+    let start = text.trim_start_matches(|c: char| c.is_whitespace() || format_character(c));
+    let word: String = start
+        .split(char::is_whitespace)
         .next()
-        .is_some_and(|word| word.eq_ignore_ascii_case("atlantis"))
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !format_character(*c))
+        .collect();
+    ATLANTIS_COMMANDS
+        .iter()
+        .any(|command| word.eq_ignore_ascii_case(command))
+}
+
+/// Whether `c` is a Unicode format character (general category `Cf`), which takes no space
+/// when shown: Unicode 16's list.
+fn format_character(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
 }
 
 /// The sentence a proposal tool refuses command text in `field` with.
@@ -345,15 +391,27 @@ mod tests {
             "  \n\tATLANTIS",
             "atlantis",
             "aTlAnTiS\nunlock",
+            "/atlantis apply",
+            "@atlantis plan",
+            "@ATLANTIS",
+            "\u{200B}atlantis apply",
+            "\u{FEFF} \u{2060}\n@Atlantis unlock",
+            "\u{00A0}\u{3000}atlantis plan",
+            "atl\u{200D}antis apply",
+            "atlantis\u{200B} apply",
         ] {
             assert!(command_text(command), "{command:?}");
         }
         for text in [
             "",
             "   ",
+            "\u{200B}",
             "please run atlantis apply",
+            "please run atlantis plan later",
             "atlantisapply",
-            "/atlantis apply",
+            "atlantis-bot apply",
+            "#atlantis apply",
+            "//atlantis apply",
             "Adds a retry to the client.",
         ] {
             assert!(!command_text(text), "{text:?}");
