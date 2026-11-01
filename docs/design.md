@@ -2190,8 +2190,8 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   start refused with an interval shorter than a call deadline. The vendor-report kind is built
   for GitHub (#193; section 13): each built-in entry with a `reach_report` is checked on a
   schedule of its own, every interval, at once when the pass starts and at each tick unless the
-  last is out, as a canary is. An entry that names no `reach_report` is not checked, and no rule
-  yet requires one of a GitHub entry with a reach (not built). The check sends the report's
+  last is out, as a canary is. A GitHub entry that declares a reach must name one (section 13);
+  an entry of another system need not, and is not checked. The check sends the report's
   tool, a reach-report entry's, through the same listener as the same principal, so it is
   decided and audited like any call, with the deadline `[connectors.<name>]` sets for the tool's
   entry plus the 5 s allowance, and compares the repositories it lists with the entry's recorded
