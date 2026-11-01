@@ -675,3 +675,81 @@ impl gateway_core::Connector for GitHubConnector {
         Box::pin(self.call(call))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use gateway_core::{Classification, CredentialMode};
+    use gateway_registry::EntryDeclaration;
+
+    use super::*;
+
+    fn settings(organization: &str) -> GitHubSettings {
+        GitHubSettings {
+            organization: organization.into(),
+            api_url: "http://127.0.0.1:9".into(),
+            ca_file: None,
+            custodian_socket: PathBuf::from("/nonexistent/custodian.sock"),
+            custodian_deadline: DEFAULT_CUSTODIAN_DEADLINE,
+            job_log_hosts: Vec::new(),
+        }
+    }
+
+    fn entry(narrowing: Narrowing, reports_reach: bool) -> BuiltInEntry {
+        BuiltInEntry {
+            name: "github-read".into(),
+            system: SYSTEM.into(),
+            permissions: BTreeMap::from([("contents".to_owned(), Access::Read)]),
+            tools: BTreeSet::new(),
+            declaration: Some(EntryDeclaration {
+                credential: CredentialMode::TeamServiceIdentity,
+                principal: "app".into(),
+                narrowing,
+                permits: Classification::Read,
+                reach: BTreeSet::new(),
+            }),
+            reports_reach,
+            reach_report: None,
+        }
+    }
+
+    /// GitHub tokens are always narrowed, to the caller's limit or the call's repository: an
+    /// entry narrowed `none` is refused when the connector is built, except a reach report's,
+    /// whose one token is the installation-wide exception.
+    #[test]
+    fn an_entry_narrowed_none_is_refused_unless_it_reports_reach() {
+        let refused =
+            GitHubConnector::new(&settings("example-org"), [&entry(Narrowing::None, false)])
+                .unwrap_err();
+        assert_eq!(refused, SettingsError::NotNarrowed("github-read".into()));
+        for (narrowing, reports_reach) in [
+            (Narrowing::None, true),
+            (Narrowing::Limit, false),
+            (Narrowing::Call, false),
+        ] {
+            GitHubConnector::new(&settings("example-org"), [&entry(narrowing, reports_reach)])
+                .unwrap();
+        }
+        // An entry that declares no credential serves no approved tool, and is not checked.
+        let mut undeclared = entry(Narrowing::None, false);
+        undeclared.declaration = None;
+        GitHubConnector::new(&settings("example-org"), [&undeclared]).unwrap();
+    }
+
+    /// The organization is a GitHub account name: 1 to 39 letters, digits and hyphens.
+    #[test]
+    fn the_organization_is_an_account_name() {
+        let long = "a".repeat(40);
+        for refused in ["", "example/org", "example_org", long.as_str()] {
+            assert_eq!(
+                GitHubConnector::new(&settings(refused), []).unwrap_err(),
+                SettingsError::Organization(refused.to_owned())
+            );
+        }
+        let longest = "a".repeat(39);
+        for accepted in ["example-org", "E", longest.as_str()] {
+            GitHubConnector::new(&settings(accepted), []).unwrap();
+        }
+    }
+}

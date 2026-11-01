@@ -423,6 +423,18 @@ permits = "read""#;
             }),
         ),
         (
+            "an entry whose credential names no principal",
+            registry(
+                &DECLARED.replace("switchboard-github-app", ""),
+                "read",
+                FROM_ARGUMENTS,
+            ),
+            RegistryError::EmptyField {
+                field: "credential.principal",
+                place: "connector `github-read`".into(),
+            },
+        ),
+        (
             "an entry narrowed per call serving a tool that checks its own scope (rule 7)",
             registry(call, "read", r#""checks_own_scope""#),
             RegistryError::Snapshot(SnapshotError::CallNarrowingWithoutArguments {
