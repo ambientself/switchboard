@@ -138,3 +138,56 @@ async fn a_stop_with_a_request_in_flight_ends_at_its_deadline() {
     );
     asking.abort();
 }
+
+#[tokio::test]
+async fn a_request_in_flight_does_not_hold_up_revoking_the_tokens_kept() {
+    // GitHub does not answer the second token request, and would be given ten seconds, more
+    // than the stop's deadline: the token already handed out is revoked meanwhile.
+    let mut world = World::with(|config| config.github.deadline_seconds = 10).await;
+    let first = world.client.token(&request()).await.unwrap();
+    world.fake.set_behaviour(Behaviour::Hang);
+    let client = world.client.clone();
+    let asking = tokio::spawn(async move { client.token(&request()).await });
+    while world.fake.token_requests() < 2 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let stopped = stop(&mut world, Duration::from_secs(2)).await;
+    assert_eq!(
+        stopped,
+        Stopped {
+            revoked: 1,
+            not_revoked: 0,
+            in_flight: 1
+        }
+    );
+    assert_eq!(world.fake.revoked(), vec![first.expose().to_owned()]);
+    asking.abort();
+}
+
+#[tokio::test]
+async fn a_token_issued_during_the_stop_is_revoked_as_it_is_issued() {
+    // GitHub answers the second token request a second and a half after it is asked, once the
+    // stop has begun and revoked the first token.
+    let mut world = World::new().await;
+    let first = world.client.token(&request()).await.unwrap();
+    world.fake.set_behaviour(Behaviour::Delay(1500));
+    let client = world.client.clone();
+    let asking = tokio::spawn(async move { client.token(&request()).await });
+    while world.fake.token_requests() < 2 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let stopped = stop(&mut world, Duration::from_secs(5)).await;
+    let second = asking.await.unwrap().unwrap();
+    assert_eq!(
+        stopped,
+        Stopped {
+            revoked: 2,
+            not_revoked: 0,
+            in_flight: 0
+        }
+    );
+    assert_eq!(
+        world.fake.revoked(),
+        vec![first.expose().to_owned(), second.expose().to_owned()]
+    );
+}

@@ -58,6 +58,8 @@ pub enum Behaviour {
     Fail,
     /// Never answers.
     Hang,
+    /// Issues tokens as GitHub does, answering this many milliseconds after it is asked.
+    Delay(u64),
     /// Issues a token for every repository of the installation, whatever was asked.
     Widen,
     /// Issues tokens as asked, and writes each repository's `full_name` in capitals, as GitHub
@@ -328,6 +330,9 @@ async fn create(
     };
     if behaviour == Behaviour::Hang {
         std::future::pending::<()>().await;
+    }
+    if let Behaviour::Delay(millis) = behaviour {
+        tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
     }
     let headers_ok = headers
         .get("accept")
