@@ -108,6 +108,6 @@ pub use stats::{
     StoreStats,
 };
 pub use store::{
-    Budgets, FinishCounts, GivenUp, OPEN_ROWS_POOL_SIZE, OpenRows, PgAuditError, PgAuditStore,
-    PoolSizes, UnknownReceipts,
+    Budgets, Disagreement, FinishCounts, GivenUp, OPEN_ROWS_POOL_SIZE, OpenRows, PgAuditError,
+    PgAuditStore, PoolSizes, UnknownReceipts,
 };

@@ -983,12 +983,15 @@ protects rows against a database superuser.
 calls, and lets running calls and their finishes complete. Its termination grace period is set
 explicitly, longer than the readiness-removal delay plus the begin budget, the call deadline,
 the finish deadline and one answer budget, for the last attempt to complete a failed begin's
-row, which is made at the finish deadline.
+row, which is made at the finish deadline. Within the same wait for the finishes, it waits for
+the side effects answered `unknown` at their deadline that still run on tasks of their own,
+and cancels none (see Receipts).
 
 **Signals,** counted and exported from milestone 2: begin failures and the audit-failure
 answers they cause; answers released before finish; finishes not written by their deadline;
 open rows; receipts in `unknown` and the age of the oldest; reconciliation's lookups by result
-and the receipts it handed to a person; begin and finish latency; connections in use per pool;
+and the receipts it handed to a person; late finishes that disagreed with reconciliation;
+begin and finish latency; connections in use per pool;
 telemetry dropped. The alert conditions are written in
 [decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md); nothing pages until
 a metrics sink and an on-call rotation exist.
@@ -1111,11 +1114,16 @@ receipt.
   the queue of receipts in `unknown`, the state `unknown` or `pending` past its row's deadline,
   with no separate deployment: it claims a receipt by setting a short lease, committed before
   any lookup is made, so no lock or connection is held across one, and records each lookup on
-  the receipt, appended and never changed. A receipt with nothing to look in, or whose
-  connector has no lookup, goes to a person at once; one whose lookups are used up goes to a
-  person on its last. The interval, the lease and the number of attempts are deployment-file
+  the receipt, appended and never changed. Each claim is counted on the receipt in the claim's
+  own write, and counts as an attempt whether or not the lookup made under it was recorded, so
+  a store that fails to save lookups still lets a receipt be looked up at most the number of
+  attempts (migration 0012). A receipt with nothing to look in, or whose connector has no
+  lookup, goes to a person at once; one whose attempts are used up goes to a person on its
+  last lookup, or at its next claim when a lookup's record was lost. The interval, the lease and the number of attempts are deployment-file
   settings, 60 s, 120 s and 5 by default, accepted by the owner on 2026-10-14 and revisited
-  once a connector has a lookup (`crates/gateway/src/reconcile.rs`). A receipt handed to a person stays `unknown`, so the
+  once a connector has a lookup (`crates/gateway/src/reconcile.rs`). A lookup has half the
+  lease to answer, so it ends while the lease is held; one that takes longer is recorded as
+  failed. A receipt handed to a person stays `unknown`, so the
   open-row and unknown-receipt signals still count it. Nothing records a person's resolution
   yet: who may record one, and through which authenticated path, is decision 0009's Still open
   10, and who settles a receipt by hand is its Still open 9. A `propose` tool may be approved
@@ -1123,6 +1131,38 @@ receipt.
   ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md)) needs a key, a
   receipt and the gate below like any side effect, and declares a lookup by marker unless its
   exception says otherwise.
+- **No receipt is looked up while its own call may still act** (#217). A side effect of a
+  connector in the gateway's own process that has not finished by its deadline is answered
+  `unknown` and runs on in a task of its own, never cancelled once sent. A lookup made
+  meanwhile could find nothing, because the request is still on its way, and settle the
+  receipt `not_performed` from an authoritative search though the call may yet act. So that
+  task holds the receipt's lease itself, through the same store, under a holder of its
+  instance's own (`crates/gateway/src/bound.rs`). The first hold is written before the call is
+  answered, while the receipt is still `pending` within its row's deadline and so not due on
+  any instance; migration 0012 lets a lease be written on a receipt `pending` or `unknown` not
+  yet settled or handed to a person, and a hand-off still only on one in `unknown`. The task
+  holds the receipt again every quarter of the lease while it runs, and once more when it ends.
+  A held receipt is not due, so no instance claims it, this one or another replica. Decision
+  0009 does not say how long such a task may hold a lease; the choice made here is the
+  conservative one: for as long as the side effect runs, with no limit, and then a full lease
+  more, so the first lookup comes at least a lease after the side effect ended, by which time a
+  vendor's search has had a lease to show it. The hold lasts only while the instance can write
+  to the store: a hold that is not written is logged as `in_process_late_side_effect_unheld`
+  and tried again at the next renewal, and an instance that stops, or is cut off from the
+  store for a whole lease, lets the lease run out and the receipt be looked up. The first hold
+  has 2 s, so a late side effect is answered at most that much after its deadline. A gateway
+  shutting down waits for such tasks within the time it already waits for its rows to
+  complete, and never cancels one; one still running when that time is up is logged as
+  `late_side_effects_left_running`, and its receipt stays `unknown` for reconciliation or a
+  person.
+- **A late finish that disagrees with reconciliation is logged and counted.** A finish written
+  after its row's deadline, by which time a lookup has settled the receipt in the other state,
+  completes its row and leaves the receipt as reconciliation settled it, as decision 0009
+  says. The Postgres store counts each such disagreement, once, in
+  `switchboard_audit_late_finish_disagreements_total`, and the gateway logs it as
+  `late_finish_disagrees_with_reconciliation`, naming the receipt, the state the finish
+  reported and the state reconciliation settled. A late `unknown` disagrees with nothing.
+  Alerting on it waits for decision 0009's Still open 9.
 - **A side effect's `error` means its connector knows nothing took effect,** and settles its
   receipt as `not_performed`: the request failed before it was sent, or the vendor definitely
   rejected it. A side-effecting connector reports `unknown` whenever it cannot know that. A
@@ -2433,11 +2473,13 @@ and 2). Built before any built-in connector, so the first one is bounded from it
   cancelled, and is `error` of the kind `oversized_or_late_read`. Any other tool is never
   cancelled once it may have been sent ("Where a call runs"): at the deadline the call is
   answered `unknown`, its row is `unknown` and its receipt stays `unknown`, and its work is
-  moved, as it is, to a task of its own that runs it to its end and logs what it came to.
-  Reconciliation settles the receipt, or a person does. A result over the size bound is
+  moved, as it is, to a task of its own that runs it to its end and logs what it came to. That
+  task holds the receipt's lease while it runs, so no instance looks the receipt up meanwhile,
+  and shutting down waits for it within the grace (section 11, Receipts). Reconciliation
+  settles the receipt afterwards, or a person does. A result over the size bound is
   discarded: `error` of the kind `oversized_or_late_read` from a read, `unknown` from any other
   tool, even one the vendor confirmed, whose reference is logged for reconciliation. Each
-  breach is logged with its kind, never cut short silently.
+  breach is logged once, with its kind and any such reference, never cut short silently.
 - The rate quotas: built (`crates/gateway/src/quota.rs`). A token bucket for each server,
   proxied or in the gateway's own process, and one for each team on each server, in each
   instance. `[limits]` sets `per_server_calls_per_minute` and `per_server_burst`, 80 and 80
@@ -2808,8 +2850,11 @@ reconciliation's cases (#55, part 4): a receipt records the vendor target its se
 takes; two claimants never both hold a receipt's lease; an ended lease can be claimed again;
 the attempts are bounded, the last handing the receipt to a person; an authoritative search
 that found nothing settles `not_performed` and no other answer does; a found effect settles
-`completed` with its reference; a lookup record is append-only; and a receipt settled by
-reconciliation is not moved by a late finish. The Postgres runner ends a lease by moving it, as
+`completed` with its reference; a lookup record is append-only; a receipt settled by
+reconciliation is not moved by a late finish, and a late finish that disagrees with it is
+counted once; each claim is counted as an attempt; and a receipt held for its call, `pending`
+or `unknown`, is not due and no one else claims it until the hold ends (#206, #217). The
+Postgres runner ends a lease by moving it, as
 the superuser, a second into the past. The
 Postgres runner passes a row's deadline by moving it, as the superuser, to the row's time at
 begin, and loses every begin's confirmation through a switch only the crate's own tests have,

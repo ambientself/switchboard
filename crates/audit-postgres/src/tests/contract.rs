@@ -217,7 +217,7 @@ impl ContractStore for Postgres {
                      r.idempotency_key, r.tool, r.tool_use_id, r.digest, r.resources,
                      r.resources_omitted, r.state, r.established_by, r.established_person,
                      r.reference, r.target_system, r.target_kind, r.target_identifier,
-                     r.handed_to_person_at",
+                     r.handed_to_person_at, r.claims",
                     " FROM switchboard_audit.receipts r"
                 ),
                 &[],
@@ -277,9 +277,13 @@ impl ContractStore for Postgres {
         &self.store
     }
 
+    fn late_finish_disagreements(&self) -> u64 {
+        self.store.stats().late_finish_disagreements
+    }
+
     /// Ends the receipt's lease a second ago by the database's clock, as the superuser, in a
     /// session whose `session_replication_role` turns off the trigger that writes a lease only
-    /// on a receipt in `unknown`.
+    /// on a receipt not yet settled or handed to a person.
     async fn pass_lease(&self, row: &AuditRowId) {
         let id = uuid(row);
         self.admin
@@ -383,4 +387,6 @@ contract!(
     a_found_effect_settles_completed_with_its_reference,
     a_lookup_record_is_append_only,
     a_receipt_settled_by_reconciliation_is_not_moved_by_a_late_finish,
+    each_claim_is_counted_as_an_attempt,
+    a_receipt_held_for_its_call_is_not_due_and_no_one_else_claims_it,
 );

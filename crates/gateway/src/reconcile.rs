@@ -7,11 +7,16 @@
 //!
 //! 1. Claims it, with a lease of `reconciliation.lease_seconds`, through the store. The claim is
 //!    committed before anything else happens, so no lookup is made without it, and no lock or
-//!    connection is held across a lookup. A receipt another instance holds is passed over.
+//!    connection is held across a lookup. The store counts the claim in the same write. A
+//!    receipt another instance holds is passed over, and so is one whose own call still runs
+//!    past its deadline, which holds it ([`crate::bound`]).
 //! 2. Hands it to a person at once when there is nothing to look in: its tool is settled by a
 //!    person, so its receipt recorded no vendor target, or the call named no single resource of
 //!    the declared kind; or its tool's connector registered no [`Lookup`] (no connector does
-//!    until #12), or the tool is no longer approved; or its attempts are used up.
+//!    until #12), or the tool is no longer approved; or its attempts are used up. Each claim is
+//!    an attempt, whether or not the lookup made under it was recorded, so a store that fails
+//!    to save lookups still lets a receipt be looked up at most `reconciliation.attempts`
+//!    times.
 //! 3. Otherwise asks the connector's lookup for the receipt's marker in its target, with half the
 //!    lease to answer, so the lookup ends while the lease is held. A lookup that takes longer is
 //!    a failed one. The lookup is not a tool call and writes no audit row.
@@ -75,9 +80,11 @@ pub const MAX_RECONCILE_LEASE: Duration = Duration::from_secs(3600);
 /// after a claim usually finds its lease a moment short of running out, so one instance's
 /// lookups land about three minutes apart; several instances bring that nearer two. That is an
 /// estimate, assuming no backlog, lookups that answer promptly and saves that succeed. A pass
-/// works through up to [`RECONCILE_BATCH`] receipts one at a time, each lookup may take half
-/// the lease, and a lookup whose save fails uses up no attempt, so a backlog, slow lookups or a
-/// failing store can make it much longer.
+/// works through up to [`RECONCILE_BATCH`] receipts one at a time, and each lookup may take
+/// half the lease, so a backlog or slow lookups can make it much longer. A lookup whose save
+/// fails still uses up its attempt, since an attempt is counted when its claim is made, so a
+/// failing store does not add lookups, though one that cannot record the hand-off leaves the
+/// receipt unhanded until it can.
 pub const DEFAULT_RECONCILE_ATTEMPTS: u32 = 5;
 /// The most attempts the deployment file may give.
 pub const MAX_RECONCILE_ATTEMPTS: u32 = 20;
@@ -400,7 +407,14 @@ impl Reconciler {
             (Some(_), None) => return self.hand_off(&claimed, HandOff::NoLookup, report).await,
             (Some(target), Some(lookup)) => (target, lookup),
         };
-        if claimed.lookups.len() >= usize::try_from(self.settings.attempts).unwrap_or(usize::MAX) {
+        // Each claim is an attempt, this one included, whether or not the lookup made under an
+        // earlier one was recorded: a store that fails to save lookups cannot let a receipt be
+        // looked up without bound. A receipt claimed before claims were counted has its
+        // recorded lookups for attempts.
+        let attempts = self.settings.attempts;
+        if claimed.lookups.len() >= usize::try_from(attempts).unwrap_or(usize::MAX)
+            || claimed.claims > attempts
+        {
             return self
                 .hand_off(&claimed, HandOff::AttemptsUsedUp, report)
                 .await;

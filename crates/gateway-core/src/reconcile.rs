@@ -11,10 +11,16 @@
 //! and leaves it `unknown`, for the next attempt.
 //!
 //! A [`ReceiptQueue`] is the store's side: the receipts due a lookup, a short lease that one
-//! instance claims a receipt with, committed before any lookup is made, the lookups made,
-//! appended and never changed, and the hand-off to a person once the attempts are used up or
-//! when there is nothing to look in. A receipt handed to a person stays `unknown`. How a person
-//! records a resolution is not built (decision 0009, Still open 10).
+//! instance claims a receipt with, committed before any lookup is made and counted against the
+//! receipt's attempts, the lookups made, appended and never changed, and the hand-off to a
+//! person once the attempts are used up or when there is nothing to look in. A receipt handed
+//! to a person stays `unknown`. How a person records a resolution is not built (decision 0009,
+//! Still open 10).
+//!
+//! The same lease keeps a receipt from being looked up while its own call may still act: a side
+//! effect answered `unknown` at its deadline runs on in a task of its own, never cancelled once
+//! sent (decision 0009, "Where a call runs"), and that task [holds](ReceiptQueue::hold) its
+//! receipt's lease until it ends. A held receipt is not due, on any instance.
 
 use std::fmt;
 use std::time::{Duration, SystemTime};
@@ -259,18 +265,20 @@ pub enum Recorded {
 ///
 /// A receipt is due when it reads as `unknown` (the state `unknown`, or `pending` past its
 /// row's deadline), has not been handed to a person, and its lease is free: never set, or
-/// ended. A receipt is held by the holder that claimed it until its lease ends. Ending a lease
-/// early is not offered: a lease runs out, which also spaces one receipt's attempts.
+/// ended. A receipt is held by the holder that claimed it, or that [holds](Self::hold) it for
+/// its call, until its lease ends. Ending a lease early is not offered: a lease runs out, which
+/// also spaces one receipt's attempts.
 pub trait ReceiptQueue: Send + Sync {
     /// Up to `limit` receipts due, the longest reserved first, as they are now, with the
     /// lookups made so far. Reads only: nothing is claimed.
     fn due<'a>(&'a self, limit: usize) -> BoxFuture<'a, Result<Vec<Receipt>, StoreError>>;
 
     /// Claims the receipt reserved under `row` for `holder`, for `lease` from now, if it is
-    /// still due, and returns it as it is then. The claim is committed when this returns, and
-    /// not before, so no lookup is made before it and no lock or connection is held across one.
-    /// Of two claims at once, at most one succeeds. `None` when the receipt is not due: settled,
-    /// handed to a person, or held under a lease that has not ended.
+    /// still due, counts the claim in its [`claims`](Receipt::claims) in the same write, and
+    /// returns it as it is then. The claim is committed when this returns, and not before, so
+    /// no lookup is made before it and no lock or connection is held across one. Of two claims
+    /// at once, at most one succeeds. `None`, counting nothing, when the receipt is not due:
+    /// settled, handed to a person, or held under a lease that has not ended.
     fn claim<'a>(
         &'a self,
         row: &'a AuditRowId,
@@ -294,6 +302,24 @@ pub trait ReceiptQueue: Send + Sync {
         answer: &'a LookupAnswer,
         attempts: u32,
     ) -> BoxFuture<'a, Result<Recorded, StoreError>>;
+
+    /// Holds the receipt reserved under `row` for `holder`, for `lease` from now, on behalf of
+    /// the call that reserved it: a side effect answered `unknown` at its deadline that runs on
+    /// in a task of its own, which may still act. A held receipt is not due, so no instance
+    /// claims it or looks it up while it is held. The task holds it again before the lease
+    /// ends, for as long as it runs.
+    ///
+    /// Sets the lease when it is free or `holder` holds it already, while the receipt is
+    /// `pending`, within its row's deadline or past it, or `unknown`, and has not been handed
+    /// to a person. Counts no claim. Returns whether `holder` holds it when this returns:
+    /// `false`, writing nothing, when another holder's lease has not ended, or the receipt is
+    /// settled or handed to a person, or there is none under `row`.
+    fn hold<'a>(
+        &'a self,
+        row: &'a AuditRowId,
+        holder: &'a LeaseHolder,
+        lease: Duration,
+    ) -> BoxFuture<'a, Result<bool, StoreError>>;
 
     /// Hands the receipt reserved under `row` to a person, recording when, by the store's
     /// clock. It stays `unknown`, and is no longer due. Refused, writing nothing, unless

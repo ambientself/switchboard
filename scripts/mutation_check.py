@@ -1146,6 +1146,8 @@ mutate("reconcile-found-left-unknown", "a lookup that found the effect leaves it
 mutate("reconcile-person-sent-to-lookup", "a tool settled by a person records a vendor target, so its receipt is sent to the lookup", R,
        "            Settlement::Person => None,",
        "            Settlement::Person => named(resources).first().cloned(),")
+mutate("core-tool-call-row-wrong", "a connector is given another row than its call's, so a late side effect holds a receipt that is not its own", SRC + "audit.rs",
+       "        row: start.row.clone(),\n", "        row: AuditRowId::new(\"00000000-0000-7000-8000-000000000000\"),\n")
 mutate("reconcile-target-not-recorded", "begin records no vendor target, so every receipt goes to a person", SRC + "audit.rs",
        "            .and_then(|settlement| settlement.target(&call.resources)),",
        "            .and_then(|_| None),")
@@ -1797,11 +1799,11 @@ mutate("fake-audit-begin-drops-resources", "the store keeps a row without the re
        "                    state.rows.push((row.clone(), AuditRecord { resources: gateway_core::audit::RecordedResources::Unknown, ..record.clone() }, times));")
 mutate("fake-audit-begin-resets-omitted", "the store keeps a row without the count of resources begin omitted", A, FAKE_BEGIN_PUSH,
        "                    state.rows.push((row.clone(), AuditRecord { resources_omitted: 0, ..record.clone() }, times));")
-FAKE_FINISH_WRITE = "                row.completion = Some(completion.clone());\n                Ok(())"
+FAKE_FINISH_WRITE = "                row.completion = Some(completion.clone());\n                Ok(true)"
 mutate("fake-audit-finish-resets-omitted", "finishing a row clears its count of omitted resources", A, FAKE_FINISH_WRITE,
-       "                row.completion = Some(completion.clone());\n                row.resources_omitted = 0;\n                Ok(())")
+       "                row.completion = Some(completion.clone());\n                row.resources_omitted = 0;\n                Ok(true)")
 mutate("fake-audit-finish-rewrites-row", "finishing a row changes more than its completion", A, FAKE_FINISH_WRITE,
-       "                row.completion = Some(completion.clone());\n                row.resources_omitted += 1;\n                Ok(())")
+       "                row.completion = Some(completion.clone());\n                row.resources_omitted += 1;\n                Ok(true)")
 mutate("fake-audit-row-id-ignored", "the store keeps every row under one identifier, not the one begin was given", A,
        FAKE_BEGIN_PUSH, '                    state.rows.push((AuditRowId::new("0"), record.clone(), times));')
 mutate("testkit-begin-duplicates-row", "a begin with a known identifier writes a second row", A,
@@ -1830,7 +1832,7 @@ mutate("testkit-lost-confirmation-ignored", "a begin told to lose its confirmati
        "            if false {\n                // As the Postgres store")
 # A repeated finish must match the completion stored, an error's kind included, as Postgres's does.
 mutate("fake-audit-error-kind-repeat-unchecked", "a repeated finish with an error of another kind is accepted", A,
-       "            Some(written) if written == completion => Ok(()),",
+       "            Some(written) if written == completion => Ok(false),",
        "            Some(written)\n"
        "                if written == completion\n"
        "                    || (matches!(written.outcome, Outcome::Error { .. })\n"
@@ -1946,8 +1948,8 @@ mutate("testkit-retry-after-settled-runs", "a begin under a row whose receipt ha
 mutate("testkit-reference-dropped", "a receipt's vendor reference is not kept", A,
        "            receipt.reference = reference.cloned();\n", "")
 mutate("testkit-late-finish-settles-receipt", "a finish after its row's deadline settles the receipt, as if the deadline had not passed", A,
-       "            && may_move(receipt.state, settled, &EstablishedBy::Call, past_deadline)",
-       "            && may_move(receipt.state, settled, &EstablishedBy::Call, false)")
+       "        if may_move(receipt.state, settled, &EstablishedBy::Call, past_deadline) {",
+       "        if may_move(receipt.state, settled, &EstablishedBy::Call, false) {")
 # A pending receipt past its row's deadline reads as unknown wherever the store reads it (#55):
 # its receipts, the reuse answer and a retried begin. tests/receipts.rs and the contract suite's
 # item 6 catch this.
@@ -1965,6 +1967,22 @@ mutate_all("testkit-attempts-unbounded", "a receipt is looked up without bound, 
 mutate("testkit-lookup-record-replaced", "each lookup replaces the record of the one before it", A,
        "            receipt.lookups.push(LookupRecord {",
        "            receipt.lookups.truncate(made.saturating_sub(1));\n            receipt.lookups.push(LookupRecord {")
+# A call holds its receipt's lease, each claim is counted as an attempt, and a late finish that
+# disagrees with reconciliation is counted (#206, #217). The contract suite's reconciliation
+# cases catch these.
+mutate("testkit-hold-ignores-other-holder", "a call holds its receipt whatever lease another holder has", A,
+       "            if !open || !(state.lease_free(row, now) || state.holds(row, holder, now)) {",
+       "            if !open {")
+mutate("testkit-hold-on-settled-receipt", "a receipt settled or handed to a person can be held", A,
+       "                    && matches!(receipt.state, ReceiptState::Pending | ReceiptState::Unknown)\n"
+       "                    && receipt.handed_to_person.is_none()\n",
+       "")
+mutate("testkit-claim-not-counted", "a claim is not counted on its receipt, so a lookup whose save fails uses up no attempt", A,
+       "                    stored.claims = stored.claims.saturating_add(1);\n", "")
+mutate("testkit-late-finish-disagreement-not-counted", "a late finish that disagrees with reconciliation is not counted", A,
+       "            self.late_finish_disagreements += 1;\n", "")
+mutate("testkit-late-finish-agreement-counted", "a late finish that agrees with reconciliation is counted as a disagreement", A,
+       "        && receipt.state != settled\n", "")
 
 C = TESTKIT_SRC + "credentials.rs"
 NEXT_FAILURE = "            Refusing::Next(failure) => {\n                state.refusing = Refusing::Never;\n                Some(failure)\n            }"
@@ -2622,6 +2640,21 @@ mutate_all("gw-lookup-before-claim", "a receipt is looked up before its claim is
             "        }\n"))
 mutate("gw-reconciliation-signals-unwritten", "the metrics leave out reconciliation's signals", GW_METRICS,
        "        if let Some(reconciliation) = &self.reconciliation {\n", "        if let Some(reconciliation) = None::<&ReconcileSignals> {\n")
+# Each claim is an attempt, a lookup has half the lease, the deployment file's [reconciliation]
+# reaches the settings, and a late finish's disagreement is exported (#206). tests/reconcile.rs,
+# tests/deployment.rs and metrics.rs's own tests catch these.
+mutate("gw-claims-not-counted-as-attempts", "a lookup whose save fails uses up no attempt, so a receipt is looked up without bound", GW_RECONCILE,
+       "            || claimed.claims > attempts\n", "            || false\n")
+mutate("gw-lookup-has-the-whole-lease", "a lookup has the whole lease to answer, so it may end after the lease does", GW_RECONCILE,
+       "        let answer = tokio::time::timeout(self.settings.lookup_deadline(), lookup.look(request))\n",
+       "        let answer = tokio::time::timeout(self.settings.lease, lookup.look(request))\n")
+mutate("gw-reconciliation-table-ignored", "the deployment file's [reconciliation] does not reach the settings, which are the defaults", GW + "deployment.rs",
+       "        let reconciliation = ReconciliationSection::settings(file.reconciliation.as_ref())?;\n",
+       "        let reconciliation = ReconciliationSection::settings(None)?;\n")
+mutate("gw-late-finish-disagreements-unexported", "the metrics leave out late finishes that disagreed with reconciliation", GW_METRICS,
+       "        stats.late_finish_disagreements,\n", "        0,\n")
+mutate("gw-proxied-quotas-not-from-file", "the deployment file's [limits] quotas do not reach a proxied server's bulkhead", GW + "start.rs",
+       "        )\n        .with_quotas(limits.quotas);\n", "        );\n")
 mutate("gw-demo-kind-open-rows-names-outage", "the kind run's open-row metrics check names a database outage it did not have",
        "deploy/demo/demo.sh",
        "  local open=\"one row\"\n",
@@ -3075,8 +3108,9 @@ mutate("gw-in-process-bound-not-applied", "a connector in the gateway's own proc
        "            limits,\n"
        "            quotas,\n"
        "            in_process.clone(),\n"
+       "            late.clone(),\n"
        "        ));\n",
-       "        let _ = (&quotas, &in_process, Bounded::new);\n")
+       "        let _ = (&quotas, &in_process, &late, Bounded::new);\n")
 mutate("gw-in-process-late-side-effect-error", "a side effect past its bound is recorded as error, which settles its receipt not_performed", GW_BOUND,
        "        } else {\n            ToolOutcome::Unknown\n        };\n",
        "        } else {\n            ToolOutcome::error(ErrorKind::Other, breach.sentence())\n        };\n")
@@ -3086,6 +3120,28 @@ mutate("gw-in-process-side-effect-cancelled", "a side effect past its deadline i
 mutate("gw-in-process-size-bound-removed", "a result of any size from a connector in the gateway's own process is passed on", GW_BOUND,
        "        if fits(result, self.limits.max_result_bytes) {\n",
        "        if fits(result, usize::MAX) {\n")
+# A late side effect holds its receipt's lease while it runs, so no instance looks the receipt
+# up meanwhile; shutting down waits for it; and each breach is logged once (#217).
+# tests/reconcile.rs, tests/in_process.rs and tests/in_process_logs.rs catch these.
+mutate("gw-late-side-effect-unheld", "a late side effect is answered before its receipt is held, so another instance may look it up while it runs", GW_BOUND,
+       "                if let Some(holding) = &holding {\n                    holding.hold(&row, &connector, &late_tool).await;\n                }\n", "")
+mutate("gw-late-side-effect-hold-not-renewed", "a late side effect holds its receipt once, so a lookup comes a lease later while it still runs", GW_BOUND,
+       "                tokio::time::sleep(every).await;\n                self.hold(row, connector, tool).await;\n",
+       "                tokio::time::sleep(every).await;\n")
+mutate("gw-late-side-effect-not-held-at-its-end", "a late side effect's receipt is not held again as it ends, so a lookup may come at once", GW_BOUND,
+       "        self.hold(row, connector, tool).await;\n        outcome\n", "        outcome\n")
+mutate("gw-reconciler-holds-nothing", "making the reconciler does not tell late side effects where to hold their receipts", BOOT,
+       "        self.late.hold_in(\n", "        let _ = (\n")
+mutate("gw-late-call-wait-returns-at-once", "shutting down does not wait for a late side effect", GW_BOUND,
+       "            if running == 0 {\n                return 0;\n            }\n",
+       "            if running == 0 || !within.is_zero() {\n                return 0;\n            }\n")
+mutate("gw-late-call-end-not-told", "a late side effect's end does not wake a shutdown waiting for it, which waits out its whole grace", GW_BOUND,
+       "        self.0.ended.notify_waiters();\n", "")
+mutate("gw-breach-logged-twice", "an oversized side effect's breach is logged twice", GW_BOUND,
+       "        self.breached(Breach::Oversized, read, tool, reference)\n",
+       "        tracing::warn!(event = BOUND_BREACHED_EVENT, \"again\");\n        self.breached(Breach::Oversized, read, tool, reference)\n")
+mutate("gw-breach-reference-dropped", "an oversized side effect's breach does not carry the vendor's reference", GW_BOUND,
+       "            reference = reference.map(VendorReference::as_str),\n", "            reference = None::<&str>,\n")
 mutate("gw-team-quota-not-applied", "a team's rate quota on a server is never taken, so one team can use up the server's", GW_QUOTA,
        "        let team = team.map(|team| self.team(team, now));\n",
        "        let team = team.filter(|_| false).map(|team| self.team(team, now));\n")
@@ -4173,8 +4229,12 @@ mutate("pg-row-ids-default-kept", "the database still makes an identifier for a 
 mutate("pg-row-ids-not-granted", "the gateway may not write the identifier it chose", PG_ROW_IDS,
        "GRANT INSERT (id) ON switchboard_audit.call_rows TO switchboard_gateway;\n", "")
 mutate("pg-finish-uses-begin-pool", "finish waits on the begin pool", PG_STORE,
-       "            pool: self.finish.clone(),\n            cancel: Arc::clone(&self.cancel),\n            row: row.as_str().to_owned(),\n            finish,\n",
-       "            pool: self.begin.clone(),\n            cancel: Arc::clone(&self.cancel),\n            row: row.as_str().to_owned(),\n            finish,\n")
+       "            pool: self.finish.clone(),\n            cancel: Arc::clone(&self.cancel),\n"
+       "            counters: Arc::clone(&self.counters),\n            disagreed: Arc::clone(&self.disagreed),\n"
+       "            row: row.as_str().to_owned(),\n            finish,\n",
+       "            pool: self.begin.clone(),\n            cancel: Arc::clone(&self.cancel),\n"
+       "            counters: Arc::clone(&self.counters),\n            disagreed: Arc::clone(&self.disagreed),\n"
+       "            row: row.as_str().to_owned(),\n            finish,\n")
 mutate("pg-finish-overwrites", "finish does not skip a completed row", PG_COLUMNS,
        "latency_ms = $5\n        WHERE id = ($1::text)::uuid AND outcome IS NULL",
        "latency_ms = $5\n        WHERE id = ($1::text)::uuid")
@@ -4800,12 +4860,14 @@ mutate("pg-check-cascade-references-call-rows-refused", "a cascading foreign key
 # third trigger, and the count of receipts in unknown. tests/receipts.rs, the contract suite's
 # item 6 on Postgres (tests/contract.rs) and tests/check.rs catch these.
 PG_RECEIPTS = PG + "sql/migrations/0008_receipts.sql"
-# Migration 0009 replaces receipt_moves, so the trigger's moves are mutated in its copy.
+# Migration 0009 replaced receipt_moves, and 0012 replaces it again, so the trigger's moves are
+# mutated in 0012's copy, which is in force; 0009's lookup_appends is still 0009's.
 PG_RECONCILIATION = PG + "sql/migrations/0009_reconciliation.sql"
-mutate("pg-receipt-trigger-back-to-pending", "the receipt trigger lets reconciliation or a person move an unknown receipt back to pending", PG_RECONCILIATION,
+PG_HELD = PG + "sql/migrations/0012_held_and_counted_claims.sql"
+mutate("pg-receipt-trigger-back-to-pending", "the receipt trigger lets reconciliation or a person move an unknown receipt back to pending", PG_HELD,
        "        WHEN OLD.state = 'unknown'\n            THEN NEW.state IN ('completed', 'not_performed')\n",
        "        WHEN OLD.state = 'unknown'\n            THEN NEW.state IN ('completed', 'not_performed', 'pending')\n")
-mutate("pg-receipt-trigger-deadline-ignored", "the receipt trigger lets the call settle its receipt past the row's deadline", PG_RECONCILIATION,
+mutate("pg-receipt-trigger-deadline-ignored", "the receipt trigger lets the call settle its receipt past the row's deadline", PG_HELD,
        "            THEN NOT past AND NEW.state <> 'pending'\n",
        "            THEN NEW.state <> 'pending'\n")
 mutate("pg-receipt-delete-granted", "the gateway's role may delete a receipt", PG_RECEIPTS,
@@ -4829,9 +4891,10 @@ mutate("pg-reservation-outside-begin-transaction", "the row is committed before 
        "            let statement = transaction.prepare_cached(ReceiptRow::RESERVE).await?;\n")
 mutate("pg-settle-only-if-read-first", "a completion settles a receipt only if its first read found one, so a lost begin's receipt that commits after that read stays pending", PG_STORE,
        "    if updated == 1 {\n        let statement = transaction.prepare_cached(ReceiptRow::SETTLE).await?;\n"
-       "        transaction\n            .execute(&statement, &[&row, &finish.settles, &finish.reference])\n            .await?;\n",
+       "        let settled = transaction\n            .execute(&statement, &[&row, &finish.settles, &finish.reference])\n            .await?;\n",
        "    if updated == 1 {\n        let statement = transaction.prepare_cached(ReceiptRow::SETTLE).await?;\n"
-       "        if reserved {\n            transaction\n                .execute(&statement, &[&row, &finish.settles, &finish.reference])\n                .await?;\n        }\n")
+       "        let settled = if reserved {\n            transaction\n                .execute(&statement, &[&row, &finish.settles, &finish.reference])\n                .await?\n"
+       "        } else {\n            1\n        };\n")
 mutate("pg-finish-settles-past-deadline", "finish moves a receipt whatever its row's deadline", PG_COLUMNS,
        "        WHERE r.row_id = ($1::text)::uuid AND r.state = 'pending'\n"
        "            AND NOT EXISTS (SELECT FROM switchboard_audit.call_rows c\n"
@@ -4848,11 +4911,31 @@ mutate("pg-check-receipt-trigger-skipped", "the boot check does not look for the
 # catch these.
 mutate("pg-lookup-record-updated", "a lookup record may be changed, by any role that may write it", PG_RECONCILIATION,
        "    IF TG_OP <> 'INSERT' THEN\n", "    IF TG_OP = 'DELETE' THEN\n")
-mutate("pg-settle-without-a-lookup", "reconciliation may settle a receipt with no lookup recorded that establishes the state", PG_RECONCILIATION,
+mutate("pg-settle-without-a-lookup", "reconciliation may settle a receipt with no lookup recorded that establishes the state", PG_HELD,
        "        IF NOT EXISTS (\n", "        IF false AND NOT EXISTS (\n")
 mutate("pg-claim-ignores-lease", "a claim is granted whatever lease another holder has", PG + "src/reconcile.rs",
        "         AND (r.lease_until IS NULL OR r.lease_until <= clock_timestamp())\n     RETURNING \",",
        "     RETURNING \",")
+# A call holds its receipt's lease, each claim is counted as an attempt, and a late finish that
+# disagrees with reconciliation is counted (migration 0012; #206, #217). The contract suite's
+# reconciliation cases on Postgres and tests/reconcile.rs catch these.
+mutate("pg-hold-ignores-other-holder", "a call holds its receipt whatever lease another holder has", PG + "src/reconcile.rs",
+       "        AND (r.lease_until IS NULL OR r.lease_until <= clock_timestamp() OR r.lease_holder = $2)\";",
+       "        AND true\";")
+mutate("pg-claim-not-counted", "a claim is not counted on its receipt, so a lookup whose save fails uses up no attempt", PG + "src/reconcile.rs",
+       "             lease_until = clock_timestamp() + $3::bigint * interval '1 microsecond',\n             claims = r.claims + 1\n",
+       "             lease_until = clock_timestamp() + $3::bigint * interval '1 microsecond'\n")
+mutate("pg-trigger-lease-on-settled", "the receipt trigger writes a lease on a receipt already settled", PG_HELD,
+       "    IF leased AND (OLD.state NOT IN ('pending', 'unknown')\n", "    IF leased AND (false\n")
+mutate("pg-trigger-claims-outside-unknown", "the receipt trigger counts a claim, or writes a hand-off, on a receipt not in unknown", PG_HELD,
+       "    IF (handed OR counted) AND (NOT unknown OR OLD.handed_to_person_at IS NOT NULL) THEN\n",
+       "    IF (handed OR counted) AND (OLD.handed_to_person_at IS NOT NULL) THEN\n")
+mutate("pg-trigger-claims-jump", "the receipt trigger lets the count of claims jump or fall", PG_HELD,
+       "    IF counted AND NEW.claims IS DISTINCT FROM OLD.claims + 1 THEN\n", "    IF false THEN\n")
+mutate("pg-late-finish-disagreement-not-counted", "a late finish that disagrees with reconciliation is not counted", PG_STORE,
+       "                self.counters\n                    .late_finish_disagreements\n                    .fetch_add(1, Ordering::SeqCst);\n", "")
+mutate("pg-late-finish-agreement-counted", "a late finish that agrees with reconciliation is counted as a disagreement", PG_STORE,
+       "                if state != finish.settles {\n", "                if !state.is_empty() {\n")
 mutate("pg-check-lookup-trigger-skipped", "the boot check does not look for the lookup trigger", PG_CHECK,
        "    Trigger {\n        table: LOOKUPS,\n        name: \"lookup_appends\",\n"
        "        purpose: \"appends a lookup to a receipt in unknown, and never changes or removes one\",\n"
@@ -5777,9 +5860,8 @@ mutate("gw-start-postgres-ignored", "audit set to Postgres connects to nothing",
 # given, each from 1 to 64. tests/deployment.rs watches the defaults and the bounds; the sizes
 # reaching the store, tests/postgres.rs, which needs SWITCHBOARD_TEST_DATABASE_URL.
 mutate("gw-start-audit-pools-ignored", "the store is built with the default pools, whatever the deployment file sets", START,
-       "        PgAuditStore::connect(config, tokio_postgres::NoTls, pools)?.on_given_up(log_given_up);\n",
-       "        PgAuditStore::connect(config, tokio_postgres::NoTls, PoolSizes::default())?.on_given_up(log_given_up);\n"
-       "    let _ = pools;\n")
+       "    let store = PgAuditStore::connect(config, tokio_postgres::NoTls, pools)?\n",
+       "    let _ = pools;\n    let store = PgAuditStore::connect(config, tokio_postgres::NoTls, PoolSizes::default())?\n")
 mutate("gw-deploy-audit-pool-ceiling-unchecked", "an audit pool of more than 64 connections loads", DEPLOY,
        "        Some(size) if size == 0 || size > MAX_AUDIT_POOL_SIZE => {\n",
        "        Some(size) if size == 0 => {\n")
@@ -6231,7 +6313,7 @@ mutate("demo-driver-kind-identity-failures-whole-log", "the identity failure cou
 # caught only against Postgres (SWITCHBOARD_TEST_DATABASE_URL).
 
 mutate("gw-given-up-not-logged", "a finish the store gives up is not logged", GW + "start.rs",
-       "?.on_given_up(log_given_up);\n", "?;\n")
+       "        .on_given_up(log_given_up)\n", "")
 mutate("gw-given-up-wrong-event", "a finish given up is logged under another event", GW + "start.rs",
        'pub const GIVEN_UP_EVENT: &str = "audit_row_given_up";', 'pub const GIVEN_UP_EVENT: &str = "audit_row_given_up_";')
 mutate("gw-given-up-row-unnamed", "the given-up event does not name its row", GW + "start.rs",
@@ -6641,7 +6723,7 @@ mutate("registry-built-in-tool-unlisted-accepted", "a built-in tool loads on an 
 mutate("gateway-built-in-connector-unbounded", "a built-in connector runs without the in-process bound or quotas",
        "crates/gateway/src/boot.rs",
        "            connector: Arc::new(Bounded::new(\n                name.clone(),\n                connector,\n"
-       "                limits,\n                quotas,\n                in_process.clone(),\n            )),",
+       "                limits,\n                quotas,\n                in_process.clone(),\n                late.clone(),\n            )),",
        "            connector,")
 mutate("gateway-built-in-definition-unchecked", "a built-in approval of another definition than its connector's is served",
        "crates/gateway/src/boot.rs",

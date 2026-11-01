@@ -62,8 +62,8 @@ use std::time::{Duration, Instant};
 use connector_proxy::DEFAULT_DEADLINE;
 use gateway_core::{
     AuditStore, Classification, Connector, ConnectorName, DeploymentName, EntryKind, InstanceName,
-    Issuer, Lookup, Narrowing, PolicySnapshot, ProfileName, ReceiptQueue, SnapshotError, TeamId,
-    ToolName,
+    Issuer, LeaseHolder, Lookup, Narrowing, PolicySnapshot, ProfileName, ReceiptQueue,
+    SnapshotError, TeamId, ToolName,
 };
 use gateway_identity::{Clock, ConfigError, Identity, IdentityConfig};
 use gateway_otto::{HttpResolver, KeyConfigError};
@@ -71,7 +71,9 @@ use gateway_registry::{Registry, RulePrincipal};
 use thiserror::Error;
 
 use crate::audit::DisabledAuditStore;
-use crate::bound::{Bounded, DEFAULT_IN_PROCESS_DEADLINE, InProcessLimits, InProcessSignals};
+use crate::bound::{
+    Bounded, DEFAULT_IN_PROCESS_DEADLINE, InProcessLimits, InProcessSignals, LateCalls,
+};
 use crate::catalog::{CatalogError, ToolCatalog};
 use crate::config::{AuditSection, Config, HttpSection, IdentitySection, IssuerKindEntry};
 use crate::currency::profile_requiring_currency;
@@ -538,6 +540,7 @@ pub struct Gates {
     policy: Arc<LivePolicy>,
     connectors: BTreeMap<ConnectorName, Registered>,
     in_process: Arc<InProcessSignals>,
+    late: Arc<LateCalls>,
     lookups: BTreeMap<ConnectorName, Arc<dyn Lookup>>,
     resolver: Option<Arc<HttpResolver>>,
     freshness: Freshness,
@@ -632,6 +635,12 @@ impl Gates {
         self.in_process.clone()
     }
 
+    /// The side effects of connectors in the gateway's own process answered `unknown` at their
+    /// deadline that still run, which a gateway shutting down waits for ([`crate::bound`]).
+    pub fn late_calls(&self) -> Arc<LateCalls> {
+        self.late.clone()
+    }
+
     /// The client for Otto's resolver interface, which a call under a profile that requires
     /// currency asks (decision 0012), or `None` when none is configured.
     pub fn resolver(&self) -> Option<&Arc<HttpResolver>> {
@@ -690,18 +699,29 @@ impl Gates {
     /// This instance's reconciliation of `unknown` receipts over `queue`, the store's queue,
     /// with the lookups the wiring registered and `settings`. It follows the policy these gates
     /// serve to find each receipt's connector. See [`crate::reconcile`].
+    ///
+    /// From here on, a side effect of a connector in the gateway's own process that runs past
+    /// its deadline holds its receipt in `queue` for `settings.lease` at a time while it runs,
+    /// under a holder of its own, so no instance looks the receipt up meanwhile
+    /// ([`crate::bound`]).
     pub fn reconciler(
         &self,
         queue: Arc<dyn ReceiptQueue>,
         settings: ReconcileSettings,
     ) -> Reconciler {
-        Reconciler::new(
-            queue,
+        let reconciler = Reconciler::new(
+            queue.clone(),
             self.policy.clone(),
             self.lookups.clone(),
             &self.instance,
             settings,
-        )
+        );
+        self.late.hold_in(
+            queue,
+            LeaseHolder::new(format!("{} late-call", reconciler.holder())),
+            settings.lease,
+        );
+        reconciler
     }
 
     /// The policy served now, which the argument check reads to see whether a tool was
@@ -776,6 +796,7 @@ fn check_with(config: Config, wiring: Wiring, development: bool) -> Result<Gates
     catalog.check(&approved)?;
 
     let in_process = Arc::new(InProcessSignals::default());
+    let late = Arc::new(LateCalls::default());
     let mut connectors = BTreeMap::new();
     for (name, mut registered) in registrations {
         let limits = in_process_bound(&name, &in_process_limits, &call_deadlines)?;
@@ -787,6 +808,7 @@ fn check_with(config: Config, wiring: Wiring, development: bool) -> Result<Gates
             limits,
             quotas,
             in_process.clone(),
+            late.clone(),
         ));
         if connectors.insert(name.clone(), registered).is_some() {
             return Err(BootError::DuplicateConnector(name));
@@ -837,6 +859,7 @@ fn check_with(config: Config, wiring: Wiring, development: bool) -> Result<Gates
         policy: Arc::new(LivePolicy::new(policy)),
         connectors,
         in_process,
+        late,
         lookups,
         resolver,
         // No file is read again, so the policy never goes stale.
@@ -929,6 +952,7 @@ pub(crate) fn check_registry_with(
         }
     }
     let in_process = Arc::new(InProcessSignals::default());
+    let late = Arc::new(LateCalls::default());
     let mut built_in_definitions = BTreeMap::new();
     for BuiltIn {
         name,
@@ -948,6 +972,7 @@ pub(crate) fn check_registry_with(
                 limits,
                 quotas,
                 in_process.clone(),
+                late.clone(),
             )),
             reads: Reads::Registry,
             results: Results::Values,
@@ -990,6 +1015,7 @@ pub(crate) fn check_registry_with(
         policy: live,
         connectors,
         in_process,
+        late,
         lookups,
         resolver,
         freshness,

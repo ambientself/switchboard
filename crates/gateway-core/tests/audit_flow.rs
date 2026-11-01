@@ -1560,6 +1560,7 @@ fn an_allowed_side_effect_reserves_a_pending_receipt_with_its_row() {
             target: None,
             lookups: Vec::new(),
             handed_to_person: None,
+            claims: 0,
         }]
     );
 }

@@ -68,6 +68,9 @@
 //!   - `switchboard_audit_finishes_given_up_total{cause}`, `cause` one of `deadline`,
 //!     `completed_differently`, `no_such_row`, `task_lost` and `other`;
 //!   - `switchboard_audit_begins_never_committed_total`;
+//!   - `switchboard_audit_late_finish_disagreements_total`, the finishes written after their
+//!     row's deadline whose outcome disagreed with the state reconciliation had already settled
+//!     the row's receipt in, which is left as it was (decision 0009, "What a receipt is");
 //!   - `switchboard_audit_finishes_in_flight`;
 //!   - `switchboard_audit_open_rows`, `switchboard_audit_oldest_open_row_deadline_seconds`
 //!     and `switchboard_audit_open_rows_poll_failures_total`, from the open-row poll below;
@@ -907,6 +910,13 @@ fn audit_signals(text: &mut Text, signals: &AuditSignals) {
         stats.begins_never_committed,
     );
     text.single(
+        "switchboard_audit_late_finish_disagreements_total",
+        "counter",
+        "Finishes written after their row's deadline that disagreed with the state \
+         reconciliation had settled the receipt in.",
+        stats.late_finish_disagreements,
+    );
+    text.single(
         "switchboard_audit_finishes_in_flight",
         "gauge",
         "Audit row completions still being tried.",
@@ -1250,6 +1260,7 @@ mod tests {
             },
             answers_released_before_finish: 5,
             begins_never_committed: 6,
+            late_finish_disagreements: 22,
             finishes_in_flight: 7,
             begin_pool: PoolStats {
                 in_use: 8,
@@ -1291,6 +1302,7 @@ mod tests {
             "switchboard_audit_begin_failures_total{cause=\"value_refused\"} 4",
             "switchboard_audit_answers_released_before_finish_total 5",
             "switchboard_audit_begins_never_committed_total 6",
+            "switchboard_audit_late_finish_disagreements_total 22",
             "switchboard_audit_finishes_in_flight 7",
             "switchboard_audit_pool_connections_in_use{pool=\"begin\"} 8",
             "switchboard_audit_pool_connections_open{pool=\"begin\"} 9",
