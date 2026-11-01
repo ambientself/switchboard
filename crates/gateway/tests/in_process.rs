@@ -306,11 +306,17 @@ async fn shutting_down_waits_for_a_late_side_effect_within_its_grace_and_never_c
     // The grace runs out first: the side effect still runs, and is not cancelled.
     assert_eq!(world.late.wait(DEADLINE).await, 1);
     assert_eq!(world.connector.finished(), 0);
+    let waiting = std::time::Instant::now();
     assert_eq!(world.late.wait(Duration::from_secs(10)).await, 0);
     assert_eq!(
         world.connector.finished(),
         1,
         "the wait returned before the side effect ended"
+    );
+    assert!(
+        waiting.elapsed() < Duration::from_secs(5),
+        "the wait went on after the side effect ended: {:?}",
+        waiting.elapsed()
     );
     assert_eq!(world.late.running(), 0);
     assert_eq!(world.held_receipt(0), ReceiptState::Unknown);
