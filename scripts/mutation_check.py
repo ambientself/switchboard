@@ -5116,9 +5116,12 @@ mutate("pg-check-cascade-references-call-rows-refused", "a cascading foreign key
 # #203: the routes around the grants that the check follows to call_rows, followed to receipts
 # too: a rule or a foreign key's action on receipts, a view or rule elsewhere that reaches it, a
 # definer function or a cascading table whose owner can change it, and one whose owner owns
-# receipt_moves. tests/check.rs's receipt route tests catch these.
+# receipt_moves; and a rule on receipt_lookups, which the gateway appends to. tests/check.rs's
+# receipt route tests catch these.
 mutate("pg-check-receipt-rule-ignored", "a rule on the receipt table passes the check", PG_CHECK,
        "    rules(client, table, RECEIPTS_TABLE, problems).await?;\n", "")
+mutate("pg-check-lookup-rule-ignored", "a rule on the lookup table passes the check", PG_CHECK,
+       "    rules(client, table, LOOKUPS_TABLE, problems).await?;\n", "")
 mutate("pg-check-receipt-referential-action-ignored", "a foreign key on the receipt table with ON DELETE CASCADE passes the check", PG_CHECK,
        "    referential_actions(client, table, RECEIPTS_TABLE, problems).await?;\n", "")
 mutate("pg-check-reaching-receipts-ignored", "a grant on a view or rule outside the schema that reaches receipts passes the check", PG_CHECK,

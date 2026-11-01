@@ -3821,3 +3821,46 @@ async fn a_definer_or_a_foreign_keys_action_whose_owner_can_change_receipts_is_r
         "receipt_moves is still on the table"
     );
 }
+
+/// A rule on `receipt_lookups` runs its statements as the table's owner whenever the gateway
+/// appends a lookup: here, in place of the lookup, it deletes the receipt. The table is in the
+/// schema, where the walk over views and rules elsewhere does not look, so the rule is refused
+/// on the table itself, as one on `receipts` is.
+#[tokio::test]
+async fn a_rule_on_the_lookup_table_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "SET ROLE {OWNER_ROLE};
+             CREATE RULE purge AS ON INSERT TO switchboard_audit.receipt_lookups
+                 DO INSTEAD DELETE FROM switchboard_audit.receipts WHERE row_id = NEW.row_id;"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems_of(&db).await,
+        vec![Problem::Rule {
+            table: "switchboard_audit.receipt_lookups".into(),
+            rule: "purge".into()
+        }]
+    );
+
+    // What the check refuses is real: the gateway appends a lookup to a receipt in unknown,
+    // and the receipt is gone.
+    let admin = db.admin().await;
+    let receipt = fresh_id(&admin).await;
+    receipt_in(&admin, &receipt, &receipt, "unknown", true).await;
+    db.connect_as(GATEWAY_ROLE)
+        .await
+        .batch_execute(&format!(
+            "INSERT INTO switchboard_audit.receipt_lookups
+                 (row_id, attempt, result, authoritative, reference)
+             VALUES ('{receipt}', 1, 'failed', false, NULL)"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(receipts(&db).await, 0);
+}

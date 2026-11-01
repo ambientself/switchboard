@@ -1407,8 +1407,10 @@ key on it whose action writes it, a grant on a view or rule that reaches it or o
 outside the schema, a definer function whose owner can read or change it or owns
 `receipt_moves`, and a cascading foreign key on a table whose owner can, would each let the
 gateway's role delete or rewrite a receipt, which its column grants and `receipt_moves`
-withhold; each is refused as it is for `call_rows`. A foreign key that references `receipts`
-is judged like any other: unlike one that references `call_rows`, it is not passed.
+withhold; each is refused as it is for `call_rows`. So is a rule on
+`switchboard_audit.receipt_lookups`, which the gateway appends to: its statements would run as
+the table's owner. A foreign key that references `receipts` is judged like any other: unlike
+one that references `call_rows`, it is not passed.
 
 This has an operational cost. In a database shared with other applications, a cascading
 foreign key on a table owned by a superuser, or by any role that can reach the audit tables,
@@ -2004,7 +2006,8 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   whose action writes it, a grant on a view or rule elsewhere that reaches it, a definer
   function whose owner can change it or owns `receipt_moves`, and a cascading foreign key on a
   table whose owner can change it are each refused, as each would let the gateway's role
-  delete or rewrite a receipt. They are not followed to `receipt_lookups` yet.
+  delete or rewrite a receipt, and so is a rule on `receipt_lookups`. The views, definer
+  functions and foreign keys' actions are not followed to `receipt_lookups` yet.
 - Receipts in Postgres: built (#55, part 2). Migration 0008 adds `switchboard_audit.receipts`,
   one row per receipt, keyed by the audit row that reserved it (a foreign key to `call_rows`),
   with the key's scope (the principal's issuer and subject, and the delegation's scope, which

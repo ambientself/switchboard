@@ -705,10 +705,11 @@ pub enum Problem {
         /// What it is held on.
         object: String,
     },
-    /// An audit table, `switchboard_audit.call_rows` or `switchboard_audit.receipts`, has a
-    /// rule. A rule's statements run, as the table's owner, in place of or beside a write the
-    /// gateway makes, so one could delete a row whenever the gateway completes one, or a receipt
-    /// whenever the gateway settles one. The migrations make none.
+    /// An audit table, `switchboard_audit.call_rows`, `switchboard_audit.receipts` or
+    /// `switchboard_audit.receipt_lookups`, has a rule. A rule's statements run, as the table's
+    /// owner, in place of or beside a write the gateway makes, so one could delete a row
+    /// whenever the gateway completes one, or a receipt whenever the gateway settles one or
+    /// appends a lookup to it. The migrations make none.
     Rule {
         /// The table, with its schema.
         table: String,
@@ -1115,6 +1116,9 @@ const CALL_ROWS: &str = "switchboard_audit.call_rows";
 /// The receipt table, with its schema, as reports name it.
 const RECEIPTS_TABLE: &str = "switchboard_audit.receipts";
 
+/// The lookup table, with its schema, as reports name it.
+const LOOKUPS_TABLE: &str = "switchboard_audit.receipt_lookups";
+
 /// What makes a role able, as reports say it ([`ABLE`]).
 const ABLE_ON: &str = "can read or change switchboard_audit.call_rows or \
                        switchboard_audit.receipts, or turn off their triggers";
@@ -1168,7 +1172,8 @@ impl PgAuditStore {
     /// rule elsewhere that reaches it, a definer function whose owner can change it or turn off
     /// `receipt_moves`, and a foreign key's action on another table whose owner can. Each would
     /// let the gateway's role delete or rewrite a receipt, which its grants on `receipts` and
-    /// the trigger withhold, and each is refused as it is for `call_rows`.
+    /// the trigger withhold, and each is refused as it is for `call_rows`. So is a rule on
+    /// `receipt_lookups`, which the gateway appends to.
     ///
     /// # What it requires
     ///
@@ -1223,8 +1228,8 @@ impl PgAuditStore {
     ///   aside, and with no options, such as `security_invoker`. The role may select from it,
     ///   and may do nothing else with it.
     /// - `call_rows` is a table, not a view or foreign table of that name, and has no rule, and
-    ///   neither has `receipts`. A rule's statements run as the table's owner whenever the
-    ///   gateway writes.
+    ///   neither has `receipts` or `receipt_lookups`. A rule's statements run as the table's
+    ///   owner whenever the gateway writes.
     /// - No foreign key on `call_rows` or on `receipts` has a `CASCADE`, `SET NULL` or
     ///   `SET DEFAULT` action on delete or on update. Such an action writes the table, as its
     ///   owner, whenever a row of the table it references is deleted or updated, by any role
@@ -1290,8 +1295,9 @@ impl PgAuditStore {
     ///   mapping or a function that holds another role's password, can reach `call_rows` as
     ///   that role. Only an administrator stores that password. A foreign table in
     ///   `switchboard_audit` is refused; one elsewhere is not followed to where it connects.
-    /// - The routes it follows to `call_rows` and `receipts` it does not yet follow to
-    ///   `receipt_lookups`. Its grants and its trigger `lookup_appends` are checked.
+    /// - The views, definer functions and foreign keys' actions it follows to `call_rows` and
+    ///   `receipts` it does not yet follow to `receipt_lookups`. Its grants, its trigger
+    ///   `lookup_appends` and the absence of a rule on it are checked.
     ///
     /// It asks whether a role is able once per role, where it used to ask that once for every
     /// pair of a definer function and a role, and its walk over definer functions reads small
@@ -1919,6 +1925,11 @@ async fn receipts(
 /// lookup ([`LOOKUP_INSERTED`]) and read them ([`LOOKUP_SELECTED`]), and nothing more: it may
 /// update no column. Anything on the table as a whole is refused by `other_privileges`; its
 /// trigger, which refuses every change and removal, is checked with the others.
+///
+/// It has no rule. The gateway's role appends lookups, and a rule's statements run as the
+/// table's owner whenever it does, so a rule here could delete or rewrite a receipt, or an
+/// audit row, as one on either of those tables could. Being in the schema, the table is passed
+/// over by [`reaching_privileges`], which looks only elsewhere.
 async fn lookups(
     client: &ClientWrapper,
     problems: &mut Vec<Problem>,
@@ -1929,10 +1940,11 @@ async fn lookups(
     };
     unlogged(client, table, problems).await?;
     columns(client, table, LOOKUPS, LOOKUP_COLUMNS, problems).await?;
+    rules(client, table, LOOKUPS_TABLE, problems).await?;
     column_privileges(
         client,
         table,
-        &format!("switchboard_audit.{LOOKUPS}"),
+        LOOKUPS_TABLE,
         [
             ("INSERT", LOOKUP_INSERTED),
             ("UPDATE", &[]),
