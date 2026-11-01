@@ -550,7 +550,8 @@ async fn the_receipt_team_migration_keeps_the_receipts_already_reserved() {
         .await
         .unwrap();
     let id = fresh_id(&admin).await;
-    receipt_in(&admin, &id, "key-before-0014", "unknown", false).await;
+    // Its row's deadline has passed, so the receipt is due.
+    receipt_in(&admin, &id, "key-before-0014", "unknown", true).await;
     let read =
         format!("SELECT to_jsonb(r) FROM switchboard_audit.receipts r WHERE row_id = '{id}'");
     let before = values(&admin, &read).await;
