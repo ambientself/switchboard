@@ -28,7 +28,7 @@
 //! back. A call a cap sheds takes no token.
 //!
 //! Each bulkhead counts, in [`ServerSignals`]: the calls its server's connector ran, by
-//! outcome; how long each took; those that were late or too large, by their error kind; the
+//! outcome, `unknown` apart from `error`; how long each took; those that were late or too large, by their error kind; the
 //! calls each cap refused; and the calls each quota refused. A call dropped before its
 //! connector returned is counted in none of the first three. [`crate::metrics`] exports them,
 //! labelled by the server's name in the registry and nothing a caller chooses.
@@ -226,6 +226,7 @@ pub struct ServerSignals {
     ok: AtomicU64,
     error: AtomicU64,
     refused: AtomicU64,
+    unknown: AtomicU64,
     late_or_oversized: AtomicU64,
     shed_server: AtomicU64,
     shed_team: AtomicU64,
@@ -249,8 +250,8 @@ impl ServerSignals {
             }
             ToolOutcome::Refused(_) => &self.refused,
             // Only a side effect reports it, and the registry's rule 2 approves no proxied tool
-            // that is not a read yet.
-            ToolOutcome::Unknown => &self.error,
+            // that is not a read yet. Counted apart from the errors: the server may have acted.
+            ToolOutcome::Unknown => &self.unknown,
         };
         counter.fetch_add(1, Ordering::Relaxed);
         let nanos = latency.as_nanos();
@@ -271,6 +272,7 @@ impl ServerSignals {
             ok: read(&self.ok),
             error: read(&self.error),
             refused: read(&self.refused),
+            unknown: read(&self.unknown),
             late_or_oversized: read(&self.late_or_oversized),
             shed_server: read(&self.shed_server),
             shed_team: read(&self.shed_team),
@@ -290,13 +292,16 @@ impl ServerSignals {
 pub struct ServerCounts {
     /// Calls the server's connector completed as `ok`.
     pub ok: u64,
-    /// Calls it completed as `error`, late or too large ones included, and as `unknown`.
+    /// Calls it completed as `error`, late or too large ones included.
     pub error: u64,
     /// Calls it refused, such as one for a tool it does not serve.
     pub refused: u64,
+    /// Calls it completed as `unknown`: side effects whose server gave no definite answer, so
+    /// they may have taken effect. Not counted under `error`.
+    pub unknown: u64,
     /// Calls that were an error of the kind `oversized_or_late_read`: a `read` tool's answer
     /// too large, or none by the deadline. Another tool's is reported as the outcome
-    /// `unknown`, counted under `error` and not here.
+    /// `unknown`, counted under `unknown` and not here.
     pub late_or_oversized: u64,
     /// Calls the server's cap refused.
     pub shed_server: u64,
@@ -327,5 +332,42 @@ impl ProxiedSignals {
             .iter()
             .map(|(server, signals)| (server.clone(), signals.counts()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gateway_core::{ErrorKind, ToolOutcome};
+
+    use super::*;
+
+    /// Each outcome is counted under its own label, `unknown` apart from `error`, and only a
+    /// read's late or oversized answer is counted as late or oversized.
+    #[test]
+    fn each_outcome_is_counted_under_its_own_label() {
+        let signals = ServerSignals::default();
+        let latency = Duration::from_millis(3);
+        for outcome in [
+            ToolOutcome::Ok(serde_json::json!({})),
+            ToolOutcome::error(ErrorKind::Other, "failed"),
+            ToolOutcome::error(ErrorKind::OversizedOrLateRead, "late"),
+            ToolOutcome::Refused("refused".to_owned()),
+            ToolOutcome::Unknown,
+            ToolOutcome::Unknown,
+        ] {
+            signals.record(&outcome, latency);
+        }
+        let counts = signals.counts();
+        assert_eq!(
+            (
+                counts.ok,
+                counts.error,
+                counts.refused,
+                counts.unknown,
+                counts.late_or_oversized
+            ),
+            (1, 2, 1, 2, 1)
+        );
+        assert_eq!(counts.latency.count, 6);
     }
 }

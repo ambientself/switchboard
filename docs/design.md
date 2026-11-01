@@ -2275,7 +2275,8 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   policy's age (#132), and each server's drift polls, withdrawals, probe results and
   reach-check results (#166, #167, #176) are exported, labelled only by registry names. The
   late or oversized count is of reads only: a side effect's late or oversized answer is the
-  outcome `unknown` (#55), counted with the errors (the limits entry below).
+  outcome `unknown` (#55), counted under its own outcome, `unknown`, not with the errors
+  (#204; the limits entry below).
 
 **#11, the argument check against the approved schema.** Built (#122): the loader accepts a
 subset of JSON Schema 2020-12 and refuses anything else at load, including a `$schema` naming
@@ -2343,11 +2344,11 @@ checked; a schema that needs them cannot be approved yet.
   and calls to other servers, are not held up. `tests/limits.rs` shows it.
 - The metrics of section 9 that these give: built. `switchboard_calls_shed_total{scope}`, with
   `scope` one of `instance`, `server` and `team`; and, labelled by the server's name in the
-  registry only, `switchboard_proxied_calls_total{server,outcome}`,
-  `switchboard_proxied_call_seconds{server}` and
+  registry only, `switchboard_proxied_calls_total{server,outcome}`, `outcome` one of `ok`,
+  `error`, `refused` and `unknown`, `switchboard_proxied_call_seconds{server}` and
   `switchboard_proxied_late_or_oversized_total{server}`, the last from the error kind
-  `oversized_or_late_read`, so it counts reads only; a side effect's is the outcome `unknown`,
-  counted with the errors (#55). Both demos show overload and a hanging server (the
+  `oversized_or_late_read`, so it counts reads only; a side effect's is the outcome `unknown`
+  (#55), counted under `outcome="unknown"`, not with the errors (#204). Both demos show overload and a hanging server (the
   demonstrations entry under #11 above). The configurable audit pools and the row's size bound
   are in the #11 list above.
 

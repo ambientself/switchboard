@@ -614,6 +614,7 @@ async fn a_hanging_server_holds_one_team_to_its_cap_and_holds_up_no_one_else() {
         "switchboard_proxied_calls_total{server=\"slow\",outcome=\"ok\"} 0",
         "switchboard_proxied_calls_total{server=\"slow\",outcome=\"error\"} 9",
         "switchboard_proxied_calls_total{server=\"slow\",outcome=\"refused\"} 0",
+        "switchboard_proxied_calls_total{server=\"slow\",outcome=\"unknown\"} 0",
         "switchboard_proxied_late_or_oversized_total{server=\"slow\"} 9",
         "switchboard_proxied_late_or_oversized_total{server=\"other\"} 0",
         "switchboard_proxied_call_seconds_bucket{server=\"slow\",le=\"2\"} 0",
