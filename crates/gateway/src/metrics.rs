@@ -92,10 +92,11 @@
 //! - With the turn-grant gate, from its [`GrantSignals`] (decision 0012, design section 11):
 //!   `switchboard_grant_failures_total{kind}`, the grants refused, `kind` one of the eleven
 //!   checks (`version`, `unknown_key`, `retired_key`, `encoding`, `signature`, `malformed`,
-//!   `wrong_audience`, `not_yet_valid`, `expired`, `lifetime` and `wrong_pod`), each written
-//!   from zero; and `switchboard_grants_accepted_total{key_id}`, the grants verified under each
-//!   configured key, written only when a key is configured. A request with the grant header
-//!   more than once counts as `malformed`.
+//!   `wrong_audience`, `not_yet_valid`, `expired`, `lifetime_over_ceiling` and `wrong_pod`, the
+//!   names the audit row records), each written from zero; and
+//!   `switchboard_grants_accepted_total{key_id}`, the grants verified under each configured
+//!   key, written only when a key is configured. A request with the grant header more than once
+//!   counts as `malformed`.
 //!
 //! - With Otto's resolver configured, from its client's counts (decision 0012, "Currency"):
 //!   `switchboard_resolver_answers_total{answer}`, each question by its answer, `answer` one of
@@ -777,8 +778,8 @@ fn grant_signals(text: &mut Text, counts: &GrantCounts) {
         "switchboard_grant_failures_total",
         "counter",
         "Turn grants refused, by the check they failed (decision 0012). Each wrong_audience or \
-         wrong_pod is to be investigated; expired, not_yet_valid and lifetime are to alert on a \
-         rate, and are not logged one by one.",
+         wrong_pod is to be investigated; expired, not_yet_valid and lifetime_over_ceiling are to \
+         alert on a rate, and are not logged one by one.",
     );
     for (kind, count) in &counts.failures {
         text.sample(

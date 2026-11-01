@@ -68,6 +68,14 @@ fn the_document_states_the_constants() {
     assert!(
         DOC.contains("SHA-256( \"otto/gateway-turn-grant/kid/v3\" || 0x00 || public key )[0..16]")
     );
+    // The verification order's failure kinds are the names this crate gives them, which the
+    // gateway logs and counts and the audit row records.
+    for kind in gateway_otto::FailureKind::ALL {
+        assert!(
+            DOC.contains(&format!(" | `{kind}` |\n")),
+            "the verification order does not name `{kind}`"
+        );
+    }
 }
 
 #[test]

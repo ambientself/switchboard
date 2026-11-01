@@ -204,6 +204,8 @@ async fn grant_failures_are_logged_by_kind_with_nothing_from_their_claims() {
         "switchboard_grant_failures_total{kind=\"signature\"} 1",
         "switchboard_grant_failures_total{kind=\"malformed\"} 1",
         "switchboard_grant_failures_total{kind=\"version\"} 0",
+        // The lifetime failure's label is the name the audit row records.
+        "switchboard_grant_failures_total{kind=\"lifetime_over_ceiling\"} 0",
         &format!(
             "switchboard_grants_accepted_total{{key_id=\"{}\"}} 1",
             minter.key_id()

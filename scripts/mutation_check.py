@@ -1654,6 +1654,10 @@ mutate_all("otto-grant-negative-zero-read-as-zero", "iat is read through a float
             "fn through_float<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<i64>, D::Error> {\n"
             "    Ok(Some(f64::deserialize(deserializer)? as i64))\n}\n\n"
             "/// A member that is present is its value, never `null`."))
+# One name for the lifetime failure (#213): the counter's label is the row's. tests/binding.rs,
+# tests/format_doc.rs, the gateway's grants.rs and tests/grant_logs.rs catch this.
+mutate("otto-grant-lifetime-label-short", "the lifetime failure is labelled `lifetime`, not the row's `lifetime_over_ceiling`", OV,
+       'FailureKind::LifetimeOverCeiling => "lifetime_over_ceiling",', 'FailureKind::LifetimeOverCeiling => "lifetime",')
 mutate("otto-grant-required-pod-optional", "a grant without pod is accepted when the issuer requires it", OV,
        "        if require_pod && claims.pod.is_none() {", "        if false {")
 mutate("otto-grant-required-egress-optional", "a grant without egress is accepted when the issuer requires it", OV,

@@ -806,6 +806,8 @@ fn requires_delegation(snapshot: &PolicySnapshot, profile: &ProfileName) -> bool
 mod tests {
     use super::*;
 
+    /// Each kind maps to the core's failure of the same name, so the counter's label, the log
+    /// line and the row name a failure alike.
     #[test]
     fn every_failure_kind_maps_to_the_core_failure_of_its_name() {
         let mapped: BTreeSet<DelegationFailure> = FailureKind::ALL
@@ -814,12 +816,7 @@ mod tests {
             .collect();
         assert_eq!(mapped.len(), FailureKind::ALL.len(), "two kinds map to one");
         for kind in FailureKind::ALL {
-            let core = delegation_failure(kind);
-            let expected = match kind {
-                FailureKind::LifetimeOverCeiling => "lifetime_over_ceiling",
-                other => other.as_str(),
-            };
-            assert_eq!(core.as_str(), expected, "{kind:?}");
+            assert_eq!(delegation_failure(kind).as_str(), kind.as_str(), "{kind:?}");
         }
     }
 

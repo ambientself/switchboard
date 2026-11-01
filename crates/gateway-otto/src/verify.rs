@@ -65,7 +65,8 @@ impl FailureKind {
         FailureKind::WrongPod,
     ];
 
-    /// The kind's name, for a row, a log line or a counter's label.
+    /// The kind's name, for a log line or a counter's label: the name the audit row records
+    /// for the core's failure of the same kind.
     pub fn as_str(self) -> &'static str {
         match self {
             FailureKind::Version => "version",
@@ -76,7 +77,7 @@ impl FailureKind {
             FailureKind::Malformed => "malformed",
             FailureKind::Expired => "expired",
             FailureKind::NotYetValid => "not_yet_valid",
-            FailureKind::LifetimeOverCeiling => "lifetime",
+            FailureKind::LifetimeOverCeiling => "lifetime_over_ceiling",
             FailureKind::WrongAudience => "wrong_audience",
             FailureKind::WrongPod => "wrong_pod",
         }

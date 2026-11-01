@@ -140,7 +140,7 @@ failure kind, which Switchboard records, logs and counts, and never tells the ca
 | 9 | `aud` includes this deployment. | `wrong_audience` |
 | 10 | `iat` ≤ now + 30. | `not_yet_valid` |
 | 11 | `exp` > now − 30. | `expired` |
-| 12 | `exp − iat` ≤ 900. | `lifetime` |
+| 12 | `exp − iat` ≤ 900. | `lifetime_over_ceiling` |
 | 13 | Once the issuer requires `pod`: it equals the caller's proved pod UID. A caller whose token proves no pod fails. | `wrong_pod` |
 
 Now is the gateway's clock in whole seconds since 1970-01-01T00:00:00Z, rounded down. The 30
