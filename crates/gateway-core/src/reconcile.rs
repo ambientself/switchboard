@@ -20,7 +20,9 @@
 //! The same lease keeps a receipt from being looked up while its own call may still act: a side
 //! effect answered `unknown` at its deadline runs on in a task of its own, never cancelled once
 //! sent (decision 0009, "Where a call runs"), and that task [holds](ReceiptQueue::hold) its
-//! receipt's lease until it ends. A held receipt is not due, on any instance.
+//! receipt's lease until it ends. A held receipt is not due, on any instance, and nor is any
+//! receipt before its row's deadline, so a first hold that is not written at once is tried
+//! again before another instance can claim the receipt.
 
 use std::fmt;
 use std::time::{Duration, SystemTime};
@@ -263,11 +265,14 @@ pub enum Recorded {
 /// "Reconciliation"). Every instance works it, so there is no separate deployment. Times are
 /// the store's: database time for Postgres.
 ///
-/// A receipt is due when it reads as `unknown` (the state `unknown`, or `pending` past its
-/// row's deadline), has not been handed to a person, and its lease is free: never set, or
-/// ended. A receipt is held by the holder that claimed it, or that [holds](Self::hold) it for
-/// its call, until its lease ends. Ending a lease early is not offered: a lease runs out, which
-/// also spaces one receipt's attempts.
+/// A receipt is due when its row's deadline has passed, it reads as `unknown` (the state
+/// `unknown`, or `pending`), it has not been handed to a person, and its lease is free: never
+/// set, or ended. A receipt the call answered `unknown` within its row's deadline is not due
+/// before the deadline, on any instance: its call may be a side effect still running whose
+/// [hold](Self::hold) is not written yet, and the deadline, which includes the finish deadline,
+/// leaves that hold time to be written and tried again. A receipt is held by the holder that
+/// claimed it, or that [holds](Self::hold) it for its call, until its lease ends. Ending a
+/// lease early is not offered: a lease runs out, which also spaces one receipt's attempts.
 pub trait ReceiptQueue: Send + Sync {
     /// Up to `limit` receipts due, the longest reserved first, as they are now, with the
     /// lookups made so far. Reads only: nothing is claimed.

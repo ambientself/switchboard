@@ -645,10 +645,12 @@ impl State {
             .any(|(leased, by, until)| leased == row && by == holder && *until > now)
     }
 
-    /// Whether `receipt` is due at `now`: it reads as `unknown`, was not handed to a person,
-    /// and its lease is free.
+    /// Whether `receipt` is due at `now`: its row's deadline has passed, it reads as
+    /// `unknown`, was not handed to a person, and its lease is free. One answered `unknown`
+    /// within its row's deadline is not due until the deadline, as Postgres's `DUE` reads it.
     fn due(&self, receipt: &Receipt, now: SystemTime) -> bool {
-        self.reads_as_unknown(receipt, now)
+        self.past_deadline(&receipt.row, now)
+            && self.reads_as_unknown(receipt, now)
             && receipt.handed_to_person.is_none()
             && self.lease_free(&receipt.row, now)
     }
@@ -1349,14 +1351,14 @@ impl AuditStore for InMemoryAuditStore {
 }
 
 /// The queue of `unknown` receipts as the Postgres store keeps it (decision 0009,
-/// "Reconciliation"), by this store's clock: a receipt is due when it reads as `unknown`, was
-/// not handed to a person and its lease is free; a claim sets a lease only on a receipt still
-/// due, and counts itself in the receipt's claims; a hold sets a lease on a receipt `pending`
-/// or `unknown`, not handed to a person, whose lease is free or already the holder's, and
-/// counts no claim; a lookup is appended, never changed, and moves the receipt as the core's
-/// [`LookupAnswer::settles`] says, or hands it to a person on its last attempt; and nothing is
-/// written for a holder whose lease has ended. A claim can be held at a gate
-/// ([`hold_claims`](InMemoryAuditStore::hold_claims)) or told to fail
+/// "Reconciliation"), by this store's clock: a receipt is due when its row's deadline has
+/// passed, it reads as `unknown`, was not handed to a person and its lease is free; a claim
+/// sets a lease only on a receipt still due, and counts itself in the receipt's claims; a hold
+/// sets a lease on a receipt `pending` or `unknown`, not handed to a person, whose lease is
+/// free or already the holder's, and counts no claim; a lookup is appended, never changed, and
+/// moves the receipt as the core's [`LookupAnswer::settles`] says, or hands it to a person on
+/// its last attempt; and nothing is written for a holder whose lease has ended. A claim can be
+/// held at a gate ([`hold_claims`](InMemoryAuditStore::hold_claims)) or told to fail
 /// ([`fail_next_claim`](InMemoryAuditStore::fail_next_claim)), a hold told to fail
 /// ([`fail_next_hold`](InMemoryAuditStore::fail_next_hold),
 /// [`fail_all_holds`](InMemoryAuditStore::fail_all_holds)), and every record of a lookup told
