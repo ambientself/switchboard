@@ -421,6 +421,9 @@ struct State {
     leases: Vec<(AuditRowId, LeaseHolder, SystemTime)>,
     claim_gate: Option<Gate>,
     claims_failing: Failing,
+    records_failing: Failing,
+    /// Late finishes that disagreed with the state reconciliation had settled their receipt in.
+    late_finish_disagreements: u64,
 }
 
 impl State {
@@ -602,14 +605,19 @@ impl State {
             )
             .into());
         }
-        self.complete_row(id, completion, reached)?;
+        let written = self.complete_row(id, completion, reached)?;
         let past_deadline = self.past_deadline(id, now);
-        if let Some(receipt) = receipt.map(|at| &mut self.receipts[at])
-            && may_move(receipt.state, settled, &EstablishedBy::Call, past_deadline)
-        {
+        let Some(receipt) = receipt.map(|at| &mut self.receipts[at]) else {
+            return Ok(());
+        };
+        if may_move(receipt.state, settled, &EstablishedBy::Call, past_deadline) {
             receipt.state = settled;
             receipt.established_by = EstablishedBy::Call;
             receipt.reference = reference.cloned();
+        } else if written && disagrees(receipt, settled) {
+            // The row is completed and the receipt left as it is; the disagreement is counted,
+            // as Postgres's store counts it (decision 0009, "What a receipt is").
+            self.late_finish_disagreements += 1;
         }
         Ok(())
     }
@@ -672,13 +680,14 @@ impl State {
 
     /// Completes the row `id`, writing `reached` in place of its resources, which must be
     /// `unknown`. A repeat is compared on its completion alone: Postgres's role cannot read a
-    /// row's resources to compare them.
+    /// row's resources to compare them. Whether the completion was written now, not found
+    /// written already.
     fn complete_row(
         &mut self,
         id: &AuditRowId,
         completion: &Completion,
         reached: Option<&ReachedResources>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         if self.list_rows.iter().any(|(stored, _, _)| stored == id) {
             return Err(format!(
                 "audit row {} records a listing, which is never completed",
@@ -713,12 +722,24 @@ impl State {
                     row.resources_omitted = reached.omitted;
                 }
                 row.completion = Some(completion.clone());
-                Ok(())
+                Ok(true)
             }
-            Some(written) if written == completion => Ok(()),
+            Some(written) if written == completion => Ok(false),
             Some(_) => Err("the row was already finished, with a different completion".into()),
         }
     }
+}
+
+/// Whether a late finish that would settle a receipt `settled` disagrees with `receipt`, which
+/// it may no longer move: reconciliation settled it in another state. A finish that settles
+/// nothing, `unknown`, disagrees with nothing.
+fn disagrees(receipt: &Receipt, settled: ReceiptState) -> bool {
+    receipt.established_by == EstablishedBy::Reconciliation
+        && matches!(
+            settled,
+            ReceiptState::Completed | ReceiptState::NotPerformed
+        )
+        && receipt.state != settled
 }
 
 /// An [`AuditStore`] that keeps its rows in memory, in the order they were begun.
@@ -1083,6 +1104,18 @@ impl InMemoryAuditStore {
         self.state().claims_failing = Failing::Next;
     }
 
+    /// Every [`record_lookup`](ReceiptQueue::record_lookup) from here on fails, writing
+    /// nothing, as a store that cannot save lookups would.
+    pub fn fail_all_lookup_records(&self) {
+        self.state().records_failing = Failing::Always;
+    }
+
+    /// How many late finishes disagreed with the state reconciliation had settled their
+    /// receipt in: each completed its row and left the receipt as it was.
+    pub fn late_finish_disagreements(&self) -> u64 {
+        self.state().late_finish_disagreements
+    }
+
     /// Who holds the lease on the receipt `row` now, if anyone does.
     pub fn lease_holder(&self, row: &AuditRowId) -> Option<LeaseHolder> {
         let now = self.clock.now();
@@ -1307,11 +1340,14 @@ impl AuditStore for InMemoryAuditStore {
 /// The queue of `unknown` receipts as the Postgres store keeps it (decision 0009,
 /// "Reconciliation"), by this store's clock: a receipt is due when it reads as `unknown`, was
 /// not handed to a person and its lease is free; a claim sets a lease only on a receipt still
-/// due; a lookup is appended, never changed, and moves the receipt as the core's
+/// due, and counts itself in the receipt's claims; a hold sets a lease on a receipt `pending`
+/// or `unknown`, not handed to a person, whose lease is free or already the holder's, and
+/// counts no claim; a lookup is appended, never changed, and moves the receipt as the core's
 /// [`LookupAnswer::settles`] says, or hands it to a person on its last attempt; and nothing is
 /// written for a holder whose lease has ended. A claim can be held at a gate
 /// ([`hold_claims`](InMemoryAuditStore::hold_claims)) or told to fail
-/// ([`fail_next_claim`](InMemoryAuditStore::fail_next_claim)).
+/// ([`fail_next_claim`](InMemoryAuditStore::fail_next_claim)), and every record of a lookup
+/// told to fail ([`fail_all_lookup_records`](InMemoryAuditStore::fail_all_lookup_records)).
 impl ReceiptQueue for InMemoryAuditStore {
     fn due<'a>(&'a self, limit: usize) -> BoxFuture<'a, Result<Vec<Receipt>, StoreError>> {
         Box::pin(async move {
@@ -1354,7 +1390,43 @@ impl ReceiptQueue for InMemoryAuditStore {
             let until = now.checked_add(lease).unwrap_or(now);
             state.leases.retain(|(leased, _, _)| leased != row);
             state.leases.push((row.clone(), holder.clone(), until));
-            Ok(Some(receipt))
+            let counted = state
+                .receipts
+                .iter_mut()
+                .find(|stored| stored.row == *row)
+                .map(|stored| {
+                    stored.claims = stored.claims.saturating_add(1);
+                    stored.claims
+                })
+                .unwrap_or_default();
+            Ok(Some(Receipt {
+                claims: counted,
+                ..receipt
+            }))
+        })
+    }
+
+    fn hold<'a>(
+        &'a self,
+        row: &'a AuditRowId,
+        holder: &'a LeaseHolder,
+        lease: Duration,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        Box::pin(async move {
+            let now = self.clock.now();
+            let mut state = self.state();
+            let open = state.receipts.iter().any(|receipt| {
+                receipt.row == *row
+                    && matches!(receipt.state, ReceiptState::Pending | ReceiptState::Unknown)
+                    && receipt.handed_to_person.is_none()
+            });
+            if !open || !(state.lease_free(row, now) || state.holds(row, holder, now)) {
+                return Ok(false);
+            }
+            let until = now.checked_add(lease).unwrap_or(now);
+            state.leases.retain(|(leased, _, _)| leased != row);
+            state.leases.push((row.clone(), holder.clone(), until));
+            Ok(true)
         })
     }
 
@@ -1368,6 +1440,9 @@ impl ReceiptQueue for InMemoryAuditStore {
         Box::pin(async move {
             let now = self.clock.now();
             let mut state = self.state();
+            if state.records_failing.take() {
+                return Err(down());
+            }
             let at = state.held(row, holder, now)?;
             let receipt = &mut state.receipts[at];
             let made = receipt.lookups.len();

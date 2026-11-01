@@ -89,6 +89,10 @@ impl ContractStore for InMemory {
         let to_go = until.duration_since(self.clock.now()).unwrap_or_default();
         self.clock.advance(to_go);
     }
+
+    fn late_finish_disagreements(&self) -> u64 {
+        self.store.late_finish_disagreements()
+    }
 }
 
 macro_rules! contract {
@@ -140,4 +144,6 @@ contract!(
     a_found_effect_settles_completed_with_its_reference,
     a_lookup_record_is_append_only,
     a_receipt_settled_by_reconciliation_is_not_moved_by_a_late_finish,
+    each_claim_is_counted_as_an_attempt,
+    a_receipt_held_for_its_call_is_not_due_and_no_one_else_claims_it,
 );

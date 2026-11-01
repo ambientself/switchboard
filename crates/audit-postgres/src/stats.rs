@@ -167,6 +167,10 @@ pub struct StoreStats {
     pub answers_released_before_finish: u64,
     /// Finishes and completions of failed begins' rows that gave up, by cause.
     pub finishes_given_up: GivenUpCauses,
+    /// Finishes that completed their row after its deadline and disagreed with the state
+    /// reconciliation had settled the row's receipt in ([`Disagreement`](crate::Disagreement)).
+    /// The receipt was left as it was.
+    pub late_finish_disagreements: u64,
     /// Failed begins whose row the store's last attempt, at the finish deadline, found
     /// missing: the insert had not committed by then. Not given up, and not reported.
     pub begins_never_committed: u64,

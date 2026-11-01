@@ -165,8 +165,9 @@ pub(crate) const RECEIPT_INSERTED: &[&str] = &[
     "target_identifier",
 ];
 
-/// The columns of `receipts` the gateway's role updates: a move's, and reconciliation's lease
-/// and hand-off. Never its row, scope, key, call, target or time.
+/// The columns of `receipts` the gateway's role updates: a move's, and reconciliation's lease,
+/// hand-off and count of claims (migration 0012). Never its row, scope, key, call, target or
+/// time.
 pub(crate) const RECEIPT_UPDATED: &[&str] = &[
     "state",
     "established_by",
@@ -175,6 +176,7 @@ pub(crate) const RECEIPT_UPDATED: &[&str] = &[
     "lease_holder",
     "lease_until",
     "handed_to_person_at",
+    "claims",
 ];
 
 /// The columns of `receipts` the gateway's role reads: every one, for the reuse check, a
@@ -201,10 +203,11 @@ pub(crate) const RECEIPT_SELECTED: &[&str] = &[
     "lease_holder",
     "lease_until",
     "handed_to_person_at",
+    "claims",
 ];
 
-/// The columns of `receipts` that migration 0009 adds for reconciliation, with their types as
-/// Postgres's `format_type` names them.
+/// The columns of `receipts` that migrations 0009 and 0012 add for reconciliation, with their
+/// types as Postgres's `format_type` names them.
 pub(crate) const RECEIPT_COLUMNS: &[(&str, &str)] = &[
     ("target_system", "text"),
     ("target_kind", "text"),
@@ -212,6 +215,7 @@ pub(crate) const RECEIPT_COLUMNS: &[(&str, &str)] = &[
     ("lease_holder", "text"),
     ("lease_until", "timestamp with time zone"),
     ("handed_to_person_at", "timestamp with time zone"),
+    ("claims", "integer"),
 ];
 
 /// The table of lookups made on receipts (decision 0009, "Reconciliation"), which migration
@@ -1160,8 +1164,8 @@ impl PgAuditStore {
     /// - `switchboard_audit.receipts` is there, as a table that is not unlogged, with its
     ///   trigger `receipt_moves` enabled to fire before each insert or update, which moves a
     ///   receipt only as its state table allows (decision 0009, part 2), and with the columns
-    ///   reconciliation reads and writes, of their types: the vendor target, the lease and the
-    ///   hand-off to a person.
+    ///   reconciliation reads and writes, of their types: the vendor target, the lease, the
+    ///   hand-off to a person and the count of claims.
     /// - `switchboard_audit.receipt_lookups` is there, as a table that is not unlogged, with
     ///   every column of its type and its trigger `lookup_appends` enabled to fire before each
     ///   insert, update or delete, which appends a lookup to a receipt in `unknown` and refuses
