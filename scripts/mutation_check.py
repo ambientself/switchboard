@@ -847,8 +847,20 @@ mutate("ran-fields-public", "a run can be made up", SRC + "audit.rs",
 mutate("row-completion-fields-public", "a store's finish can be called for any row", SRC + "audit.rs",
        "pub struct RowCompletion {\n    row: AuditRowId,\n    completion: Completion,\n    reference: Option<VendorReference>,",
        "pub struct RowCompletion {\n    pub row: AuditRowId,\n    pub completion: Completion,\n    pub reference: Option<VendorReference>,")
-mutate("tool-call-constructor-public", "a connector can be called around the audited path", SRC + "connector.rs",
-       "    pub(crate) fn new(\n        call: CallContext,", "    pub fn new(\n        call: CallContext,")
+# ToolCall::new takes what the decision granted, a crate-private type, so making new public alone
+# would still leave nothing outside the core able to call it: the grant is made public and
+# exported with it.
+mutate_all(
+    "tool-call-constructor-public",
+    "a connector can be called around the audited path",
+    (SRC + "connector.rs", "    pub(crate) fn new(\n        call: CallContext,", "    pub fn new(\n        call: CallContext,"),
+    (SRC + "connector.rs",
+     "pub(crate) struct Granted {\n    pub(crate) policy_revision: PolicyRevision,\n    pub(crate) caller_limit: Option<Vec<Resource>>,\n}",
+     "pub struct Granted {\n    pub policy_revision: PolicyRevision,\n    pub caller_limit: Option<Vec<Resource>>,\n}"),
+    (SRC + "lib.rs",
+     "pub use connector::{BoxFuture, Connector, ErrorKind, ToolCall, ToolOutcome};",
+     "pub use connector::{BoxFuture, Connector, ErrorKind, Granted, ToolCall, ToolOutcome};"),
+)
 mutate("connector-run-without-call", "a connector runs without being handed the call", SRC + "connector.rs",
        "    fn run(&self, call: ToolCall) -> BoxFuture<'_, ToolOutcome>;", "    fn run(&self) -> BoxFuture<'_, ToolOutcome>;", breaks_build=True)
 mutate("run-drops-arguments", "the connector is not given the call's arguments", SRC + "audit.rs",
@@ -3892,8 +3904,10 @@ mutate("registry-adapter-without-sources", "a tool may read its resources from n
        "    if sources.is_empty() {\n        return Err(RegistryError::AdapterWithoutSources(name.clone()));",
        "    if false {\n        return Err(RegistryError::AdapterWithoutSources(name.clone()));")
 mutate("registry-adapter-argument-undeclared", "an adapter may read an argument the schema does not declare", RR,
-       "            .and_then(|p| p.get(argument))\n",
-       '            .and_then(|p| p.get(argument))\n            .or(schema.get("type"))\n')
+       "            None => {\n                return Err(RegistryError::AdapterArgumentUndeclared {\n"
+       "                    tool: name.clone(),\n                    argument: source.from_argument,\n"
+       "                });\n            }\n",
+       "            None => {}\n")
 mutate("registry-adapter-argument-not-string", "an adapter may read an argument not typed as a string", RR,
        "            Some(false) => {\n                return Err(RegistryError::AdapterArgumentNotString {\n"
        "                    tool: name.clone(),\n                    argument: source.from_argument,\n"
@@ -3972,6 +3986,44 @@ mutate("registry-connector-serves-proxied-tool", "a built-in entry may list a pr
 mutate("registry-connector-tool-on-two-entries", "a tool may be served by two built-in entries", RB,
        "            if let Some(first) = served.insert(tool.clone(), entry.name.clone()) {",
        "            if let Some(first) = served.insert(tool.clone(), entry.name.clone()).filter(|_| false) {")
+# An entry declares its credential whole, naming the principal it acts as, or not at all; a tool
+# is approved under its entry's system. tests/built_in.rs watches each.
+mutate("registry-connector-partly-declared-accepted", "an entry that declares part of its credential loads as one that declares none", RB,
+       "            _ => return Err(RegistryError::EntryPartlyDeclared(entry.name)),", "            _ => None,")
+mutate("registry-connector-principal-empty-accepted", "an entry's credential may name no principal", RB,
+       "                if credential.principal.is_empty() {", "                if false {")
+mutate("registry-built-in-name-outside-system", "a built-in tool may be named after another system than its entry's", RR,
+       "    if !under_system(&name, &entry.system) {", "    if false {")
+# A reach-report entry is held to its one job, and an entry's reach report names a tool such an
+# entry lists (decision 0011, section 4; #193). tests/reach_report.rs watches each.
+mutate("registry-reach-report-entry-permits-accepted", "a reach-report entry may permit more than read", RB,
+       "            Some(declaration) if declaration.permits != Classification::Read => {",
+       "            Some(declaration) if false && declaration.permits != Classification::Read => {")
+mutate("registry-reach-report-tool-write-accepted", "a reach report's tool may be approved as a write", RR,
+       "    if entry.reports_reach && tool.classification != gateway_core::Classification::Read {", "    if false {")
+mutate("registry-reach-report-unlisted-accepted", "an entry's reach report may name a tool no reach-report entry lists", RB,
+       "            if !reported {", "            if false {")
+# A reach that is required cannot be left out (decision 0011, sections 1 and 4; #220): a tool
+# declared as its entry's reach needs a reach on the entry, as a proxied entry does, and a GitHub
+# entry with a reach names its reach report. tests/built_in.rs watches each.
+mutate("registry-as-reach-without-reach-accepted", "a built-in tool declared as the reach loads on an entry with no reach, and every call is denied", RR,
+       "                .is_none_or(|declaration| declaration.reach.is_empty()) =>",
+       "                .is_none_or(|declaration| declaration.reach.is_empty() && false) =>")
+mutate("registry-reach-report-optional", "a GitHub entry with a reach loads without a reach report, and its reach is never checked", RB,
+       "        if built.system == REPORTED_SYSTEM && reaches && built.reach_report.is_none() {", "        if false {")
+# What a built-in approval declares, for the gateway to compare with what its connector states
+# (#220). The assurance's own tests, tests/built_in.rs and the gateway's tests/github_reach.rs
+# watch these.
+mutate("registry-no-resources-declared-as-checking-scope", "an approval declaring no resources is read as checking its own scope", RR,
+       "            (ResourceDeclaration::NoResources, _) => StatedResources::NoResources,",
+       "            (ResourceDeclaration::NoResources, _) => StatedResources::ChecksOwnScope,")
+RAS = REGISTRY + "src/assurance.rs"
+mutate("registry-assurance-classification-ignored", "an approval may classify a built-in tool otherwise than its connector does", RAS,
+       "        if approved.classification != self.classification {", "        if false {")
+mutate("registry-assurance-sources-ignored", "an approval may read a built-in tool's resources from other arguments than its connector does", RAS,
+       "            (StatedResources::FromArguments(stated), StatedResources::FromArguments(declared)) => {",
+       "            (StatedResources::FromArguments(_), StatedResources::FromArguments(_)) => true,\n"
+       "            (StatedResources::FromArguments(stated), StatedResources::FromArguments(declared)) => {")
 
 # --- gateway-registry: schema validation ---------------------------------------------------
 #
@@ -6090,6 +6142,13 @@ mutate("gw-reach-report-failure-withdraws", "a report that could not be read is 
 mutate("gw-reach-report-never-scheduled", "no entry is checked against its report on the drift schedule, so a changed installation is never found", DRIFT,
        "        for reporting in self.reporting() {\n            reports.spawn(report_every(\n",
        "        for reporting in self.reporting().into_iter().take(0) {\n            reports.spawn(report_every(\n")
+# A tick while an entry's report is out makes none, and a report's call is given the deadline of
+# the report tool's connector (#220). tests/github_reach.rs watches both.
+mutate("gw-reach-report-overlapping", "every tick starts a report, so two of one entry's reports run at once", DRIFT,
+       "        let idle = checking.is_empty();\n        if idle {\n            checking.spawn(check_report(",
+       "        let idle = true;\n        if idle {\n            checking.spawn(check_report(")
+mutate("gw-reach-report-deadline-of-the-checked-entry", "a report's call is given the checked entry's deadline, not the report tool's connector's", DRIFT,
+       "                    .get(&served_by)\n", "                    .get(&entry)\n")
 
 
 # --- first slice: resources on rows, naming what goes down ------------------------------------
@@ -6589,6 +6648,36 @@ mutate("github-tags-on-a-contents-token", "the tags are read on the releases' co
        "token(connector, request, TAGS_PERMISSIONS)", "token(connector, request, RELEASES_PERMISSIONS)")
 mutate("github-reads-entry-unchecked", "an entry that serves a newer read without its permissions is served", GH + "reads.rs",
        "                if entry.permissions.get(*permission) < Some(&Access::Read) {", "                if false {")
+# The connector is built only for an organization that is an account name, and for entries whose
+# tokens are narrowed, a reach report's aside. connector.rs's own tests and tests/github_reach.rs
+# catch these.
+mutate("github-organization-name-unchecked", "the connector is built for an organization that is not a GitHub account name", GHC,
+       "        if !account {", "        if false {")
+mutate("github-entry-not-narrowed-accepted", "a GitHub entry narrowed none, so serving tokens for the whole installation, is served", GHC,
+       "            if declaration.narrowing == Narrowing::None && !entry.reports_reach {", "            if false {")
+mutate("github-reach-report-entry-refused", "a reach-report entry, narrowed none, is refused as if it were any other entry", GHC,
+       "            if declaration.narrowing == Narrowing::None && !entry.reports_reach {",
+       "            if declaration.narrowing == Narrowing::None {")
+# What the connector's code states of each tool, and which tools it serves on each entry (#220):
+# boot refuses an approval that declares otherwise. tools.rs's own tests and tests/github.rs,
+# github_search.rs and github_reach.rs catch these.
+mutate("github-search-stated-as-arguments", "the search is stated as reading its resources from its arguments, though it checks its own scope", GH + "search.rs",
+       "            resources: StatedResources::ChecksOwnScope,", "            resources: StatedResources::FromArguments(Vec::new()),")
+mutate("github-reads-stated-unqualified", "a read is stated as reaching the repository its repo argument names alone, not owner/repo", GHT,
+       "            from_argument: \"repo\".into(),\n            qualified_by: Some(\"owner\".into()),\n            system: crate::SYSTEM.into(),",
+       "            from_argument: \"repo\".into(),\n            qualified_by: None,\n            system: crate::SYSTEM.into(),")
+mutate("github-report-served-on-every-entry", "the reach report's tool is served on every entry, not only a reach-report entry's", GH + "lib.rs",
+       "    } else {\n        definitions()\n    };",
+       "    } else {\n        let mut all = definitions();\n        all.push(report::definition());\n        all\n    };")
+# The reach report reads every page up to 1,000 repositories, and a list that does not come to
+# GitHub's total is an error. report.rs's own tests catch these.
+GHP = GH + "report.rs"
+mutate("github-report-first-page-only", "the report reads its first page alone", GHP,
+       "    for page in 1..=MAX_REPORT_PAGES {", "    for page in 1..=1 {")
+mutate("github-report-uncapped", "the report reads past 1,000 repositories, as many pages as GitHub has", GHP,
+       "    for page in 1..=MAX_REPORT_PAGES {", "    for page in 1.. {")
+mutate("github-report-total-unchecked", "a list that does not come to GitHub's total is served as the installation's", GHP,
+       "            if repositories.len() != total_usize {", "            if false {")
 mutate("gateway-job-log-hosts-dropped", "the deployment file's [github] job_log_hosts do not reach the connector",
        "crates/gateway/src/deployment.rs",
        "            job_log_hosts: self.job_log_hosts,", "            job_log_hosts: Vec::new(),")
@@ -6645,7 +6734,18 @@ mutate("gateway-built-in-connector-unbounded", "a built-in connector runs withou
        "            connector,")
 mutate("gateway-built-in-definition-unchecked", "a built-in approval of another definition than its connector's is served",
        "crates/gateway/src/boot.rs",
-       "        if basis.built_in_definitions.get(tool) != approved {", "        if false {")
+       "        if approved != Some(&served.definition_sha256) {", "        if false {")
+# The connector states each tool's assurance, and boot and every reload refuse an approval that
+# declares otherwise; what a connector serves is keyed by entry and tool (#220). boot.rs's own
+# tests and tests/github.rs watch these.
+mutate("gateway-built-in-assurance-unchecked", "a built-in approval that declares checks_own_scope or no_resources for a tool that does neither is served",
+       "crates/gateway/src/boot.rs",
+       "        if let Some(mismatch) = mismatch {", "        if let Some(mismatch) = mismatch.filter(|_| false) {")
+mutate("gateway-built-in-tools-by-name-only", "a tool its connector serves on one entry is served on any entry that approves it",
+       "crates/gateway/src/boot.rs",
+       "        let Some(served) = basis.built_in_tools.get(&(entry.clone(), tool.clone())) else {",
+       "        let Some(served) = basis\n            .built_in_tools\n            .iter()\n"
+       "            .find(|((_, name), _)| name == tool)\n            .map(|(_, served)| served)\n        else {")
 mutate("gateway-narrowing-gate-refuses-built-in", "a built-in entry narrowed to the limit is refused as if proxied",
        "crates/gateway/src/boot.rs",
        "        .find(|entry| entry.kind == EntryKind::Proxied && entry.narrowing != Narrowing::None)",
@@ -6668,9 +6768,19 @@ mutate("gateway-connectors-outside-the-policy", "an entry changed under the same
        "            connectors: registry.connectors().clone(),", "            connectors: BTreeMap::new(),")
 # The registry holds a reach-report entry to its one job, and an entry's reach report to one that
 # can check it (decision 0011, section 4; #193). The registry's tests/reach_report.rs watches each.
-mutate("registry-reach-report-surface-unchecked", "a reach report's tool may be served to any principal of a team",
+# A reach report's tool is served on registry-reach alone, to one named principal, the registry's
+# own identity (decision 0011, section 4; #220).
+mutate("registry-reach-report-surface-unchecked", "a reach report's tool may be served on any surface, to any principal of a team",
        "crates/gateway-registry/src/registry.rs",
-       "        if !matches!(surface.principals, PrincipalsFile::AnyInTeamsAndGroups) {", "        if true {")
+       "        if registrys_own {\n            continue;", "        if true {\n            continue;")
+mutate("registry-reach-report-surface-any-name", "a reach report's tool may be served on any surface restricted to one named principal",
+       "crates/gateway-registry/src/registry.rs",
+       "        let registrys_own = surface.name.as_str() == REACH_SURFACE\n",
+       "        let registrys_own = (surface.name.as_str() == REACH_SURFACE || true)\n")
+mutate("registry-reach-report-surface-many-principals", "a reach report's tool may be served on registry-reach to several named principals",
+       "crates/gateway-registry/src/registry.rs",
+       "            && matches!(&surface.principals, PrincipalsFile::Only(ids) if ids.len() == 1);",
+       "            && matches!(&surface.principals, PrincipalsFile::Only(_));")
 mutate("registry-reach-report-entry-narrowed-accepted", "a reach-report entry may be narrowed, though its credential reads the whole installation",
        "crates/gateway-registry/src/builtin.rs",
        "            Some(declaration) if declaration.narrowing != Narrowing::None => {",
