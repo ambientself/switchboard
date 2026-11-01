@@ -44,6 +44,7 @@ use gateway_core::receipt::EstablishedBy;
 use gateway_core::{ErrorKind, LookupAnswer, ReasonKind, Receipt, ReceiptState, Resource};
 use gateway_identity::SystemClock;
 use gateway_registry::Registry;
+use gateway_testkit::StoreBudgets;
 use github_world::{
     ACCOUNT, AMEND_CHANGE, Answered, BOT_LOGIN, CREATE_PR, OTHER_ORG, Options, PROPOSE_CHANGE,
     TEAM_A, TEAM_A_OTHER, World,
@@ -55,6 +56,14 @@ const REPO: &str = "/repos/example-org/atlas";
 
 /// What the default branch's README holds.
 const SEED: &str = "Atlas.\n";
+
+/// Budgets that put a call row's deadline a little over a second past its call deadline, so a
+/// test in real time sees it pass. No receipt is due before its row's deadline.
+const SHORT_BUDGETS: StoreBudgets = StoreBudgets {
+    begin: Duration::from_millis(100),
+    answer: Duration::from_millis(100),
+    finish_deadline: Duration::from_secs(1),
+};
 
 /// A world whose write entry serves the proposal tools, with the App's bot login configured.
 fn proposing() -> Options {
@@ -964,6 +973,7 @@ async fn after_the_first_write_every_failure_is_unknown_and_reconciliation_finds
             attempts: 1,
             ..ReconcileSettings::default()
         },
+        budgets: SHORT_BUDGETS,
         ..proposing()
     })
     .await;
@@ -1044,6 +1054,9 @@ async fn after_the_first_write_every_failure_is_unknown_and_reconciliation_finds
         1,
         "one pull request was opened"
     );
+    for row in &unknown {
+        world.past_deadline(row).await;
+    }
 
     let before = world.rest.requests().len();
     let report = world.reconciler.pass().await;
@@ -1370,6 +1383,7 @@ async fn reconciliation_finds_an_amendment_by_the_marker_it_added() {
             attempts: 1,
             ..ReconcileSettings::default()
         },
+        budgets: SHORT_BUDGETS,
         ..proposing()
     })
     .await;
@@ -1384,6 +1398,7 @@ async fn reconciliation_finds_an_amendment_by_the_marker_it_added() {
     answered.tool_error();
     assert_eq!(outcome(&world, AMEND_CHANGE).await, Outcome::Unknown);
     let row = row_of(&answered);
+    world.past_deadline(&row).await;
     let report = world.reconciler.pass().await;
     assert_eq!((report.claimed, report.settled), (1, 1), "{report:?}");
     let settled = receipt(&world, &row);
@@ -1410,6 +1425,7 @@ async fn with_a_bot_login_a_lookup_passes_over_a_copy_someone_else_opened() {
             attempts: 1,
             ..ReconcileSettings::default()
         },
+        budgets: SHORT_BUDGETS,
         ..proposing()
     })
     .await;
@@ -1431,6 +1447,7 @@ async fn with_a_bot_login_a_lookup_passes_over_a_copy_someone_else_opened() {
         .to_owned();
     let copy = world.rest.open_elsewhere("atlas", &copied);
     assert_eq!(copy, 2);
+    world.past_deadline(&row).await;
     let report = world.reconciler.pass().await;
     assert_eq!(report.settled, 1, "{report:?}");
     assert_eq!(

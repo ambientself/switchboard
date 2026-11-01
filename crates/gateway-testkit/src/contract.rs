@@ -3833,6 +3833,8 @@ pub async fn an_attribution_read_finds_only_the_principals_completed_receipt_of_
         attributed(contract, fixture, TeamA, draft, ours, "d-5").await,
         None
     );
+    // Its row's deadline passes, so it is due.
+    contract.pass_deadline(&unknown).await;
     let holder = holder("attribution");
     claimed(contract, &unknown, &holder).await;
     let found = LookupAnswer::Found {
