@@ -7,8 +7,8 @@
 //! Its arguments are `owner`, `repo`, `title`, `idempotency_key`, `files` and
 //! `unverifiedClaims`, and an optional `body`. The title is held to `github__create_pr`'s rules;
 //! the key is 1 to [`MAX_KEY_CHARS`] of `A-Z a-z 0-9 . _ -`, not beginning with `.`, holding no
-//! `..` and not ending with `.lock`, so that `otto/<key>` is a branch name; the body is at most
-//! [`MAX_CALLER_BODY_CHARS`] characters. The key names the branch: it is not the call's
+//! `..` and not ending with `.` or `.lock`, so that `otto/<key>` is a branch name; the body is
+//! at most [`MAX_CALLER_BODY_CHARS`] characters. The key names the branch: it is not the call's
 //! idempotency key, which the gateway answers a repeat of before the connector runs. The rest,
 //! and every refusal before a request, is [`crate::proposals`]'s.
 //!
@@ -91,7 +91,7 @@ pub(crate) fn definition() -> Definition {
             "type": "string",
             "minLength": 1,
             "maxLength": MAX_KEY_CHARS,
-            "description": "Names the proposal's branch, otto/<key>: letters, digits, '.', '_' and '-', not beginning with '.', with no '..' and not ending in '.lock'. A repeat with the same key answers the existing proposal."
+            "description": "Names the proposal's branch, otto/<key>: letters, digits, '.', '_' and '-', not beginning with '.', with no '..' and not ending in '.' or '.lock'. A repeat with the same key answers the existing proposal."
         }),
     );
     properties.insert("files".into(), proposals::files_schema());
@@ -182,14 +182,15 @@ fn branch_key(key: &str) -> Result<(), String> {
         && charset
         && !key.starts_with('.')
         && !key.contains("..")
+        && !key.ends_with('.')
         && !key.ends_with(".lock");
     if well_formed {
         return Ok(());
     }
     Err(format!(
         "idempotency_key {:?} must be 1 to {MAX_KEY_CHARS} of the characters A-Z a-z 0-9 . _ -, \
-         not beginning with \".\", holding no \"..\" and not ending with \".lock\", since it \
-         names the branch otto/<key>",
+         not beginning with \".\", holding no \"..\" and not ending with \".\" or \".lock\", since \
+         it names the branch otto/<key>",
         bounded(key, 128).0
     ))
 }
@@ -548,6 +549,8 @@ mod tests {
             (json!({"idempotency_key": ".x"}), "must be 1 to 100"),
             (json!({"idempotency_key": "a..b"}), "must be 1 to 100"),
             (json!({"idempotency_key": "a.lock"}), "must be 1 to 100"),
+            (json!({"idempotency_key": "widget."}), "must be 1 to 100"),
+            (json!({"idempotency_key": "v1.2."}), "must be 1 to 100"),
             (json!({"idempotency_key": "a/b"}), "must be 1 to 100"),
             (json!({"idempotency_key": "a b"}), "must be 1 to 100"),
             (

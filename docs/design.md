@@ -1683,9 +1683,9 @@ file of the call, a content that is not a string or over 1,000,000 bytes; `unver
 missing or null ("unverifiedClaims is required"), not strings, over 20, or a claim over 1,000
 bytes. `github__propose_change` also takes a title held to `github__create_pr`'s rules, an
 `idempotency_key` of 1 to 100 characters of `A-Z a-z 0-9 . _ -`, not beginning with `.`,
-holding no `..` and not ending with `.lock`, which names the branch `otto/<key>`, and a body of
-at most 65,536 characters; the whole body, with the claims block and the marker, is held to
-GitHub's 65,536 before any request too. The key is not the call's idempotency key: a repeat
+holding no `..` and not ending with `.` or `.lock`, which names the branch `otto/<key>`, and
+a body of at most 65,536 characters; the whole body, with the claims block and the marker, is
+held to GitHub's 65,536 before any request too. The key is not the call's idempotency key: a repeat
 under the same tool-use identifier is a `duplicate` before the connector runs, and a repeat
 under a new one reaches it. `github__amend_change` takes `pr_number`, 1 or more, and an
 optional `expected_head` of 40 lowercase hex digits. Then, in this order, each is `refused`:

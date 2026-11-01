@@ -800,6 +800,11 @@ async fn each_malformed_argument_is_invalid_arguments_and_nothing_is_sent() {
             proposal("x.lock", json!({})),
             "idempotency_key",
         ),
+        (
+            PROPOSE_CHANGE,
+            proposal("widget.", json!({})),
+            "idempotency_key",
+        ),
         (PROPOSE_CHANGE, proposal(".x", json!({})), "idempotency_key"),
         (
             PROPOSE_CHANGE,
