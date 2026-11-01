@@ -30,24 +30,33 @@
 //! It can be told to answer every request with a status, with GitHub's rate-limit answer, or
 //! late (see [`Mode`]). Every error it answers carries the token it was sent in its body, as a
 //! careless vendor might, so a test can show that nothing the caller reads holds it.
+//!
+//! For the write tools it opens pull requests, lists them, and answers comparisons, and a write
+//! can be given a fault of its own ([`Fault`]); see `writes`. It records each request's body
+//! beside its token.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use key_custodian::fake::{FakeGitHub, IssuedToken};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 mod reads;
+mod writes;
 
 pub use reads::{FakeLogHost, LogHit};
+pub use writes::Fault;
 
 /// One request the fake received.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,6 +69,8 @@ pub struct Recorded {
     pub query: String,
     /// The bearer token in its `Authorization` header, if it had one.
     pub token: Option<String>,
+    /// Its body, if it had one, as text.
+    pub body: Option<String>,
 }
 
 /// What the fake does with the next requests.
@@ -93,6 +104,11 @@ struct Shared {
     requests: Mutex<Vec<Recorded>>,
     content: Mutex<Content>,
     reads: Mutex<reads::Content>,
+    writes: Mutex<writes::Content>,
+    /// Whether to stop taking connections once the next comparison is answered.
+    close_after_compare: AtomicBool,
+    /// Stops the server taking connections.
+    close: Notify,
 }
 
 /// The fake, serving until dropped.
@@ -122,12 +138,18 @@ impl FakeRest {
             requests: Mutex::new(Vec::new()),
             content: Mutex::new(Content::default()),
             reads: Mutex::new(reads::Content::default()),
+            writes: Mutex::new(writes::Content::default()),
+            close_after_compare: AtomicBool::new(false),
+            close: Notify::new(),
         });
         let router = Router::new().fallback(answer).with_state(shared.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
+        let closing = shared.clone();
         let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, router).await;
+            let _ = axum::serve(listener, router)
+                .with_graceful_shutdown(async move { closing.close.notified().await })
+                .await;
         });
         Ok(Self {
             address,
@@ -300,6 +322,7 @@ async fn answer(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
     let token = bearer(&headers);
     lock(&shared.requests).push(Recorded {
@@ -307,6 +330,7 @@ async fn answer(
         path: uri.path().to_owned(),
         query: uri.query().unwrap_or("").to_owned(),
         token: token.clone(),
+        body: (!body.is_empty()).then(|| String::from_utf8_lossy(&body).into_owned()),
     });
     let mode = *lock(&shared.mode);
     match mode {
@@ -328,9 +352,6 @@ async fn answer(
             return response;
         }
     }
-    if method != Method::GET {
-        return error(StatusCode::NOT_FOUND, "Not Found", token.as_deref());
-    }
     let issued = token.as_deref().and_then(|token| {
         let revoked = shared.app.revoked();
         shared
@@ -347,6 +368,15 @@ async fn answer(
             token.as_deref(),
         );
     };
+    // The endpoints of the write tools and the lookup (`writes`).
+    if let Some(response) =
+        writes::answer(&shared, &issued, &method, &uri, token.as_deref(), &body).await
+    {
+        return response;
+    }
+    if method != Method::GET {
+        return error(StatusCode::NOT_FOUND, "Not Found", token.as_deref());
+    }
     if uri.path() == "/search/issues" {
         return search(&shared, &issued, &uri, token.as_deref());
     }
