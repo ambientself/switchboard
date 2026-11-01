@@ -7,8 +7,8 @@ mod common;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::PermissionsExt;
 
-use common::{World, my_uid, write_file};
-use key_custodian::{Config, StartError};
+use common::{World, my_uid, registry, write_file};
+use key_custodian::{Config, PolicyError, StartError};
 
 #[tokio::test]
 async fn no_key_refuses_to_start() {
@@ -130,6 +130,32 @@ async fn a_registry_that_does_not_load_refuses_to_start() {
     .err()
     .unwrap();
     assert!(matches!(error, StartError::Policy(_)), "{error}");
+}
+
+#[tokio::test]
+async fn a_github_entry_listing_a_tool_of_another_system_refuses_to_start() {
+    // The loader accepts each of these on a built-in entry; the custodian does not.
+    for tool in ["docs__read", "githubber__read", "github__"] {
+        let (error, socket) = World::try_with(|config| {
+            let text = registry("r1").replace(
+                r#"tools = ["github__get_issue", "github__get_file"]"#,
+                &format!(r#"tools = ["github__get_issue", "github__get_file", "{tool}"]"#),
+            );
+            write_file(&config.registry, &text, 0o644);
+        })
+        .await
+        .err()
+        .unwrap();
+        assert!(
+            matches!(
+                &error,
+                StartError::Policy(PolicyError::ToolOutsideSystem { tool: found, .. })
+                    if found.as_str() == tool
+            ),
+            "{tool}: {error}"
+        );
+        assert!(!socket.exists(), "{tool}: no socket is made");
+    }
 }
 
 #[tokio::test]

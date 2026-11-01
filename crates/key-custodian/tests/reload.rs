@@ -89,3 +89,37 @@ async fn a_file_that_does_not_load_keeps_the_copy_served() {
     .await;
     world.client.token(&request()).await.unwrap();
 }
+
+#[tokio::test]
+async fn a_github_entry_listing_a_tool_of_another_system_keeps_the_copy_served() {
+    let world = World::new().await;
+    let text = registry("r2").replace(
+        r#"tools = ["github__propose"]"#,
+        r#"tools = ["github__propose", "docs__write"]"#,
+    );
+    assert_ne!(text, registry("r2"));
+    write_file(&world.registry, &text, 0o644);
+    until(|| {
+        world
+            .running()
+            .counters()
+            .render()
+            .contains("switchboard_custodian_policy_reloads_total{result=\"refused\"} 1")
+    })
+    .await;
+    // Still r1: the request at r1 is served, and r2 is stale.
+    world.client.token(&request()).await.unwrap();
+    let mut next = request();
+    next.revision = PolicyRevision::new("r2");
+    let error = world.client.token(&next).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ClientError::Refused {
+                reason: Refusal::StaleRevision,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+}
