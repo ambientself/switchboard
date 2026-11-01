@@ -9,9 +9,16 @@
 //!   (`open`, `closed` or `all`; `open` unless given), `head` (`owner:branch`), `sort`
 //!   (`created` or `updated`), `direction` (`asc` or `desc`), `per_page` (30 unless given, 100
 //!   at most) and `page`. A token needs `pull_requests` at `read` or above.
+//! - `PATCH /repos/{owner}/{repo}/pulls/{n}` changes the title, body or state it is sent,
+//!   and nothing else, as the most recently updated from then on. A token needs
+//!   `pull_requests: write`. A test changes a pull request as a person or GitHub might with
+//!   [`FakeRest::set_pull`]: its state, draft flag, merge, author or head.
 //! - `GET /repos/{owner}/{repo}/compare/{base}...{head}` answers what a test set for the
 //!   repository ([`FakeRest::compare_files`], [`FakeRest::comparison`]), whatever the branches,
 //!   and a 404 when it set nothing. A token needs `contents` at `read` or above.
+//!
+//! A pull request names its head's and base's repository, its head's commit when the
+//! repository has git data (`git`), and `merged_at`, `null` until a test merges it.
 //!
 //! The next write can be given a fault ([`FakeRest::fault_next_write`], see [`Fault`]): an
 //! answer that applies nothing, an answer after applying, a connection closed with no answer
@@ -132,12 +139,61 @@ impl FakeRest {
         let mut content = lock(&self.shared.writes);
         let author = "someone-else".to_owned();
         let pull = json!({"title": "elsewhere", "head": "x", "base": "main", "body": body, "draft": false});
-        open(&mut content, &self.shared.account, repo, &pull, &author)
+        open(
+            &mut content,
+            &self.shared.account,
+            repo,
+            &pull,
+            &author,
+            None,
+        )
+    }
+
+    /// Changes pull request `number` of `repo`, opened through the fake, as a person or GitHub
+    /// might: each field of `changes` replaces the pull request's, an object's fields one by
+    /// one, such as `{"state": "closed"}`, `{"draft": false}`, `{"merged_at": "..."}`,
+    /// `{"user": {"login": "someone"}}` or `{"body": "..."}`. It is the most recently updated
+    /// from then on.
+    pub fn set_pull(&self, repo: &str, number: u64, changes: Value) {
+        let mut content = lock(&self.shared.writes);
+        content.clock += 1;
+        let clock = content.clock;
+        content.updated.insert((repo.to_owned(), number), clock);
+        let pull = content
+            .opened
+            .get_mut(repo)
+            .and_then(|opened| opened.get_mut(&number))
+            .expect("the pull request was opened through the fake");
+        merge(pull, &changes);
+        let changed = pull.clone();
+        drop(content);
+        lock(&self.shared.content)
+            .pulls
+            .insert((repo.to_owned(), number), changed);
+    }
+}
+
+/// `changes` written over `target`, an object's fields one by one.
+fn merge(target: &mut Value, changes: &Value) {
+    match (target, changes) {
+        (Value::Object(target), Value::Object(changes)) => {
+            for (name, change) in changes {
+                merge(target.entry(name.clone()).or_insert(Value::Null), change);
+            }
+        }
+        (target, change) => *target = change.clone(),
     }
 }
 
 /// Opens `pull` in `repo` as `author`, and its number.
-fn open(content: &mut Content, account: &str, repo: &str, pull: &Value, author: &str) -> u64 {
+fn open(
+    content: &mut Content,
+    account: &str,
+    repo: &str,
+    pull: &Value,
+    author: &str,
+    head_sha: Option<String>,
+) -> u64 {
     let number = content
         .opened
         .get(repo)
@@ -151,9 +207,15 @@ fn open(content: &mut Content, account: &str, repo: &str, pull: &Value, author: 
         "body": pull["body"],
         "draft": pull["draft"],
         "html_url": format!("https://github.example.test/{account}/{repo}/pull/{number}"),
-        "head": {"ref": pull["head"], "label": format!("{account}:{}", pull["head"].as_str().unwrap_or(""))},
-        "base": {"ref": pull["base"]},
+        "head": {
+            "ref": pull["head"],
+            "label": format!("{account}:{}", pull["head"].as_str().unwrap_or("")),
+            "sha": head_sha,
+            "repo": {"full_name": format!("{account}/{repo}")},
+        },
+        "base": {"ref": pull["base"], "repo": {"full_name": format!("{account}/{repo}")}},
         "user": {"login": author},
+        "merged_at": null,
     });
     content
         .opened
@@ -169,6 +231,7 @@ fn open(content: &mut Content, account: &str, repo: &str, pull: &Value, author: 
 /// What a path under the repository names.
 enum Endpoint {
     Pulls,
+    Pull(u64),
     Compare,
 }
 
@@ -188,6 +251,12 @@ pub(super) async fn answer(
     let tail = parts.next().unwrap_or("");
     let endpoint = if tail == "pulls" {
         Endpoint::Pulls
+    } else if let Some(number) = tail
+        .strip_prefix("pulls/")
+        .and_then(|number| number.parse::<u64>().ok())
+        .filter(|_| *method == Method::PATCH)
+    {
+        Endpoint::Pull(number)
     } else if tail.starts_with("compare/") && *method == Method::GET {
         Endpoint::Compare
     } else {
@@ -200,6 +269,7 @@ pub(super) async fn answer(
     let (permissions, write): (&[&str], bool) = match (&endpoint, method) {
         (Endpoint::Pulls, &Method::POST) => (&["pull_requests"], true),
         (Endpoint::Pulls, &Method::GET) => (&["pull_requests"], false),
+        (Endpoint::Pull(_), &Method::PATCH) => (&["pull_requests"], true),
         (Endpoint::Compare, _) => (&["contents"], false),
         _ => return Some(error(StatusCode::NOT_FOUND, "Not Found", token)),
     };
@@ -215,12 +285,13 @@ pub(super) async fn answer(
         Endpoint::Compare => compare(shared, &repo, token),
         Endpoint::Pulls if write => create(shared, &repo, body, token).await,
         Endpoint::Pulls => list(shared, &repo, query),
+        Endpoint::Pull(number) => edit(shared, &repo, number, body, token).await,
     })
 }
 
 /// Whether `issued` may use `permissions`: at `write` when `write`, or at `read` or above. A
 /// token asked for with no permissions has every one the installation has.
-fn may(issued: &IssuedToken, permissions: &[&str], write: bool) -> bool {
+pub(super) fn may(issued: &IssuedToken, permissions: &[&str], write: bool) -> bool {
     match &issued.asked_permissions {
         None => true,
         Some(asked) => permissions.iter().any(|permission| {
@@ -252,6 +323,83 @@ async fn create(shared: &Shared, repo: &str, body: &[u8], token: Option<&str>) -
     if !complete {
         return error(StatusCode::UNPROCESSABLE_ENTITY, "Validation Failed", token);
     }
+    let head_sha = pull
+        .get("head")
+        .and_then(Value::as_str)
+        .and_then(|head| super::git::head(shared, repo, head));
+    faulted(shared, token, || {
+        let (number, made) = {
+            let mut content = lock(&shared.writes);
+            let author = content.author.clone();
+            let number = open(
+                &mut content,
+                &shared.account,
+                repo,
+                &pull,
+                &author,
+                head_sha,
+            );
+            (number, content.opened[repo][&number].clone())
+        };
+        // Served by `GET /repos/{owner}/{repo}/pulls/{n}` from here on.
+        lock(&shared.content)
+            .pulls
+            .insert((repo.to_owned(), number), made.clone());
+        Ok((StatusCode::CREATED, made))
+    })
+    .await
+}
+
+/// `PATCH` of pull request `number` of `repo`, opened through the fake: its title, body and
+/// state, as sent, and nothing else.
+async fn edit(
+    shared: &Shared,
+    repo: &str,
+    number: u64,
+    body: &[u8],
+    token: Option<&str>,
+) -> Response {
+    let Ok(sent) = serde_json::from_slice::<Value>(body) else {
+        return error(StatusCode::BAD_REQUEST, "Problems parsing JSON", token);
+    };
+    let Some(sent) = sent.as_object() else {
+        return error(StatusCode::UNPROCESSABLE_ENTITY, "Validation Failed", token);
+    };
+    let changes: serde_json::Map<String, Value> = sent
+        .iter()
+        .filter(|(name, _)| ["title", "body", "state"].contains(&name.as_str()))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    faulted(shared, token, || {
+        let mut content = lock(&shared.writes);
+        content.clock += 1;
+        let clock = content.clock;
+        let Some(pull) = content
+            .opened
+            .get_mut(repo)
+            .and_then(|opened| opened.get_mut(&number))
+        else {
+            return Err(error(StatusCode::NOT_FOUND, "Not Found", token));
+        };
+        merge(pull, &Value::Object(changes));
+        let changed = pull.clone();
+        content.updated.insert((repo.to_owned(), number), clock);
+        drop(content);
+        lock(&shared.content)
+            .pulls
+            .insert((repo.to_owned(), number), changed.clone());
+        Ok((StatusCode::OK, changed))
+    })
+    .await
+}
+
+/// A write's answer, meeting the next fault given, if any (see [`Fault`]): `apply` makes the
+/// write and gives its status and answer, or the answer of a write it refused.
+pub(super) async fn faulted(
+    shared: &Shared,
+    token: Option<&str>,
+    apply: impl FnOnce() -> Result<(StatusCode, Value), Response>,
+) -> Response {
     let fault = lock(&shared.writes).faults.pop_front();
     if let Some(Fault::Status(status)) = fault {
         let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -260,33 +408,25 @@ async fn create(shared: &Shared, repo: &str, body: &[u8], token: Option<&str>) -
     if let Some(Fault::Late(wait)) = fault {
         tokio::time::sleep(wait).await;
     }
-    let (number, made) = {
-        let mut content = lock(&shared.writes);
-        let author = content.author.clone();
-        let number = open(&mut content, &shared.account, repo, &pull, &author);
-        (number, content.opened[repo][&number].clone())
+    let (status, made) = match apply() {
+        Ok(made) => made,
+        Err(refused) => return refused,
     };
-    // Served by `GET /repos/{owner}/{repo}/pulls/{n}` from here on.
-    lock(&shared.content)
-        .pulls
-        .insert((repo.to_owned(), number), made.clone());
     match fault {
         Some(Fault::AppliedThen(status)) => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             error(status, "failed", token)
         }
         Some(Fault::AppliedThenClosed) => Response::builder()
-            .status(StatusCode::CREATED)
+            .status(status)
             .body(Body::new(Closed))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         Some(Fault::AppliedThenBrokenOff) => Response::builder()
-            .status(StatusCode::CREATED)
+            .status(status)
             .body(Body::new(BrokenOff::default()))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
-        Some(Fault::AppliedThenNotJson) => {
-            (StatusCode::CREATED, "<html>created</html>").into_response()
-        }
-        _ => (StatusCode::CREATED, made.to_string()).into_response(),
+        Some(Fault::AppliedThenNotJson) => (status, "<html>created</html>").into_response(),
+        _ => (status, made.to_string()).into_response(),
     }
 }
 
