@@ -606,6 +606,84 @@ fn the_drift_interval_defaults_to_five_minutes_and_is_5_to_900_seconds() {
     assert!(said.contains("not a valid deployment file"), "{said}");
 }
 
+/// `[reconciliation]` is optional, and each of its fields too: a pass every 60 s, a lease of
+/// 120 s and 5 attempts unless given, an interval of 5 to 3600 s, a lease of 10 to 3600 s and 1
+/// to 20 attempts; a value out of range is refused naming it, and so is a field the table does
+/// not have (#206).
+#[test]
+fn the_reconciliation_table_has_defaults_and_bounds_and_refuses_an_unknown_field() {
+    let loaded = files("reconciliation-default").load();
+    assert_eq!(loaded.reconciliation, gateway::ReconcileSettings::default());
+    assert_eq!(
+        (
+            loaded.reconciliation.interval,
+            loaded.reconciliation.lease,
+            loaded.reconciliation.attempts
+        ),
+        (Duration::from_secs(60), Duration::from_secs(120), 5)
+    );
+    let table = |fields: &str| format!("[reconciliation]\n{fields}\n[drift]\n");
+    let loaded = load_edited("reconciliation-empty", "[drift]\n", &table("")).unwrap();
+    assert_eq!(loaded.reconciliation, gateway::ReconcileSettings::default());
+    for (name, fields, interval, lease, attempts) in [
+        (
+            "lowest",
+            "interval_seconds = 5\nlease_seconds = 10\nattempts = 1\n",
+            5,
+            10,
+            1,
+        ),
+        (
+            "highest",
+            "interval_seconds = 3600\nlease_seconds = 3600\nattempts = 20\n",
+            3600,
+            3600,
+            20,
+        ),
+        ("lease-only", "lease_seconds = 300\n", 60, 300, 5),
+    ] {
+        let loaded = load_edited(
+            &format!("reconciliation-{name}"),
+            "[drift]\n",
+            &table(fields),
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.reconciliation,
+            gateway::ReconcileSettings {
+                interval: Duration::from_secs(interval),
+                lease: Duration::from_secs(lease),
+                attempts,
+            },
+            "{name}"
+        );
+    }
+    for (field, value, said) in [
+        ("interval_seconds", 4, "it must be from 5 to 3600"),
+        ("interval_seconds", 3601, "it must be from 5 to 3600"),
+        ("lease_seconds", 9, "it must be from 10 to 3600"),
+        ("lease_seconds", 3601, "it must be from 10 to 3600"),
+        ("attempts", 0, "it must be from 1 to 20"),
+        ("attempts", 21, "it must be from 1 to 20"),
+    ] {
+        let refusal = refused(
+            &format!("reconciliation-{field}-{value}"),
+            "[drift]\n",
+            &table(&format!("{field} = {value}\n")),
+        );
+        assert_eq!(
+            refusal,
+            format!("`reconciliation.{field}` is {value}; {said}")
+        );
+    }
+    let refusal = refused(
+        "reconciliation-unknown-field",
+        "[drift]\n",
+        &table("interval = 10\n"),
+    );
+    assert!(refusal.contains("not a valid deployment file"), "{refusal}");
+}
+
 #[test]
 fn keys_and_manifests_that_cannot_be_read_are_refused() {
     let files = files("unreadable");

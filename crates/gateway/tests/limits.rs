@@ -893,6 +893,51 @@ async fn a_proxied_servers_and_teams_quotas_refuse_with_a_row_and_nothing_sent()
     assert_eq!((other.shed_server, other.shed_team), (0, 0));
 }
 
+/// `start::prepare` holds each proxied server's bulkhead to the rate quotas `[limits]` sets
+/// (#217): with a server quota of one call, the second call to a server is refused with the
+/// server's quota sentence and not sent, while the other server, with a quota of its own, is
+/// still served.
+#[tokio::test]
+async fn the_deployment_files_quotas_reach_each_bulkhead() {
+    let slow = Scripted::answering().await;
+    let other = Scripted::answering().await;
+    let files = Files::new("quotas-from-file", &issuer().jwks_document(), &slow.url);
+    files.write(
+        "registry/registry.toml",
+        &registry_text(&slow.url, &other.url),
+    );
+    files.write(
+        "gateway.toml",
+        &deployment_file_probing(
+            "[audit]\nmode = \"disabled\"\n\n[limits]\nper_server_calls_per_minute = 1\n\
+             per_server_burst = 1\n",
+            &[SLOW, OTHER],
+        ),
+    );
+    let prepared = prepare(
+        files.load(),
+        InstanceName::new("test-instance"),
+        Arc::new(SystemClock),
+    )
+    .await
+    .unwrap();
+    let path = RequestPath::new(prepared.gates);
+
+    let first = call(&path, &token(TEAM_A_SA), SLOW_TOOL, json!({"n": "1"})).await;
+    assert!(is_ok(&first), "the first call was not served");
+    let second = call(&path, &token(TEAM_B_SA), SLOW_TOOL, json!({"n": "2"})).await;
+    assert_eq!(
+        refusal(&second),
+        gateway::server_over_quota(SLOW, SLOW_TOOL)
+    );
+    assert_eq!(slow.received(), 1, "the call over the quota was sent");
+    let elsewhere = call(&path, &token(TEAM_A_SA), OTHER_TOOL, json!({"n": "1"})).await;
+    assert!(is_ok(&elsewhere), "the other server was not served");
+    let counts = prepared.proxied.counts();
+    assert_eq!(counts[1].1.over_quota_server, 1);
+    assert_eq!(counts[0].1.over_quota_server, 0);
+}
+
 /// `[connectors.<name>]` for a connector the gateway does not run in its own process refuses
 /// the start. This registry declares no GitHub entry, so none is wired.
 #[tokio::test]

@@ -25,8 +25,9 @@
 //!   dropped: it is moved, as it is, to a task of its own on the runtime, which runs it to its
 //!   end and logs [`LATE_SIDE_EFFECT_EVENT`] with the outcome it came to. Reconciliation then
 //!   settles the receipt by the connector's lookup, or hands it to a person, as for any
-//!   `unknown` receipt. The task lives as long as the process: a gateway that stops while one
-//!   runs leaves its receipt `unknown` all the same.
+//!   `unknown` receipt, but not while the task runs: see [`LateCalls`]. A gateway shutting down
+//!   waits for the task within its grace period ([`LateCalls::wait`]); one that stops while
+//!   the task still runs leaves its receipt `unknown` all the same.
 //! - **A result over the size bound,** counted as the bytes of its JSON text, is discarded:
 //!   from a read, an error of the kind `oversized_or_late_read`, with [`TOO_LARGE`]; from any
 //!   other tool, `unknown`, with its receipt `unknown`, since the side effect ran and its
@@ -34,24 +35,52 @@
 //!   too: the reference is logged, and reconciliation finds it again. Only a result is bounded:
 //!   an error's message and a refusal's sentence are the connector's own.
 //!
-//! Nothing is cut short silently: each breach is logged, as [`BOUND_BREACHED_EVENT`] with its
-//! kind, `late` or `oversized`, and counted in [`InProcessSignals`], which
-//! [`crate::metrics`] exports.
+//! Nothing is cut short silently: each breach is logged once, as [`BOUND_BREACHED_EVENT`] with
+//! its kind, `late` or `oversized`, and the vendor's reference when a side effect's oversized
+//! result carried one, and counted in [`InProcessSignals`], which [`crate::metrics`] exports.
+//!
+//! **A late side effect holds its receipt.** Reconciliation looks a receipt up only under a
+//! lease ([`gateway_core::reconcile`]), and a lookup that finds nothing while the side effect is
+//! still on its way would settle the receipt `not_performed` though the call may yet act. So the
+//! late side effect's task holds the receipt's lease itself, through the store's
+//! [`ReceiptQueue::hold`], under a holder of this instance's own: once before the call is
+//! answered, while the receipt is still `pending` within its row's deadline and so not due on
+//! any instance; again every quarter of the lease while it runs; and once more when it ends. A
+//! held receipt is not due, so no instance, this one or another, claims it or looks it up while
+//! the task runs, and the first lookup comes at least a full lease after the side effect ended.
+//! The queue, holder and lease are those of the instance's reconciliation, which
+//! [`Gates::reconciler`](crate::Gates::reconciler) sets; an instance with no reconciliation
+//! holds nothing. A hold that is not written, because the store fails, the hold's
+//! [`HOLD_BUDGET`] runs out or another holder has the receipt, is logged as
+//! [`LATE_SIDE_EFFECT_UNHELD_EVENT`] and tried again [`HOLD_RETRY`] later, not a quarter of a
+//! lease later, and so on until one is written. Meanwhile this instance's own reconciliation
+//! still never claims the receipt: it skips every receipt whose late side effect runs here
+//! ([`LateCalls::runs`]). Another instance is kept off by the lease and, until the first hold
+//! is written, by the row's deadline: no receipt is due on any instance before its row's
+//! deadline has passed ([`ReceiptQueue`]), and that deadline includes the store's finish
+//! deadline, so a first hold that is not written has most of that to be written again, as a
+//! renewal that is not written has the rest of the lease. The guarantee across instances holds
+//! only while this one can write to the store: an instance cut off from the store past its
+//! row's deadline or its lease, or stopped, lets the receipt be looked up.
 //!
 //! Running a call needs a Tokio runtime, for the deadline's timer and the task a late side
 //! effect moves to.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use gateway_core::audit::AuditRowId;
 use gateway_core::{
-    BoxFuture, Classification, Connector, ConnectorName, ErrorKind, ToolCall, ToolName, ToolOutcome,
+    BoxFuture, Classification, Connector, ConnectorName, ErrorKind, LeaseHolder, ReceiptQueue,
+    ToolCall, ToolName, ToolOutcome, VendorReference,
 };
 use serde_json::Value;
+use tokio::sync::Notify;
 
 use crate::deployment::{MAX_SERVER_DEADLINE, MAX_SERVER_RESULT_BYTES};
 use crate::quota::{QuotaScope, Quotas, RateQuotas};
@@ -87,6 +116,24 @@ pub const LATE_SIDE_EFFECT_EVENT: &str = "in_process_late_side_effect_ended";
 /// The `event` field of the warning logged for each call refused by a rate quota.
 pub const OVER_QUOTA_EVENT: &str = "call_over_quota";
 
+/// The `event` field of the error logged when a late side effect's task could not hold its
+/// receipt's lease, with the `receipt`, and the `cause`: `store_failed`, `timed_out` or
+/// `not_held` (another holder has it, or it is settled or handed to a person). Logged once for
+/// each run of holds not written, at its first. Once the row's deadline or the last lease written
+/// has passed, and until a hold is written again, another instance may look the receipt up
+/// while the side effect may still act.
+pub const LATE_SIDE_EFFECT_UNHELD_EVENT: &str = "in_process_late_side_effect_unheld";
+
+/// How long one hold of a late side effect's receipt may take before it counts as not written.
+/// The first is made before the call is answered, so this bounds how much later than its
+/// deadline a late side effect is answered `unknown`.
+pub const HOLD_BUDGET: Duration = Duration::from_secs(2);
+
+/// How long a late side effect's task waits before trying again a hold of its receipt that was
+/// not written. Until one is, only the row's deadline keeps another instance off the receipt,
+/// so this is far shorter than the quarter of a lease between renewals.
+pub const HOLD_RETRY: Duration = Duration::from_secs(1);
+
 /// A connector in the gateway's own process's bounds on each call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InProcessLimits {
@@ -115,6 +162,184 @@ impl InProcessLimits {
     }
 }
 
+/// The side effects answered `unknown` at their deadline that still run on tasks of their own,
+/// for every connector in the gateway's own process, and how each holds its receipt's lease
+/// while it runs. See the [module documentation](self).
+#[derive(Default)]
+pub struct LateCalls {
+    holding: Mutex<Option<Holding>>,
+    running: AtomicUsize,
+    /// The receipt of each late side effect running, with how many run under it.
+    rows: Mutex<HashMap<AuditRowId, usize>>,
+    ended: Notify,
+}
+
+impl std::fmt::Debug for LateCalls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LateCalls")
+            .field("running", &self.running())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where and how a late side effect's task holds its receipt.
+#[derive(Clone)]
+struct Holding {
+    queue: Arc<dyn ReceiptQueue>,
+    holder: LeaseHolder,
+    lease: Duration,
+}
+
+impl LateCalls {
+    /// From here on, each late side effect holds its receipt in `queue`, under `holder`, for
+    /// `lease` at a time. [`Gates::reconciler`](crate::Gates::reconciler) calls this with its
+    /// own queue and lease.
+    pub fn hold_in(&self, queue: Arc<dyn ReceiptQueue>, holder: LeaseHolder, lease: Duration) {
+        *self.holding.lock().unwrap_or_else(PoisonError::into_inner) = Some(Holding {
+            queue,
+            holder,
+            lease,
+        });
+    }
+
+    /// How many late side effects still run.
+    pub fn running(&self) -> usize {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    /// Whether a late side effect whose receipt is `row` still runs in this process. This
+    /// instance's reconciliation never claims such a receipt, whether or not its lease is held.
+    pub fn runs(&self, row: &AuditRowId) -> bool {
+        self.rows
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(row)
+    }
+
+    /// Waits, at most `within`, for every late side effect to end, and returns how many still
+    /// run. Never cancels one: a gateway shutting down calls this within its grace period, and
+    /// one still running when the grace runs out leaves its receipt `unknown`.
+    pub async fn wait(&self, within: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let ended = self.ended.notified();
+            tokio::pin!(ended);
+            // Registered before the count is read, so an end in between is not missed.
+            ended.as_mut().enable();
+            let running = self.running();
+            if running == 0 {
+                return 0;
+            }
+            if tokio::time::timeout_at(deadline, ended).await.is_err() {
+                return self.running();
+            }
+        }
+    }
+
+    fn holding(&self) -> Option<Holding> {
+        self.holding
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Counts one late side effect, whose receipt is `row`, running until the returned guard
+    /// is dropped.
+    fn started(self: &Arc<Self>, row: &AuditRowId) -> Running {
+        *self
+            .rows
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(row.clone())
+            .or_default() += 1;
+        self.running.fetch_add(1, Ordering::SeqCst);
+        Running(Arc::clone(self), row.clone())
+    }
+}
+
+/// One late side effect running, counted until dropped, however its task ends.
+struct Running(Arc<LateCalls>, AuditRowId);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        {
+            let mut rows = self.0.rows.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(count) = rows.get_mut(&self.1) {
+                *count -= 1;
+                if *count == 0 {
+                    rows.remove(&self.1);
+                }
+            }
+        }
+        self.0.running.fetch_sub(1, Ordering::SeqCst);
+        self.0.ended.notify_waiters();
+    }
+}
+
+impl Holding {
+    /// Holds the receipt `row` for a lease, within [`HOLD_BUDGET`], and returns whether the
+    /// hold was written. A hold not written is logged when the last one, `held_before`, was
+    /// written, so a run of them is logged once.
+    async fn hold(
+        &self,
+        row: &AuditRowId,
+        connector: &ConnectorName,
+        tool: &ToolName,
+        held_before: bool,
+    ) -> bool {
+        let held =
+            tokio::time::timeout(HOLD_BUDGET, self.queue.hold(row, &self.holder, self.lease)).await;
+        let cause = match held {
+            Ok(Ok(true)) => return true,
+            Ok(Ok(false)) => "not_held",
+            Ok(Err(_)) => "store_failed",
+            Err(_) => "timed_out",
+        };
+        if !held_before {
+            return false;
+        }
+        tracing::error!(
+            event = LATE_SIDE_EFFECT_UNHELD_EVENT,
+            receipt = row.as_str(),
+            connector = connector.as_str(),
+            tool = tool.as_str(),
+            cause,
+            "a side effect answered unknown still runs, and its receipt's lease could not be \
+             held; another instance may look it up before it ends"
+        );
+        false
+    }
+
+    /// Runs `running` to its end, holding the receipt `row` again every quarter of the lease
+    /// meanwhile, and once more when it ends, so the first lookup waits a full lease after it.
+    /// `held` is whether the hold made before the call was answered was written. A hold not
+    /// written is tried again [`HOLD_RETRY`] later, until one is.
+    async fn while_running(
+        &self,
+        row: &AuditRowId,
+        connector: &ConnectorName,
+        tool: &ToolName,
+        held: bool,
+        running: Pin<Box<dyn Future<Output = ToolOutcome> + Send + 'static>>,
+    ) -> ToolOutcome {
+        let every = self.lease / 4;
+        let mut held = held;
+        let renewing = async {
+            loop {
+                tokio::time::sleep(if held { every } else { HOLD_RETRY }).await;
+                held = self.hold(row, connector, tool, held).await;
+            }
+        };
+        let outcome = tokio::select! {
+            biased;
+            outcome = running => outcome,
+            () = renewing => unreachable!("holding again never ends"),
+        };
+        self.hold(row, connector, tool, held).await;
+        outcome
+    }
+}
+
 /// A connector in the gateway's own process, behind its quotas, deadline and size bound. See
 /// the [module documentation](self).
 pub struct Bounded {
@@ -123,6 +348,7 @@ pub struct Bounded {
     limits: InProcessLimits,
     quotas: Quotas,
     signals: Arc<InProcessSignals>,
+    late: Arc<LateCalls>,
 }
 
 impl std::fmt::Debug for Bounded {
@@ -135,13 +361,15 @@ impl std::fmt::Debug for Bounded {
 }
 
 impl Bounded {
-    /// `inner`, the connector `name`, held to `limits` and `quotas`, counting in `signals`.
+    /// `inner`, the connector `name`, held to `limits` and `quotas`, counting in `signals`,
+    /// with its late side effects among `late`.
     pub fn new(
         name: ConnectorName,
         inner: Arc<dyn Connector>,
         limits: InProcessLimits,
         quotas: RateQuotas,
         signals: Arc<InProcessSignals>,
+        late: Arc<LateCalls>,
     ) -> Self {
         Self {
             name,
@@ -149,6 +377,7 @@ impl Bounded {
             limits,
             quotas: Quotas::new(quotas),
             signals,
+            late,
         }
     }
 
@@ -167,8 +396,15 @@ impl Bounded {
     }
 
     /// What a call past its bound is given: an error of the kind `oversized_or_late_read` with
-    /// `sentence` for a read, `unknown` for any other. Counted and logged.
-    fn breached(&self, breach: Breach, read: bool, tool: &ToolName) -> ToolOutcome {
+    /// `sentence` for a read, `unknown` for any other. Counted and logged once, with the
+    /// vendor's `reference` for a side effect the vendor confirmed.
+    fn breached(
+        &self,
+        breach: Breach,
+        read: bool,
+        tool: &ToolName,
+        reference: Option<&VendorReference>,
+    ) -> ToolOutcome {
         self.signals.breached(breach);
         let outcome = if read {
             ToolOutcome::error(ErrorKind::OversizedOrLateRead, breach.sentence())
@@ -183,7 +419,9 @@ impl Bounded {
             outcome = if read { "error" } else { "unknown" },
             deadline_ms = u64::try_from(self.limits.deadline.as_millis()).unwrap_or(u64::MAX),
             max_result_bytes = self.limits.max_result_bytes,
-            "a call to a connector in the gateway's own process went past its bound"
+            reference = reference.map(VendorReference::as_str),
+            "a call to a connector in the gateway's own process went past its bound; a vendor \
+             reference it confirmed is left to reconciliation"
         );
         outcome
     }
@@ -201,17 +439,11 @@ impl Bounded {
         if fits(result, self.limits.max_result_bytes) {
             return outcome;
         }
-        if let ToolOutcome::Completed(_, reference) = &outcome {
-            tracing::warn!(
-                event = BOUND_BREACHED_EVENT,
-                connector = self.name.as_str(),
-                tool = tool.as_str(),
-                reference = ?reference,
-                "a side effect the vendor confirmed gave a result over its bound; it is answered \
-                 unknown, and its reference is left to reconciliation"
-            );
-        }
-        self.breached(Breach::Oversized, read, tool)
+        let reference = match &outcome {
+            ToolOutcome::Completed(_, reference) => Some(reference),
+            _ => None,
+        };
+        self.breached(Breach::Oversized, read, tool, reference)
     }
 }
 
@@ -223,6 +455,7 @@ impl Connector for Bounded {
             return self.over_quota(scope, &tool);
         }
         let inner = Arc::clone(&self.inner);
+        let row = call.row().clone();
         // The connector's work owns what it uses, so a late side effect can be moved to a task
         // of its own and run to its end.
         let mut running: Pin<Box<dyn Future<Output = ToolOutcome> + Send + 'static>> =
@@ -238,11 +471,29 @@ impl Connector for Bounded {
             }
             if !read {
                 // A side effect is never cancelled once it may have been sent (decision 0009,
-                // "Where a call runs"): it runs to its end on a task of its own.
+                // "Where a call runs"): it runs to its end on a task of its own, holding its
+                // receipt so that no instance looks it up meanwhile. It is counted as running
+                // first, so this instance's reconciliation skips its receipt from here on. The
+                // first hold is made before the answer, while the receipt is still pending
+                // within its row's deadline and so not due anywhere.
                 let connector = self.name.clone();
                 let late_tool = tool.clone();
+                let counted = self.late.started(&row);
+                let holding = self.late.holding();
+                let held = match &holding {
+                    Some(holding) => holding.hold(&row, &connector, &late_tool, true).await,
+                    None => false,
+                };
                 runtime.spawn(async move {
-                    let outcome = running.await;
+                    let _counted = counted;
+                    let outcome = match &holding {
+                        Some(holding) => {
+                            holding
+                                .while_running(&row, &connector, &late_tool, held, running)
+                                .await
+                        }
+                        None => running.await,
+                    };
                     let reference = match &outcome {
                         ToolOutcome::Completed(_, reference) => Some(format!("{reference:?}")),
                         _ => None,
@@ -259,7 +510,7 @@ impl Connector for Bounded {
                 });
             }
             // A read's work is dropped here, which cancels it.
-            self.breached(Breach::Late, read, &tool)
+            self.breached(Breach::Late, read, &tool, None)
         })
     }
 }

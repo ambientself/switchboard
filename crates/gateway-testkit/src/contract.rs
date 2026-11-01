@@ -40,8 +40,11 @@
 //! lease can be claimed again; the number of attempts is bounded, and the last hands the
 //! receipt to a person, who finds it still `unknown`; an authoritative search that found
 //! nothing settles `not_performed`, and one that is not never does; a found effect settles
-//! `completed` with its reference; a lookup record is appended and never changed; and a
-//! receipt settled by reconciliation is not moved by a late finish.
+//! `completed` with its reference; a lookup record is appended and never changed; a receipt
+//! settled by reconciliation is not moved by a late finish, and a late finish that disagrees
+//! with it is counted, once; each claim is counted as an attempt; a receipt held for its
+//! call, `pending` or `unknown`, is not due and no one else can claim it until the hold ends;
+//! and a receipt answered `unknown` is not due, nor claimed, before its row's deadline.
 //!
 //! Some of what the in-memory store copies from Postgres cannot be tried here, and its own
 //! tests try it. A deadline whose interval is past what Postgres holds is refused, but from
@@ -140,6 +143,10 @@ pub trait ContractStore {
     /// in-memory store's clock moves past it, and Postgres's lease is set to have ended. For
     /// item 7's functions only.
     fn pass_lease(&self, row: &AuditRowId) -> impl Future<Output = ()>;
+
+    /// How many late finishes the store has counted as disagreeing with the state
+    /// reconciliation settled their receipt in. For item 7's functions only.
+    fn late_finish_disagreements(&self) -> u64;
 }
 
 /// The record a row holds.
@@ -2313,6 +2320,7 @@ pub async fn a_receipt_is_reserved_with_its_row_or_not_at_all(contract: &impl Co
             target: None,
             lookups: Vec::new(),
             handed_to_person: None,
+            claims: 0,
         }
     );
 
@@ -2907,8 +2915,16 @@ fn holder(name: &str) -> LeaseHolder {
 }
 
 /// A receipt in `unknown`: team A's proposal, whose connector reported `unknown`, finished
-/// within its deadline.
+/// within its deadline, with the deadline then passed, so it is due.
 async fn unknown_receipt(contract: &impl ContractStore) -> AuditRowId {
+    let row = unknown_within_deadline(contract).await;
+    contract.pass_deadline(&row).await;
+    row
+}
+
+/// A receipt in `unknown`: team A's proposal, whose connector reported `unknown`, finished
+/// within its deadline, which has not passed.
+async fn unknown_within_deadline(contract: &impl ContractStore) -> AuditRowId {
     let store = contract.store();
     let start = row_start();
     let guard = proposal_guard(store, &fixture(), &start, &proposal("p"), &fresh_key()).await;
@@ -2920,6 +2936,32 @@ async fn unknown_receipt(contract: &impl ContractStore) -> AuditRowId {
         ReceiptState::Unknown
     );
     start.row
+}
+
+/// A receipt the call answered `unknown` is not due before its row's deadline, on any
+/// instance (#217): its call may be a side effect still running whose hold of the lease is not
+/// written yet. No one claims it, and it is not listed. Once the deadline has passed it is due
+/// and claimed as any other.
+pub async fn an_unknown_receipt_is_not_due_before_its_rows_deadline(contract: &impl ContractStore) {
+    let row = unknown_within_deadline(contract).await;
+    let holder = holder("other");
+    assert!(
+        !is_due(contract, &row).await,
+        "an unknown receipt was due before its row's deadline"
+    );
+    assert_eq!(
+        contract
+            .queue()
+            .claim(&row, &holder, LEASE)
+            .await
+            .expect("a claim failed"),
+        None,
+        "an unknown receipt was claimed before its row's deadline"
+    );
+    assert_eq!(receipt_under(contract, &row).await.claims, 0);
+    contract.pass_deadline(&row).await;
+    assert!(is_due(contract, &row).await);
+    assert_eq!(claimed(contract, &row, &holder).await.claims, 1);
 }
 
 /// Whether the queue lists the receipt `row` as due.
@@ -2976,6 +3018,7 @@ pub async fn a_receipt_records_the_vendor_target_its_settlement_takes(
     );
     let ran = audit::run(&Answering::with(ToolOutcome::Unknown), guard).await;
     assert!(audit::finish(store, ran, 1).await.failure().is_none());
+    contract.pass_deadline(&start.row).await;
     let claimed = claimed(contract, &start.row, &holder("a")).await;
     assert_eq!(claimed.target, Some(document(TEAM_A_DOCUMENT)));
 
@@ -3337,7 +3380,8 @@ pub async fn a_lookup_record_is_append_only(contract: &impl ContractStore) {
 /// A receipt settled by reconciliation is not moved by a late finish: a call whose answer
 /// arrives after its row's deadline, by which time a lookup has settled its receipt, completes
 /// its row, and the receipt keeps the state, the establishment and the reference the lookup
-/// gave it, whatever the late finish reported.
+/// gave it, whatever the late finish reported. A late finish that settles the other state is
+/// counted as a disagreement, once; one that agrees, or reports `unknown`, is not.
 pub async fn a_receipt_settled_by_reconciliation_is_not_moved_by_a_late_finish(
     contract: &impl ContractStore,
 ) {
@@ -3351,6 +3395,7 @@ pub async fn a_receipt_settled_by_reconciliation_is_not_moved_by_a_late_finish(
                 reference: VendorReference::new("found-1"),
             },
             ReceiptState::Completed,
+            true,
         ),
         (
             ToolOutcome::Completed(json!({"draft": "d-2"}), VendorReference::new("d-2")),
@@ -3358,9 +3403,27 @@ pub async fn a_receipt_settled_by_reconciliation_is_not_moved_by_a_late_finish(
                 authoritative: true,
             },
             ReceiptState::NotPerformed,
+            true,
+        ),
+        (
+            ToolOutcome::Completed(json!({"draft": "d-3"}), VendorReference::new("d-3")),
+            LookupAnswer::Found {
+                reference: VendorReference::new("d-3"),
+            },
+            ReceiptState::Completed,
+            false,
+        ),
+        (
+            ToolOutcome::Unknown,
+            LookupAnswer::NotFound {
+                authoritative: true,
+            },
+            ReceiptState::NotPerformed,
+            false,
         ),
     ];
-    for (late, answer, settled) in cases {
+    for (late, answer, settled, disagrees) in cases {
+        let before = contract.late_finish_disagreements();
         let start = row_start();
         let guard = proposal_guard(store, &fixture, &start, &proposal("p"), &fresh_key()).await;
         let ran = audit::run(&Answering::with(late.clone()), guard).await;
@@ -3380,6 +3443,11 @@ pub async fn a_receipt_settled_by_reconciliation_is_not_moved_by_a_late_finish(
             stored(contract, &start.row).await.completion.is_some(),
             "{late:?}: the late finish was not written to the row"
         );
+        assert_eq!(
+            contract.late_finish_disagreements() - before,
+            u64::from(disagrees),
+            "{late:?} against {answer:?}"
+        );
         let receipt = receipt_under(contract, &start.row).await;
         assert_eq!(
             (
@@ -3391,4 +3459,176 @@ pub async fn a_receipt_settled_by_reconciliation_is_not_moved_by_a_late_finish(
             "{late:?}"
         );
     }
+}
+
+/// Each claim is counted on the receipt, in the claim's own write, as an attempt: the claim
+/// returns the receipt with its count, a claim that finds the receipt not due counts nothing,
+/// and the count stands whether or not a lookup was recorded under the claim. A receipt is
+/// reserved with none.
+pub async fn each_claim_is_counted_as_an_attempt(contract: &impl ContractStore) {
+    let row = unknown_receipt(contract).await;
+    assert_eq!(receipt_under(contract, &row).await.claims, 0);
+    let (first, second) = (holder("first"), holder("second"));
+    assert_eq!(claimed(contract, &row, &first).await.claims, 1);
+    assert_eq!(
+        contract
+            .queue()
+            .claim(&row, &second, LEASE)
+            .await
+            .expect("a claim failed"),
+        None
+    );
+    assert_eq!(
+        receipt_under(contract, &row).await.claims,
+        1,
+        "a claim that found the receipt held was counted"
+    );
+    // No lookup is recorded under the first claim, as when its save fails.
+    contract.pass_lease(&row).await;
+    let again = claimed(contract, &row, &second).await;
+    assert_eq!((again.claims, again.lookups.len()), (2, 0));
+    assert_eq!(
+        recorded(contract, &row, &second, LookupAnswer::Failed, ATTEMPTS).await,
+        Recorded::Left
+    );
+    contract.pass_lease(&row).await;
+    assert_eq!(claimed(contract, &row, &first).await.claims, 3);
+    assert_eq!(receipt_under(contract, &row).await.claims, 3);
+}
+
+/// A receipt held for its call is not due, and no one else claims it, while the hold lasts
+/// (#217). The call holds its receipt while it is `pending` within its row's deadline, before
+/// it is answered; the hold stands once the receipt is `unknown`, and again past the row's
+/// deadline; the holder holds it again as often as it likes; another holder cannot hold or
+/// claim it; and a hold counts no claim. Once the hold ends the receipt is due and claimed as
+/// any other, and then the call's holder cannot hold it. A receipt settled or handed to a
+/// person cannot be held.
+pub async fn a_receipt_held_for_its_call_is_not_due_and_no_one_else_claims_it(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let queue = contract.queue();
+    let (call, other) = (holder("call"), holder("other"));
+
+    // Held while pending within its deadline, then answered unknown.
+    let start = row_start();
+    let guard = proposal_guard(store, &fixture(), &start, &proposal("p"), &fresh_key()).await;
+    let row = start.row.clone();
+    assert!(
+        queue
+            .hold(&row, &call, LEASE)
+            .await
+            .expect("the hold failed")
+    );
+    let ran = audit::run(&Answering::with(ToolOutcome::Unknown), guard).await;
+    assert!(audit::finish(store, ran, 1).await.failure().is_none());
+    assert_eq!(
+        receipt_under(contract, &row).await.state,
+        ReceiptState::Unknown
+    );
+    assert!(!is_due(contract, &row).await, "a held receipt is due");
+    assert_eq!(
+        queue
+            .claim(&row, &other, LEASE)
+            .await
+            .expect("a claim failed"),
+        None,
+        "a receipt held for its call was claimed"
+    );
+    assert!(
+        !queue
+            .hold(&row, &other, LEASE)
+            .await
+            .expect("the hold failed"),
+        "another holder held a receipt held for its call"
+    );
+    assert!(
+        queue
+            .hold(&row, &call, LEASE)
+            .await
+            .expect("the hold failed"),
+        "the call could not hold its receipt again"
+    );
+    contract.pass_deadline(&row).await;
+    assert!(
+        queue
+            .hold(&row, &call, LEASE)
+            .await
+            .expect("the hold failed")
+    );
+    assert!(!is_due(contract, &row).await);
+    assert_eq!(
+        receipt_under(contract, &row).await.claims,
+        0,
+        "a hold was counted as a claim"
+    );
+
+    // Once the hold ends, the receipt is claimed as any other, and the call cannot hold it.
+    contract.pass_lease(&row).await;
+    assert!(
+        is_due(contract, &row).await,
+        "a receipt whose hold ended is not due"
+    );
+    assert_eq!(claimed(contract, &row, &other).await.claims, 1);
+    assert!(
+        !queue
+            .hold(&row, &call, LEASE)
+            .await
+            .expect("the hold failed"),
+        "the call held a receipt another holder claimed"
+    );
+
+    // A settled receipt, and one handed to a person, cannot be held.
+    let found = LookupAnswer::Found {
+        reference: VendorReference::new("draft-1"),
+    };
+    assert_eq!(
+        recorded(contract, &row, &other, found, ATTEMPTS).await,
+        Recorded::Settled(ReceiptState::Completed)
+    );
+    contract.pass_lease(&row).await;
+    assert!(
+        !queue
+            .hold(&row, &call, LEASE)
+            .await
+            .expect("the hold failed")
+    );
+    let handed = unknown_receipt(contract).await;
+    claimed(contract, &handed, &other).await;
+    queue
+        .hand_to_person(&handed, &other)
+        .await
+        .expect("the receipt was not handed off");
+    contract.pass_lease(&handed).await;
+    assert!(
+        !queue
+            .hold(&handed, &call, LEASE)
+            .await
+            .expect("the hold failed")
+    );
+    let unclaimed = unknown_receipt(contract).await;
+    let start = row_start();
+    let guard = proposal_guard(store, &fixture(), &start, &proposal("p"), &fresh_key()).await;
+    let ran = audit::run(
+        &Answering::with(ToolOutcome::Completed(
+            json!({"draft": "d-4"}),
+            VendorReference::new("d-4"),
+        )),
+        guard,
+    )
+    .await;
+    assert!(audit::finish(store, ran, 1).await.failure().is_none());
+    assert!(
+        !queue
+            .hold(&start.row, &call, LEASE)
+            .await
+            .expect("the hold failed"),
+        "a receipt its call settled was held"
+    );
+    assert!(
+        queue
+            .hold(&unclaimed, &call, LEASE)
+            .await
+            .expect("the hold failed")
+    );
 }

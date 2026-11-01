@@ -92,6 +92,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "exception",
         sql: include_str!("../sql/migrations/0012_exception.sql"),
     },
+    Migration {
+        version: 13,
+        name: "held_and_counted_claims",
+        sql: include_str!("../sql/migrations/0013_held_and_counted_claims.sql"),
+    },
 ];
 
 /// Any number, the same in every gateway: two migrators on one database take turns.

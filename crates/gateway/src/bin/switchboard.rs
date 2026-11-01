@@ -23,7 +23,10 @@
 //! capped as `[limits]` says (see [`gateway::deployment`] and [`gateway::bulkhead`]). Logs go
 //! to standard output as JSON lines; a refusal to start goes to standard error as well, as
 //! plain text. Shutting down waits for the answers still running, and for the audit store to
-//! complete the rows it is still writing, up to its finish deadline. With `[metrics]`,
+//! complete the rows it is still writing, up to its finish deadline. Within the same time it
+//! waits for the side effects answered `unknown` at their deadline that still run on tasks of
+//! their own (see [`gateway::bound`]), and never cancels one: one still running when that time
+//! is up leaves its receipt `unknown`, logged as `late_side_effects_left_running`. With `[metrics]`,
 //! `GET /metrics` is served on an address of its own (see [`gateway::metrics`]); it stops after
 //! the MCP listener, once those rows are done.
 //!
@@ -46,6 +49,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use audit_postgres::Budgets;
 use connector_proxy::ProbeFinding;
 use gateway::{
     Deployment, Metrics, Reconciler, TELEMETRY_QUEUE, Telemetry, Timeouts, probe, serve_metrics,
@@ -188,6 +192,7 @@ async fn serve(config: PathBuf) -> ExitCode {
     let reconciliation = prepared.reconciler.as_ref().map(Reconciler::signals);
     let grants = prepared.gates.grant_signals();
     let in_process = prepared.gates.in_process_signals();
+    let late = prepared.gates.late_calls();
     let resolver = prepared.gates.resolver().cloned();
     let metrics = metrics_listener.map(|listener| {
         let metrics = Metrics::new(telemetry.clone(), prepared.store.clone())
@@ -231,8 +236,25 @@ async fn serve(config: PathBuf) -> ExitCode {
     if let Some(reconciling) = reconciling {
         reconciling.abort();
     }
-    if let Some(store) = &prepared.store {
-        finish_rows(store).await;
+    // Within the time the rows are waited for, the grace period already counts: the side
+    // effects still running past their deadline are waited for, and never cancelled.
+    let within = prepared.store.as_ref().map_or_else(
+        || Budgets::default().shutdown_wait(),
+        |store| store.budgets().shutdown_wait(),
+    );
+    let rows = async {
+        if let Some(store) = &prepared.store {
+            finish_rows(store).await;
+        }
+    };
+    let ((), running) = tokio::join!(rows, late.wait(within));
+    if running > 0 {
+        tracing::error!(
+            event = "late_side_effects_left_running",
+            running,
+            "stopping with side effects answered unknown still running; their receipts stay \
+             unknown for reconciliation or a person"
+        );
     }
     // After the MCP listener, and after the rows it began are done, so the last of them can
     // still be read.

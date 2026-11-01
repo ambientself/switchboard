@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use gateway::path::RequestPath;
 use gateway::{
-    BootError, Config, InProcessLimits, InProcessSignals, Metrics, Rate, RateQuotas,
+    BootError, Config, InProcessLimits, InProcessSignals, LateCalls, Metrics, Rate, RateQuotas,
     TELEMETRY_QUEUE, Telemetry, Wiring, boot, server_over_quota, team_over_quota,
 };
 use gateway_core::audit::Outcome;
@@ -105,6 +105,7 @@ struct World {
     store: Arc<InMemoryAuditStore>,
     connector: Arc<Scripted>,
     signals: Arc<InProcessSignals>,
+    late: Arc<LateCalls>,
     path: RequestPath,
 }
 
@@ -127,6 +128,7 @@ impl World {
             store,
             connector,
             signals: gates.in_process_signals(),
+            late: gates.late_calls(),
             path: RequestPath::new(gates),
         })
     }
@@ -282,6 +284,42 @@ async fn a_late_side_effect_is_unknown_with_its_receipt_unknown_and_runs_to_its_
     assert_eq!(world.held_receipt(0), ReceiptState::Unknown);
     let counts = world.signals.counts();
     assert_eq!((counts.late, counts.oversized), (1, 0));
+}
+
+/// A gateway shutting down waits for a late side effect within its grace and never cancels it
+/// (#217): a wait shorter than the side effect returns with it still running, and it runs to
+/// its end all the same; a wait long enough returns once it has ended, and not before.
+#[tokio::test]
+async fn shutting_down_waits_for_a_late_side_effect_within_its_grace_and_never_cancels_it() {
+    let world = World::new(bounded(DEADLINE, 1024 * 1024));
+    assert_eq!(world.late.wait(Duration::ZERO).await, 0);
+    world.connector.script(Script::Late(DEADLINE * 5));
+    let body = world
+        .call(Caller::TeamA, SURFACE_ALL, DRAFT_TOOL, TEAM_A_DOCUMENT)
+        .await;
+    assert!(
+        tool_error(&body).contains("may have taken effect"),
+        "{body}"
+    );
+    assert_eq!(world.late.running(), 1);
+
+    // The grace runs out first: the side effect still runs, and is not cancelled.
+    assert_eq!(world.late.wait(DEADLINE).await, 1);
+    assert_eq!(world.connector.finished(), 0);
+    let waiting = std::time::Instant::now();
+    assert_eq!(world.late.wait(Duration::from_secs(10)).await, 0);
+    assert_eq!(
+        world.connector.finished(),
+        1,
+        "the wait returned before the side effect ended"
+    );
+    assert!(
+        waiting.elapsed() < Duration::from_secs(5),
+        "the wait went on after the side effect ended: {:?}",
+        waiting.elapsed()
+    );
+    assert_eq!(world.late.running(), 0);
+    assert_eq!(world.held_receipt(0), ReceiptState::Unknown);
 }
 
 /// A call that finishes within its deadline is answered as the connector answered it, and a

@@ -360,6 +360,12 @@ pub struct Receipt {
     /// When the receipt was handed to a person, by the store's clock, if it was. It stays
     /// `unknown` until a person settles it.
     pub handed_to_person: Option<SystemTime>,
+    /// How many times reconciliation has claimed it ([`ReceiptQueue::claim`](crate::ReceiptQueue::claim)),
+    /// this claim included when the receipt comes from one. Each claim counts as an attempt,
+    /// whether or not the lookup made under it was recorded, so a store that fails to save
+    /// lookups cannot let a receipt be looked up without bound.
+    #[serde(default)]
+    pub claims: u32,
 }
 
 impl Receipt {
@@ -442,7 +448,7 @@ impl ReceiptRequest {
     }
 
     /// The receipt this request reserves under `row`: `pending`, established by the call, with
-    /// no reference, no lookups and not handed to a person.
+    /// no reference, no lookups, no claims and not handed to a person.
     pub fn reserve(&self, row: &AuditRowId) -> Receipt {
         Receipt {
             row: row.clone(),
@@ -459,6 +465,7 @@ impl ReceiptRequest {
             target: self.target.clone(),
             lookups: Vec::new(),
             handed_to_person: None,
+            claims: 0,
         }
     }
 }

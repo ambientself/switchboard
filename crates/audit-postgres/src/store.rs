@@ -391,6 +391,7 @@ struct Counters {
     never_written: AtomicU64,
     begin_failures: BeginFailureCounters,
     answers_released: AtomicU64,
+    late_finish_disagreements: AtomicU64,
     begin_latency: LatencyCounter,
     finish_latency: LatencyCounter,
 }
@@ -555,6 +556,28 @@ pub struct GivenUp<'a> {
 
 /// What the store calls for each finish that gives up.
 type Report = Arc<dyn Fn(GivenUp<'_>) + Send + Sync>;
+
+/// A finish that completed its row after the row's deadline, by which time reconciliation had
+/// settled the row's receipt in another state than the finish's outcome settles it in: a lookup
+/// found the effect and the call reported that nothing took effect, or the other way about. The
+/// row is completed and the receipt left as it is. Decision 0009 ("What a receipt is") has the
+/// disagreement logged and counted.
+#[derive(Debug)]
+pub struct Disagreement<'a> {
+    /// The row finish completed, which is also its receipt's identifier.
+    pub row: &'a str,
+    /// The state the finish's outcome settles a receipt in: `completed` or `not_performed`.
+    pub finish: &'static str,
+    /// The state reconciliation settled the receipt in.
+    pub reconciliation: &'a str,
+}
+
+/// What the store calls for each late finish that disagrees with reconciliation.
+type DisagreementReport = Arc<dyn Fn(Disagreement<'_>) + Send + Sync>;
+
+/// The state of the receipt reserved under the row `$1`, if reconciliation settled it.
+const RECONCILED: &str = "SELECT state FROM switchboard_audit.receipts
+    WHERE row_id = ($1::text)::uuid AND established_by = 'reconciliation'";
 
 /// Counts one finish in flight until dropped.
 struct InFlight(Arc<Counters>);
@@ -789,6 +812,7 @@ pub struct PgAuditStore {
     pub(crate) cancel: Canceller,
     counters: Arc<Counters>,
     given_up: Report,
+    disagreed: DisagreementReport,
     /// Whether every begin from now on loses its confirmation after it commits, as the
     /// contract suite's runner tells it to.
     #[cfg(test)]
@@ -849,6 +873,7 @@ impl PgAuditStore {
             cancel,
             counters: Arc::default(),
             given_up: Arc::new(|_| {}),
+            disagreed: Arc::new(|_| {}),
             #[cfg(test)]
             lose_confirmations: AtomicBool::new(false),
         })
@@ -868,6 +893,22 @@ impl PgAuditStore {
     pub fn on_given_up(self, report: impl Fn(GivenUp<'_>) + Send + Sync + 'static) -> Self {
         Self {
             given_up: Arc::new(report),
+            ..self
+        }
+    }
+
+    /// The same store, calling `report` for each late finish that disagrees with the state
+    /// reconciliation settled its receipt in ([`Disagreement`]), once its row's completion has
+    /// committed, so the gateway can log it. Called on the finish's own task, so it must not
+    /// block. By default nothing is called, and the disagreement is only counted in
+    /// [`StoreStats::late_finish_disagreements`].
+    #[must_use]
+    pub fn on_late_finish_disagreeing(
+        self,
+        report: impl Fn(Disagreement<'_>) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            disagreed: Arc::new(report),
             ..self
         }
     }
@@ -899,6 +940,10 @@ impl PgAuditStore {
         StoreStats {
             begin_failures: self.counters.begin_failures.snapshot(),
             answers_released_before_finish: self.counters.answers_released.load(Ordering::SeqCst),
+            late_finish_disagreements: self
+                .counters
+                .late_finish_disagreements
+                .load(Ordering::SeqCst),
             finishes_given_up: self.counters.given_up.snapshot(),
             begins_never_committed: finishes.never_written,
             finishes_in_flight: finishes.in_flight,
@@ -1089,6 +1134,8 @@ impl PgAuditStore {
         let task = Retry {
             pool: self.finish.clone(),
             cancel: Arc::clone(&self.cancel),
+            counters: Arc::clone(&self.counters),
+            disagreed: Arc::clone(&self.disagreed),
             row: row.as_str().to_owned(),
             // As the core gives up a guard: an error of the kind `other`, which settles a
             // receipt the row reserved as `not_performed`, since nothing ran.
@@ -1132,6 +1179,7 @@ impl PgAuditStore {
             &FinishRow::from_completion(completion)?,
         )
         .await
+        .map(|_| ())
     }
 
     /// Finish with no vendor reference, for tests, which cannot make the core's completion for
@@ -1178,6 +1226,8 @@ impl PgAuditStore {
         let task = Retry {
             pool: self.finish.clone(),
             cancel: Arc::clone(&self.cancel),
+            counters: Arc::clone(&self.counters),
+            disagreed: Arc::clone(&self.disagreed),
             row: row.as_str().to_owned(),
             finish,
             attempt: self.budgets.answer,
@@ -1504,12 +1554,14 @@ async fn list_on(
     }
 }
 
-/// Writes the completion of `row` if it has none, and otherwise checks the one it has.
+/// Writes the completion of `row` if it has none, and otherwise checks the one it has. When it
+/// writes it after the row's deadline, and reconciliation settled the row's receipt in another
+/// state than the finish's outcome settles it in, the state reconciliation settled it in.
 async fn complete_on(
     client: &mut ClientWrapper,
     row: &str,
     finish: &FinishRow,
-) -> Result<(), PgAuditError> {
+) -> Result<Option<String>, PgAuditError> {
     match complete_in_transaction(client, row, finish).await {
         // The row's deadline passed between the settle's own test of it and the trigger's, by
         // the database's clock, and the trigger refused the move. Made again, the settle finds
@@ -1535,11 +1587,16 @@ async fn complete_on(
 /// a lost begin whose row and receipt commit after that read and before the update has its row
 /// completed here, and its receipt is seen by the settle. For a row with no receipt the settle
 /// matches nothing.
+///
+/// A settle that matches nothing for an outcome that settles a receipt `completed` or
+/// `not_performed` is checked against reconciliation: when reconciliation settled the receipt
+/// in the other state, that state is returned, once the completion has committed. A retried
+/// finish that finds its own completion returns nothing, so one disagreement is counted once.
 async fn complete_in_transaction(
     client: &mut ClientWrapper,
     row: &str,
     finish: &FinishRow,
-) -> Result<(), PgAuditError> {
+) -> Result<Option<String>, PgAuditError> {
     let transaction = client.transaction().await?;
     let statement = transaction.prepare_cached(ReceiptRow::STATE).await?;
     let reserved = transaction.query_opt(&statement, &[&row]).await?.is_some();
@@ -1596,11 +1653,21 @@ async fn complete_in_transaction(
     };
     if updated == 1 {
         let statement = transaction.prepare_cached(ReceiptRow::SETTLE).await?;
-        transaction
+        let settled = transaction
             .execute(&statement, &[&row, &finish.settles, &finish.reference])
             .await?;
+        let mut disagreement = None;
+        if settled == 0 && matches!(finish.settles, "completed" | "not_performed") {
+            let statement = transaction.prepare_cached(RECONCILED).await?;
+            if let Some(reconciled) = transaction.query_opt(&statement, &[&row]).await? {
+                let state: String = reconciled.try_get(0)?;
+                if state != finish.settles {
+                    disagreement = Some(state);
+                }
+            }
+        }
         transaction.commit().await?;
-        return Ok(());
+        return Ok(disagreement);
     }
     // Nothing matched: the row is missing, or already complete. A retried finish whose
     // first attempt was written finds its own completion, which is success. Nothing is written,
@@ -1624,7 +1691,7 @@ async fn complete_in_transaction(
                 latency_ms,
             ) =>
         {
-            Ok(())
+            Ok(None)
         }
         Some(_) => Err(PgAuditError::CompletedDifferently {
             row: row.to_owned(),
@@ -1650,6 +1717,10 @@ pub(crate) fn abandon(client: Object, cancel: &Canceller) {
 struct Retry {
     pool: Pool,
     cancel: Canceller,
+    /// Where a late finish that disagrees with reconciliation is counted.
+    counters: Arc<Counters>,
+    /// What is called for one, once its completion has committed.
+    disagreed: DisagreementReport,
     row: String,
     finish: FinishRow,
     attempt: Duration,
@@ -1722,7 +1793,18 @@ impl Retry {
                 drop(Object::take(client));
                 Err(error)
             }
-            Ok(completed) => completed,
+            Ok(Ok(Some(reconciliation))) => {
+                self.counters
+                    .late_finish_disagreements
+                    .fetch_add(1, Ordering::SeqCst);
+                (self.disagreed)(Disagreement {
+                    row: &self.row,
+                    finish: self.finish.settles,
+                    reconciliation: &reconciliation,
+                });
+                Ok(())
+            }
+            Ok(completed) => completed.map(|_| ()),
             Err(_) => {
                 abandon(client, &self.cancel);
                 Err(PgAuditError::AttemptTimedOut)

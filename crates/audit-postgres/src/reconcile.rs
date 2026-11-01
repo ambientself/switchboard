@@ -6,13 +6,17 @@
 //! for the connection to the answer; past it, the store asks the server to cancel what is
 //! running, and the statement fails. Every time is the database's.
 //!
-//! - [`due`](ReceiptQueue::due) reads the receipts that read as `unknown` (the state `unknown`,
-//!   or `pending` past the row's deadline), not handed to a person, whose lease is free, and
-//!   their lookups. It reads only.
-//! - [`claim`](ReceiptQueue::claim) sets a lease in one statement, committed when it returns,
-//!   and only on a receipt still due: of two claims at once, the second waits for the first's
-//!   row lock, finds the lease taken, and claims nothing. No lock or connection is held after
-//!   it returns, so none is held across a lookup.
+//! - [`due`](ReceiptQueue::due) reads the receipts whose row's deadline has passed that read as
+//!   `unknown` (the state `unknown`, or `pending`), not handed to a person, whose lease is free,
+//!   and their lookups. It reads only.
+//! - [`claim`](ReceiptQueue::claim) sets a lease and counts the claim in one statement,
+//!   committed when it returns, and only on a receipt still due: of two claims at once, the
+//!   second waits for the first's row lock, finds the lease taken, and claims nothing. No lock
+//!   or connection is held after it returns, so none is held across a lookup.
+//! - [`hold`](ReceiptQueue::hold) sets a lease for the call that reserved the receipt, in one
+//!   statement, on a receipt `pending` or `unknown` and not handed to a person whose lease is
+//!   free or already the holder's. Like a claim, it waits for another's row lock and then
+//!   judges the lease again.
 //! - [`record_lookup`](ReceiptQueue::record_lookup) appends the lookup and moves the receipt in
 //!   one transaction, holding the receipt's row lock from the check of the lease to the commit.
 //! - [`hand_to_person`](ReceiptQueue::hand_to_person) records the hand-off in one statement.
@@ -20,8 +24,9 @@
 //! The triggers hold the same rules for every role: `lookup_appends` appends a lookup only to a
 //! receipt in `unknown` not handed to a person, as the next attempt, and never lets one be
 //! changed or removed; `receipt_moves` lets reconciliation settle a receipt only on a lookup
-//! recorded on it that establishes the state, and writes a lease or a hand-off only on a
-//! receipt in `unknown` not yet handed to a person.
+//! recorded on it that establishes the state, writes a lease only on a receipt `pending` or
+//! `unknown` not yet handed to a person, writes a hand-off or a claim only on a receipt in
+//! `unknown` not yet handed to a person, and raises the count of claims by one at a time.
 
 use std::time::{Duration, SystemTime};
 
@@ -48,7 +53,7 @@ macro_rules! receipt_columns {
         "r.row_id::text, r.principal_issuer, r.principal_subject, r.delegation_scope,
          r.idempotency_key, r.tool, r.tool_use_id, r.digest, r.resources, r.resources_omitted,
          r.state, r.established_by, r.established_person, r.reference, r.target_system,
-         r.target_kind, r.target_identifier, r.handed_to_person_at"
+         r.target_kind, r.target_identifier, r.handed_to_person_at, r.claims"
     };
 }
 
@@ -60,14 +65,25 @@ macro_rules! reads_as_unknown {
     };
 }
 
-/// The receipts due, the longest reserved first: reading as `unknown`, not handed to a person,
-/// with a free lease. `$1` is the limit.
+/// A receipt's row's deadline has passed, by the database's clock: before it, a receipt the
+/// call answered `unknown` may still have its call running, a side effect whose first hold of
+/// the lease is not written yet. `c` is the row.
+macro_rules! past_deadline {
+    () => {
+        "c.deadline < clock_timestamp()"
+    };
+}
+
+/// The receipts due, the longest reserved first: past their row's deadline, reading as
+/// `unknown`, not handed to a person, with a free lease. `$1` is the limit.
 pub(crate) const DUE: &str = concat!(
     "SELECT ",
     receipt_columns!(),
     " FROM switchboard_audit.receipts r
          JOIN switchboard_audit.call_rows c ON c.id = r.row_id
      WHERE ",
+    past_deadline!(),
+    " AND ",
     reads_as_unknown!(),
     " AND r.handed_to_person_at IS NULL
          AND (r.lease_until IS NULL OR r.lease_until <= clock_timestamp())
@@ -76,19 +92,32 @@ pub(crate) const DUE: &str = concat!(
 );
 
 /// Claims the receipt `$1` for the holder `$2`, for `$3` microseconds from now, only while it
-/// is due. Returns the receipt, or no row.
+/// is due, and counts the claim. Returns the receipt, or no row.
 pub(crate) const CLAIM: &str = concat!(
     "UPDATE switchboard_audit.receipts r
          SET lease_holder = $2,
-             lease_until = clock_timestamp() + $3::bigint * interval '1 microsecond'
+             lease_until = clock_timestamp() + $3::bigint * interval '1 microsecond',
+             claims = r.claims + 1
      FROM switchboard_audit.call_rows c
      WHERE r.row_id = ($1::text)::uuid AND c.id = r.row_id AND ",
+    past_deadline!(),
+    " AND ",
     reads_as_unknown!(),
     " AND r.handed_to_person_at IS NULL
          AND (r.lease_until IS NULL OR r.lease_until <= clock_timestamp())
      RETURNING ",
     receipt_columns!()
 );
+
+/// Holds the receipt `$1` for the holder `$2`, for `$3` microseconds from now, for the call
+/// that reserved it: while it is `pending` or `unknown`, not handed to a person, and its lease
+/// is free or already `$2`'s. Counts no claim. Updates one row, or none.
+pub(crate) const HOLD: &str = "UPDATE switchboard_audit.receipts r
+    SET lease_holder = $2,
+        lease_until = clock_timestamp() + $3::bigint * interval '1 microsecond'
+    WHERE r.row_id = ($1::text)::uuid AND r.state IN ('pending', 'unknown')
+        AND r.handed_to_person_at IS NULL
+        AND (r.lease_until IS NULL OR r.lease_until <= clock_timestamp() OR r.lease_holder = $2)";
 
 /// The lookups of the receipts `$1`, by attempt.
 pub(crate) const LOOKUPS: &str = "SELECT row_id::text, result, authoritative, reference,
@@ -197,6 +226,8 @@ pub(crate) fn receipt_from(
         target,
         lookups,
         handed_to_person: row.try_get::<_, Option<SystemTime>>(17)?,
+        claims: u32::try_from(row.try_get::<_, i32>(18)?)
+            .map_err(unreadable("a receipt's count of claims"))?,
     })
 }
 
@@ -378,6 +409,25 @@ impl ReceiptQueue for PgAuditStore {
                 };
                 transaction.commit().await?;
                 Ok(recorded)
+            })
+            .await
+            .map_err(StoreError::from)
+        })
+    }
+
+    fn hold<'a>(
+        &'a self,
+        row: &'a AuditRowId,
+        holder: &'a LeaseHolder,
+        lease: Duration,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        Box::pin(async move {
+            let id = row_text(row);
+            let holder = holder.as_str();
+            let lease = micros(lease);
+            self.apart(async |client: &mut Object| {
+                // One statement, in a transaction of its own: committed when it answers.
+                Ok(client.execute(HOLD, &[&id, &holder, &lease]).await? == 1)
             })
             .await
             .map_err(StoreError::from)

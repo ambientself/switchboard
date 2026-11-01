@@ -105,7 +105,8 @@ pub use audit::DisabledAuditStore;
 pub use boot::{BootError, GateState, Gates, Settings, Wiring};
 pub use bound::{
     BOUND_BREACHED_EVENT, Bounded, DEFAULT_IN_PROCESS_DEADLINE, DEFAULT_IN_PROCESS_RESULT_BYTES,
-    InProcessCounts, InProcessLimits, InProcessSignals, LATE_SIDE_EFFECT_EVENT, OVER_QUOTA_EVENT,
+    HOLD_BUDGET, HOLD_RETRY, InProcessCounts, InProcessLimits, InProcessSignals,
+    LATE_SIDE_EFFECT_EVENT, LATE_SIDE_EFFECT_UNHELD_EVENT, LateCalls, OVER_QUOTA_EVENT,
 };
 pub use bulkhead::{
     Bulkhead, ProxiedSignals, ServerCounts, ServerSignals, server_at_capacity, team_at_capacity,
