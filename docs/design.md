@@ -185,7 +185,8 @@ Callers connect to `/mcp/{surface}`. Every `tools/call` goes through these steps
    verifier needs no profile. For Otto this is the turn grant: its version, key, canonical
    encoding, signature, audience, lifetime and, once required, pod are checked. The verifier
    does not deny. A delegation that cannot be verified is passed on as unverified, carrying the
-   kind of failure and, for a grant whose signature verified, its digest, and step 5 denies it
+   kind of failure and, for a binding that failed once its signature verified (the audience,
+   the lifetime or the pod), its digest, and step 5 denies it
    at check 3 with a single reason kind of its own. That holds under a profile that does not
    require a delegation too: check 3 denies any delegation that is present and unverified. A
    grant that verifies but names a team other than the proved team is denied at check 3 too,
@@ -502,8 +503,8 @@ of any tool not classified `read` also needs a current control plane
 
 **A delegation that does not verify is denied at check 3.** The delegation's verifier never
 denies. A delegation that fails one of its checks reaches the decision function as present and
-unverified, carrying which check failed and, only when its signature verified, its digest, and
-nothing from its claims. Which check failed is one of a closed set the core defines and an
+unverified, carrying which check failed and, only when its signature verified and a binding
+then failed (the audience, the lifetime or the pod), its digest, and nothing from its claims. Which check failed is one of a closed set the core defines and an
 adapter maps its own failures into: version, unknown key, retired key, encoding, signature,
 malformed, expired, not yet valid, lifetime over the ceiling, wrong audience and wrong pod. Check
 3 denies such a delegation whether or not the profile requires one, under the reason kind
@@ -1025,7 +1026,8 @@ as an argument, so a call path that skips the audit write does not compile.
 egress setting or currency answer. Those are kept in this gateway's record unless Otto adds
 columns ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). Grant verification
 failures are counted by kind: version, unknown key, retired key, encoding, signature, malformed,
-expired, not yet valid, lifetime over the ceiling, wrong audience and wrong pod. Also counted:
+expired, not yet valid, lifetime over the ceiling, wrong audience and wrong pod, each labelled
+with the name the row records (`lifetime_over_ceiling` for the ceiling). Also counted:
 accepted grants by key ID, which shows a rotation's progress, currency answers by result, and
 the resolver's latency and timeouts. The resolver's are exported on the metrics listener as
 `switchboard_resolver_answers_total{answer}`, every failure counted as `unconfirmed`,
@@ -2484,20 +2486,27 @@ before and after the network policy; the kind claim holds only while the evidenc
   the group order, no small-order point) before the claims are decoded, then canonical
   encoding, then the claims: `aud`, `iat` and `exp` with 30 seconds of leeway, the 15-minute
   ceiling, and `pod` and `egress` once the issuer requires them. A failure is one of section
-  11's kinds and, only once the signature verified, the grant's digest, and nothing from the
-  claims. The clock is passed in. The grant-key configuration refuses private key material, a
-  small-order or non-canonical key, a key twice or under two issuers, and a previous key with
-  no end instant; a previous key retires at its absolute end instant without a restart. The
-  tool mapping is one-to-one, read from a mapping file or from `conformance/baseline.json`, and
-  a name it lacks is dropped. A test minter is behind `test-support`.
+  11's kinds and, only for a binding's failure (the audience, the lifetime or the pod), the
+  grant's digest, and nothing from the claims: a signed grant refused for its encoding or its
+  claims' shape carries no digest. An integer claim is digits only, so `-0`, a fraction and an
+  exponent are refused as malformed. The clock is passed in. Strict verification is pinned by
+  a grant whose R is of small order, which only a lax verifier accepts. The grant-key
+  configuration refuses an empty or repeated issuer name, private key material, a key file that
+  is not one public key, a small-order or non-canonical key, a key twice or under two issuers,
+  and a previous key with no end instant; a previous key retires at its absolute end instant
+  without a restart. The tool mapping is one-to-one, read from a mapping file, from
+  `conformance/baseline.json` or as a member of the JSON configuration, where a name given
+  twice is refused rather than the last kept, and a name it lacks is dropped. A test minter is
+  behind `test-support`.
 - Built in the gateway (#22): grant keys read at boot from the deployment file's `[grants]`
   table, and the verifier run on every `tools/call` and `tools/list` that carries a grant,
   whatever the profile requires (section 7). A verified grant fills the row's delegation
   columns, and the pod UID is the caller's; a failure is recorded on the row denied at check 3,
   logged and counted as section 11 says (`switchboard_grant_failures_total{kind}`, and
   `switchboard_grants_accepted_total{key_id}`); an audience or pod failure is logged at
-  `ERROR` with its digest, a lifetime failure only counted, and nothing from a refused grant's
-  claims reaches the row, the answer or the log. The gates at boot and at snapshot load, and
+  `ERROR` with its digest, a lifetime failure only counted, any other failure logged at `WARN`
+  with no digest, and nothing from a refused grant's claims reaches the row, the answer or the
+  log. Each key-configuration refusal is reached through the gateway's boot. The gates at boot and at snapshot load, and
   CI's check that the release artifact refuses grant checking off: built (section 12). The
   tests run every group of decision 0012's except currency through the HTTP endpoint, with the
   test minter: replay, another deployment and pod, format and forgery, clock skew at the leeway
@@ -2744,8 +2753,8 @@ Otto promises. These findings inform Q9–Q13; they are not silent changes to th
     0013](decisions/0013-registry-freshness-drift-and-withdrawal.md) sets.
   - Failures. A grant that fails verification denied at check 3 as an unverified delegation,
     under one reason kind, with a deny row that records which check failed and no claims. An
-    audience or pod failure also recorded with the grant's digest; a bad signature recorded
-    with no digest. A lifetime failure counted by kind. A verifier that denies on its own, and
+    audience or pod failure also recorded with the grant's digest; a bad signature, and a
+    signed grant refused for its encoding or its claims, recorded with no digest. A lifetime failure counted by kind. A verifier that denies on its own, and
     a failure kind used as a reason kind, are mutations that must be caught.
   - Composition. A grant that lists a `write` tool no exception names, denied at check 5. Once
     decision 0011's exception exists, a grant that lists an excepted comment tool, allowed only
