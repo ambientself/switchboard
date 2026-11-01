@@ -654,6 +654,59 @@ mod tests {
         assert!(parse("github__other", &json!({})).is_none());
     }
 
+    /// Each tool states what its code gives: the search checks its own scope, every other read
+    /// reaches the repository its `owner` and `repo` name, and each is `read`. A reach-report
+    /// entry serves the report's tool alone, and any other entry every tool but that one.
+    #[test]
+    fn each_entry_serves_its_tools_as_their_code_states_them() {
+        let entry = |reports_reach: bool| gateway_registry::BuiltInEntry {
+            name: "github-read".into(),
+            system: crate::SYSTEM.into(),
+            permissions: Default::default(),
+            tools: Default::default(),
+            declaration: None,
+            reports_reach,
+            reach_report: None,
+        };
+        let ordinary = crate::served(&entry(false));
+        assert_eq!(ordinary.len(), definitions().len());
+        for tool in &ordinary {
+            let want = match tool.name.as_str() {
+                crate::search::SEARCH => StatedResources::ChecksOwnScope,
+                _ => repository_read().resources,
+            };
+            assert_eq!(tool.assurance.resources, want, "{}", tool.name);
+            assert_eq!(tool.assurance.classification, Classification::Read);
+            assert_ne!(
+                tool.name.as_str(),
+                crate::report::LIST_INSTALLATION_REPOSITORIES
+            );
+        }
+        let reporting = crate::served(&entry(true));
+        assert_eq!(reporting.len(), 1);
+        assert_eq!(
+            reporting[0].name.as_str(),
+            crate::report::LIST_INSTALLATION_REPOSITORIES
+        );
+        assert_eq!(
+            reporting[0].definition_sha256,
+            crate::report::definition().sha256()
+        );
+        assert_eq!(
+            reporting[0].assurance.resources,
+            StatedResources::NoResources
+        );
+        assert_eq!(
+            repository_read().resources,
+            StatedResources::FromArguments(vec![ResourceSource {
+                from_argument: "repo".into(),
+                qualified_by: Some("owner".into()),
+                system: "github".into(),
+                kind: "repository".into(),
+            }])
+        );
+    }
+
     #[test]
     fn each_definition_names_a_tool_this_connector_parses() {
         for definition in definitions()
