@@ -9,8 +9,9 @@
 //! refuses the call. A latency or a count past its column's range is refused the same way. So
 //! is a row over its bound, naming its largest column: [`MAX_BEGUN_ROW_BYTES`] for a call row
 //! at begin, and [`MAX_ROW_BYTES`] for a list row. At finish, a refusal's sentence holding
-//! U+0000 or longer than [`MAX_OUTCOME_SENTENCE_BYTES`] is refused, never cut: finish fails and
-//! gives up, and the row keeps no completion.
+//! U+0000 or longer than [`MAX_OUTCOME_SENTENCE_BYTES`], and a reach longer than
+//! [`MAX_REACHED_BYTES`], are refused, never cut: finish fails and gives up, and the row keeps
+//! no completion.
 //!
 //! The testkit's in-memory store refuses the same rows and completions with copies of these
 //! constants and of [`BeginRow::sizes`] and [`ListRow::sizes`] (`gateway_testkit::row_bound`).
@@ -19,8 +20,9 @@
 use std::time::Duration;
 
 use gateway_core::audit::{
-    AuditRecord, AuditRowId, Completion, DecisionKind, ErrorKind, ListRecord, Outcome,
-    RecordedDelegation, RecordedFailure, RecordedResources, RowKind,
+    AuditRecord, AuditRowId, Completion, DecisionKind, ErrorKind, ListRecord,
+    MAX_RECORDED_RESOURCES, Outcome, ReachedResources, RecordedDelegation, RecordedFailure,
+    RecordedResources, RowKind,
 };
 use gateway_core::receipt::ReceiptRequest;
 use gateway_core::{
@@ -40,9 +42,12 @@ use crate::store::{Budgets, PgAuditError};
 /// Finish cannot see the row begin wrote, so begin leaves room for the completion: it refuses a
 /// row over [`MAX_BEGUN_ROW_BYTES`], this bound less [`COMPLETION_RESERVE`], and finish refuses
 /// the one completion value that has no fixed size, the refusal sentence, when it is longer
-/// than [`MAX_OUTCOME_SENTENCE_BYTES`]. A list row is written complete and never completed, so
-/// list refuses one over this bound itself. Either refusal at begin or list names the row's
-/// largest column, and the call or the list is refused.
+/// than [`MAX_OUTCOME_SENTENCE_BYTES`]. An allowed call whose resources are `unknown`, one whose
+/// tool checks its own scope, may have them replaced at finish by the resources its tool
+/// reached (decision 0011), so begin counts that row's resources as [`MAX_REACHED_BYTES`], the
+/// most a reach may hold, and finish refuses a reach longer than that. A list row is written
+/// complete and never completed, so list refuses one over this bound itself. Either refusal at
+/// begin or list names the row's largest column, and the call or the list is refused.
 ///
 /// The values a caller chooses, and the ones it can make long, are capped before they reach a
 /// row, so in the largest row a call can begin they take at most 316,129 bytes, leaving 206,074
@@ -58,7 +63,9 @@ use crate::store::{Budgets, PgAuditError};
 ///   written as `{"reach": entry}`, and the entry is a connector name from the registry, which
 ///   has no cap of its own: an operator may name one long enough that the row is over the
 ///   bound, and begin then refuses it, naming `resources`. Nothing a caller chooses can make a
-///   reach that long.
+///   reach that long. An allowed call's `unknown` resources are counted as
+///   [`MAX_REACHED_BYTES`], the same 298,049, since finish may write what its tool reached in
+///   their place.
 /// - `proved_subject` and `proved_groups`: 16,384 together. Both come from one token, which is
 ///   at most 16 KiB (`gateway_identity::MAX_TOKEN_BYTES`), and decoding it only shortens them.
 /// - `sentence`: 1,046. The longest denial, a resource outside the caller's limit, is its
@@ -84,8 +91,9 @@ use crate::store::{Budgets, PgAuditError};
 /// gateway yet.
 ///
 /// So the largest row a call can make, begun at 522,203 bytes and finished with the longest
-/// completion finish writes, is at most 524,288 bytes. A denial is never completed, and an
-/// allowed call has no `reason` or `sentence`, so a finished row is in fact smaller.
+/// completion finish writes and the longest reach, is at most 524,288 bytes. A denial is never
+/// completed, and an allowed call has no `reason` or `sentence`, so a finished row is in fact
+/// smaller.
 pub const MAX_ROW_BYTES: usize = 512 * 1024;
 
 /// The most bytes finish writes in `outcome_sentence`. A longer refusal sentence is refused
@@ -126,8 +134,25 @@ pub const COMPLETION_RESERVE: usize =
     LONGEST_OUTCOME + LONGEST_ERROR_KIND + INTEGER_BYTES + MAX_OUTCOME_SENTENCE_BYTES;
 
 /// The most a call row may hold when begin writes it, in bytes: [`MAX_ROW_BYTES`] less
-/// [`COMPLETION_RESERVE`], 522,203, so the row stays within the bound once finished.
+/// [`COMPLETION_RESERVE`], 522,203, so the row stays within the bound once finished. An allowed
+/// call's `unknown` resources are counted as [`MAX_REACHED_BYTES`] towards it.
 pub const MAX_BEGUN_ROW_BYTES: usize = MAX_ROW_BYTES - COMPLETION_RESERVE;
+
+/// The most bytes finish writes in `resources` for a tool that checks its own scope, as
+/// [`MAX_ROW_BYTES`] counts them: the most named resources hold, 64 resources of 4,656 bytes
+/// each, 63 commas and 2 brackets, 298,049 in all. The core records a reach as begin records
+/// named resources, escaped and capped, so no reach it makes is longer. Begin counts an allowed
+/// call's `unknown` resources as this, since finish may write the reach in their place, and
+/// finish refuses a longer reach with [`PgAuditError::TooLong`], naming `resources` and this
+/// cap, rather than write a row over the bound.
+pub const MAX_REACHED_BYTES: usize =
+    MAX_RECORDED_RESOURCES * MAX_RECORDED_RESOURCE_BYTES + (MAX_RECORDED_RESOURCES - 1) + 2;
+
+/// The most bytes one recorded resource holds as JSON: a system and a kind of at most 128
+/// escaped characters and an identifier of at most 2,048, each cut with a 3-byte `…` and each
+/// character doubled at most by JSON's escaping, 261, 261 and 4,101 bytes with their quotes,
+/// and 33 for the keys, colons, commas and braces: 4,656.
+const MAX_RECORDED_RESOURCE_BYTES: usize = 2 * (2 + 2 * 128 + 3) + (2 + 2 * 2_048 + 3) + 33;
 
 /// The bytes of a text value, as the store sends it.
 fn text_bytes(text: &str) -> usize {
@@ -479,7 +504,8 @@ impl BeginRow {
         Ok(row)
     }
 
-    /// Each column and its bytes, as [`MAX_ROW_BYTES`] counts them.
+    /// Each column and its bytes, as [`MAX_ROW_BYTES`] counts them: an allowed call's
+    /// `unknown` resources as [`MAX_REACHED_BYTES`], which finish may write in their place.
     pub fn sizes(&self) -> [(&'static str, usize); 38] {
         let [
             pod,
@@ -501,7 +527,7 @@ impl BeginRow {
             ("tool", text_bytes(&self.tool)),
             ("connector", optional_bytes(self.connector.as_deref())),
             ("classification", optional_bytes(self.classification)),
-            ("resources", json_bytes(&self.resources)),
+            ("resources", self.resources_bytes()),
             ("resources_omitted", INTEGER_BYTES),
             ("decision", text_bytes(self.decision)),
             ("reason", optional_bytes(self.reason.as_deref())),
@@ -544,6 +570,19 @@ impl BeginRow {
             ),
             ("currency", optional_bytes(self.currency)),
         ]
+    }
+
+    /// The bytes `resources` is counted as: its JSON text, or, for an allowed call whose
+    /// resources are `unknown`, [`MAX_REACHED_BYTES`], the most the resources its tool reached
+    /// may hold when finish writes them in place of `unknown`. Only a tool that checks its own
+    /// scope is allowed with `unknown` resources, and a denial is never completed.
+    fn resources_bytes(&self) -> usize {
+        let held = json_bytes(&self.resources);
+        if self.decision == "allow" && self.resources.as_str() == Some("unknown") {
+            held.max(MAX_REACHED_BYTES)
+        } else {
+            held
+        }
     }
 
     /// The values for [`INSERT_ANSWERED`](Self::INSERT_ANSWERED), in order: this row's, and
@@ -978,6 +1017,9 @@ pub(crate) struct FinishRow {
     pub settles: &'static str,
     /// The vendor's reference for what the call made, for its receipt.
     pub reference: Option<String>,
+    /// The resources a tool that checks its own scope reached, and how many were left out,
+    /// written in place of the row's `unknown` ones by [`UPDATE_REACHED`](Self::UPDATE_REACHED).
+    pub reached: Option<(Value, i64)>,
 }
 
 impl FinishRow {
@@ -985,6 +1027,14 @@ impl FinishRow {
     /// already complete; [`SELECT`](Self::SELECT) then says which.
     pub const UPDATE: &'static str = "UPDATE switchboard_audit.call_rows
         SET outcome = $2, outcome_sentence = $3, error_kind = $4, latency_ms = $5
+        WHERE id = ($1::text)::uuid AND outcome IS NULL";
+
+    /// [`UPDATE`](Self::UPDATE), and the resources the call's tool reached in place of the
+    /// row's `unknown` ones (decision 0011). `complete_once` refuses it for a row begun with
+    /// any other resources.
+    pub const UPDATE_REACHED: &'static str = "UPDATE switchboard_audit.call_rows
+        SET outcome = $2, outcome_sentence = $3, error_kind = $4, latency_ms = $5,
+            resources = $6, resources_omitted = $7
         WHERE id = ($1::text)::uuid AND outcome IS NULL";
 
     /// The completion a row already has, read back with only the columns the gateway's role
@@ -995,7 +1045,8 @@ impl FinishRow {
     /// The columns for `completion`. Refuses a sentence holding U+0000, a sentence longer than
     /// [`MAX_OUTCOME_SENTENCE_BYTES`], and a latency past the column's range, rather than write
     /// another value than the completion's. So a completion written is never more than
-    /// [`COMPLETION_RESERVE`], the room begin left for it. Refuses a `duplicate`, which only
+    /// [`COMPLETION_RESERVE`], the room begin left for it; a reach is held to the room begin
+    /// left for it by [`with_reached`](Self::with_reached). Refuses a `duplicate`, which only
     /// begin writes, as the answer to a reused key.
     pub fn from_completion(completion: &Completion) -> Result<Self, PgAuditError> {
         let (outcome_sentence, error_kind) = match &completion.outcome {
@@ -1019,6 +1070,7 @@ impl FinishRow {
             latency_ms,
             settles,
             reference: None,
+            reached: None,
         })
     }
 
@@ -1032,8 +1084,37 @@ impl FinishRow {
         Ok(self)
     }
 
-    /// Each column and its bytes, as [`MAX_ROW_BYTES`] counts them. Finish need not count them:
-    /// [`COMPLETION_RESERVE`] is their most.
+    /// The same columns, with the resources the call's tool `reached`, written as begin writes
+    /// named resources. Refuses a reach longer than [`MAX_REACHED_BYTES`], the room begin left
+    /// for it in place of `unknown`, naming `resources` and the cap, rather than write a row over
+    /// the bound. The core caps a reach as it caps named resources, so none it makes is longer.
+    pub fn with_reached(
+        mut self,
+        reached: Option<&ReachedResources>,
+    ) -> Result<Self, PgAuditError> {
+        self.reached = reached
+            .map(|reached| {
+                let reach = resources_of(
+                    &RecordedResources::Named(reached.resources.clone()),
+                    reached.omitted,
+                )?;
+                let bytes = json_bytes(&reach.0);
+                if bytes > MAX_REACHED_BYTES {
+                    return Err(PgAuditError::TooLong {
+                        column: "resources",
+                        bytes,
+                        cap: MAX_REACHED_BYTES,
+                    });
+                }
+                Ok(reach)
+            })
+            .transpose()?;
+        Ok(self)
+    }
+
+    /// Each completion column and its bytes, as [`MAX_ROW_BYTES`] counts them. Finish need not
+    /// count them: [`COMPLETION_RESERVE`] is their most. A reach is held to
+    /// [`MAX_REACHED_BYTES`], which begin counted in place of `unknown`.
     #[cfg(test)]
     pub fn sizes(&self) -> [(&'static str, usize); 4] {
         [
@@ -1391,6 +1472,33 @@ pub(crate) fn largest_allowed_record(bytes: usize) -> AuditRecord {
     record.reason = None;
     record.sentence = None;
     padded(record, bytes)
+}
+
+/// The largest call row a tool that checks its own scope can begin: [`largest_allowed_record`]'s
+/// with `unknown` resources, which begin counts as [`MAX_REACHED_BYTES`], and `policy_revision`
+/// as long as it must be for the row to hold `bytes` as begin counts it.
+#[cfg(test)]
+pub(crate) fn largest_self_scoped_record(bytes: usize) -> AuditRecord {
+    let mut record = largest_denial();
+    record.decision = DecisionKind::Allow;
+    record.reason = None;
+    record.sentence = None;
+    record.resources = RecordedResources::Unknown;
+    record.resources_omitted = 0;
+    padded(record, bytes)
+}
+
+/// The longest reach the core can record: [`largest_record`]'s named resources, 64 of them,
+/// each value of backslashes at its cap, with one more left out.
+#[cfg(test)]
+pub(crate) fn largest_reach() -> ReachedResources {
+    match largest_denial().resources {
+        RecordedResources::Named(resources) => ReachedResources {
+            resources,
+            omitted: 1,
+        },
+        other => panic!("the largest denial names its resources, not {other:?}"),
+    }
 }
 
 /// `record` with `policy_revision` as long as it must be for its row to hold `bytes`.
@@ -2035,6 +2143,7 @@ mod tests {
         ] {
             assert!(sizes[column] <= most, "{column}: {}", sizes[column]);
         }
+        assert_eq!(sizes["resources"], MAX_REACHED_BYTES);
         let capped = 298_049 + 16_384 + 1_046 + 128 + 3 * 131 + 36 + 28 + 21 + 11 + 8 + 5 + 4 + 16;
         assert_eq!(capped, 316_129);
         assert_eq!(MAX_BEGUN_ROW_BYTES - capped, 206_074);
@@ -2117,6 +2226,103 @@ mod tests {
         assert!(held + longest <= MAX_ROW_BYTES);
     }
 
+    /// Decision 0011 and decision 0014, section 7: a row a tool that checks its own scope begins
+    /// with `unknown` resources is counted with room for the longest reach finish may write in
+    /// their place, so the largest such row begun, finished with the longest reach and the
+    /// longest completion, is within [`MAX_ROW_BYTES`]. A row a byte over begin's bound is
+    /// refused, naming `resources`. A denial's `unknown`, which is never completed, is counted
+    /// as written. Finish refuses a reach longer than [`MAX_REACHED_BYTES`], naming the column
+    /// and the cap.
+    #[test]
+    fn a_self_scoped_row_leaves_room_for_the_longest_reach() {
+        let begun = largest_self_scoped_record(MAX_BEGUN_ROW_BYTES);
+        let row = BeginRow::from_record(&AuditRowId::new(LARGEST_ID), &begun, &budgets())
+            .expect("a self-scoped row at begin's bound is begun");
+        let sizes: std::collections::BTreeMap<&str, usize> = row.sizes().into_iter().collect();
+        assert_eq!(sizes.values().sum::<usize>(), MAX_BEGUN_ROW_BYTES);
+        assert_eq!(sizes["resources"], MAX_REACHED_BYTES);
+        assert_eq!(row.resources, json!("unknown"));
+        let written = MAX_BEGUN_ROW_BYTES - MAX_REACHED_BYTES + "\"unknown\"".len();
+
+        let mut over = begun.clone();
+        over.policy_revision = format!("{}r", over.policy_revision).as_str().into();
+        match BeginRow::from_record(&AuditRowId::new(LARGEST_ID), &over, &budgets()) {
+            Err(PgAuditError::RowTooLarge {
+                column,
+                bytes,
+                bound,
+            }) => assert_eq!(
+                (column, bytes, bound),
+                ("resources", MAX_BEGUN_ROW_BYTES + 1, MAX_BEGUN_ROW_BYTES)
+            ),
+            other => panic!("{other:?}"),
+        }
+
+        // The longest reach, with the longest completion: a refusal with its sentence at the cap.
+        let finish = FinishRow::from_completion(&Completion {
+            outcome: Outcome::Refused {
+                sentence: "s".repeat(MAX_OUTCOME_SENTENCE_BYTES),
+            },
+            latency_ms: u64::from(u32::MAX),
+        })
+        .unwrap()
+        .with_reached(Some(&largest_reach()))
+        .expect("the longest reach is written");
+        let (reach, omitted) = finish.reached.as_ref().unwrap();
+        assert_eq!(*omitted, 1);
+        assert_eq!(json_bytes(reach), MAX_REACHED_BYTES);
+        assert_eq!(reach.to_string().len(), 298_049);
+        let completion: usize = finish.sizes().iter().map(|(_, bytes)| bytes).sum();
+        let finished = written - "\"unknown\"".len() + json_bytes(reach) + completion;
+        assert!(finished <= MAX_ROW_BYTES, "{finished}");
+        assert_eq!(finished, MAX_ROW_BYTES - (COMPLETION_RESERVE - completion));
+
+        // A denial's `unknown` is never replaced, so it is counted as written.
+        let mut denied = begun.clone();
+        denied.decision = DecisionKind::Deny;
+        denied.reason = Some(gateway_core::ReasonKind::ResourceOutsideLimit);
+        let row = BeginRow::from_record(&AuditRowId::new(LARGEST_ID), &denied, &budgets()).unwrap();
+        let sizes: std::collections::BTreeMap<&str, usize> = row.sizes().into_iter().collect();
+        assert_eq!(sizes["resources"], "\"unknown\"".len());
+
+        // A reach longer than the room begin left is refused, never cut.
+        let mut longer = largest_reach();
+        longer.resources.push(longer.resources[0].clone());
+        let bytes = MAX_REACHED_BYTES + 1 + 4_656;
+        for (reached, bytes) in [
+            (longer, bytes),
+            (
+                ReachedResources {
+                    resources: vec![gateway_core::audit::RecordedResource {
+                        system: "s".to_owned(),
+                        kind: "k".to_owned(),
+                        identifier: "i".repeat(MAX_REACHED_BYTES),
+                    }],
+                    omitted: 0,
+                },
+                MAX_REACHED_BYTES + r#"[{"system":"s","kind":"k","identifier":""}]"#.len(),
+            ),
+        ] {
+            match FinishRow::from_completion(&Completion {
+                outcome: Outcome::Ok,
+                latency_ms: 1,
+            })
+            .unwrap()
+            .with_reached(Some(&reached))
+            {
+                Err(PgAuditError::TooLong {
+                    column,
+                    bytes: refused,
+                    cap,
+                }) => assert_eq!(
+                    (column, refused, cap),
+                    ("resources", bytes, MAX_REACHED_BYTES)
+                ),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
     /// A refusal's sentence of [`MAX_OUTCOME_SENTENCE_BYTES`] is written whole, and one a byte
     /// longer is refused, naming the column and the cap, never cut: the row is exactly its
     /// record or it is not written. The cap counts bytes, not characters.
@@ -2187,7 +2393,10 @@ mod tests {
                 ..
             })
         ));
+        // Named resources, not `unknown`, which an allowed call's row counts as the longest
+        // reach and which would be its largest column.
         let mut record = allowed_workload();
+        record.resources = RecordedResources::Named(Vec::new());
         record.deployment = "d".repeat(MAX_ROW_BYTES / 2).as_str().into();
         record.profile = "p".repeat(MAX_ROW_BYTES / 2 + 1).as_str().into();
         assert!(matches!(
@@ -2238,6 +2447,21 @@ mod tests {
         assert_eq!(row_bound::MAX_ROW_BYTES, MAX_ROW_BYTES);
         assert_eq!(row_bound::MAX_BEGUN_ROW_BYTES, MAX_BEGUN_ROW_BYTES);
         assert_eq!(row_bound::COMPLETION_RESERVE, COMPLETION_RESERVE);
+        assert_eq!(row_bound::MAX_REACHED_BYTES, MAX_REACHED_BYTES);
+        let reach = FinishRow::from_completion(&Completion {
+            outcome: Outcome::Ok,
+            latency_ms: 1,
+        })
+        .unwrap()
+        .with_reached(Some(&largest_reach()))
+        .unwrap()
+        .reached
+        .unwrap()
+        .0;
+        assert_eq!(
+            row_bound::reached_bytes(&largest_reach()),
+            json_bytes(&reach)
+        );
         assert_eq!(
             row_bound::MAX_OUTCOME_SENTENCE_BYTES,
             MAX_OUTCOME_SENTENCE_BYTES
@@ -2249,6 +2473,9 @@ mod tests {
             mode: CredentialMode::PerUserGrant,
             principal: "per-user".into(),
         });
+        // `allowed_workload` is a self-scoped call's row, its resources `unknown`.
+        let mut denied_unknown = allowed_workload();
+        denied_unknown.decision = DecisionKind::Deny;
         let mut escaped = denied_user_with_delegation();
         escaped.resources = serde_json::from_value(json!({"named": [
             {"system": "s\"q", "kind": "k\\b", "identifier": "é\n\u{1}"}
@@ -2263,9 +2490,11 @@ mod tests {
             allowed_workload(),
             denied_unverified(),
             reach,
+            denied_unknown,
             escaped,
             largest_record(MAX_BEGUN_ROW_BYTES),
             largest_allowed_record(MAX_BEGUN_ROW_BYTES),
+            largest_self_scoped_record(MAX_BEGUN_ROW_BYTES),
         ] {
             let row = BeginRow::from_record(&id(), &record, &budgets()).unwrap();
             assert_eq!(
@@ -2573,6 +2802,7 @@ mod tests {
                 latency_ms: 7,
                 settles: "completed",
                 reference: None,
+                reached: None,
             }
         );
         assert_eq!(
@@ -2586,6 +2816,7 @@ mod tests {
                 latency_ms: 7,
                 settles: "not_performed",
                 reference: None,
+                reached: None,
             }
         );
         assert_eq!(
@@ -2599,6 +2830,7 @@ mod tests {
                 latency_ms: 7,
                 settles: "not_performed",
                 reference: None,
+                reached: None,
             }
         );
     }
@@ -2649,6 +2881,7 @@ mod tests {
             latency_ms: 4,
             settles: "not_performed",
             reference: None,
+            reached: None,
         };
         assert!(row.is("refused", Some("No."), None, Some(4)));
         assert!(!row.is("error", Some("No."), None, Some(4)));
@@ -2665,6 +2898,7 @@ mod tests {
             latency_ms: 4,
             settles: "not_performed",
             reference: None,
+            reached: None,
         };
         assert!(error.is("error", None, Some("vendor_refusal"), Some(4)));
         assert!(!error.is("error", None, Some("other"), Some(4)));

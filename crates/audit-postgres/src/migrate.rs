@@ -82,6 +82,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "delegation_and_currency",
         sql: include_str!("../sql/migrations/0010_delegation_and_currency.sql"),
     },
+    Migration {
+        version: 11,
+        name: "reached_resources",
+        sql: include_str!("../sql/migrations/0011_reached_resources.sql"),
+    },
 ];
 
 /// Any number, the same in every gateway: two migrators on one database take turns.

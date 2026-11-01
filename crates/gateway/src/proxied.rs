@@ -5,7 +5,8 @@
 //! upstream; a call whose tool was withdrawn meanwhile is outcome `refused`.
 
 use gateway_core::{
-    ApprovedTool, BoxFuture, Connector, ErrorKind, Resources, ToolCall, ToolOutcome,
+    ApprovedTool, BoxFuture, Connector, ErrorKind, ResourceDeclaration, Resources, ToolCall,
+    ToolOutcome,
 };
 use gateway_registry::ArgumentError;
 use serde_json::Value;
@@ -47,11 +48,18 @@ pub fn withdrawn_while_deciding(tool: &str) -> String {
 /// A tool with no adapter in that policy, or arguments that are not an object, name no
 /// resources: check 6 denies that for a tool that declares its resources, and it never
 /// guesses.
+///
+/// A tool declared `checks_own_scope`, which only a built-in tool may be, cannot say what a
+/// call reaches until it runs: its resources are `unknown`, and its row records what it
+/// reports it reached when it finishes (decision 0011).
 pub(crate) fn registry_resources(
     policy: &ServedPolicy,
     tool: &ApprovedTool,
     arguments: &Value,
 ) -> Resources {
+    if tool.resources == ResourceDeclaration::ChecksOwnScope {
+        return Resources::Unknown;
+    }
     match (policy.arguments(&tool.name), arguments.as_object()) {
         (Some(adapter), Some(arguments)) => adapter.resources(arguments),
         _ => Resources::Named(Vec::new()),

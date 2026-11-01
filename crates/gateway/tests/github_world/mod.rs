@@ -54,6 +54,8 @@ pub const SURFACE: &str = "github";
 pub const GET_FILE: &str = "github__get_file";
 pub const GET_PR: &str = "github__get_pr";
 pub const GET_ISSUE: &str = "github__get_issue";
+/// The search, which checks its own scope.
+pub const SEARCH: &str = "github__search";
 /// The permission set the entry states.
 pub const PERMISSIONS: &str = r#"{ contents = "read", issues = "read", pull_requests = "read" }"#;
 /// The GitHub connector entry of the newer reads, which ask for their own permission sets
@@ -144,11 +146,22 @@ impl Default for Options {
     }
 }
 
-/// The registry file at `revision`: one GitHub entry narrowed `narrowing`, serving the three
+/// The registry file at `revision`: one GitHub entry narrowed `narrowing`, serving the four
 /// tools on the surface `github` to team A and team B, each tool approved with its connector's
-/// own definition. Team A's limit holds atlas and borealis on the App's account and a
-/// repository of another organization; team B's holds cosmos.
+/// own definition, the search declared `checks_own_scope`. An entry narrowed per call cannot
+/// serve a tool that checks its own scope (decision 0011), so it serves the other three. Team
+/// A's limit holds atlas and borealis on the App's account and a repository of another
+/// organization; team B's holds cosmos. The newer reads are on an entry and a surface of their
+/// own ([`reads_text`]).
 pub fn registry_text(revision: &str, narrowing: &str, permissions: &str) -> String {
+    let served: Vec<String> = connector_github::definitions()
+        .into_iter()
+        .map(|definition| definition.name)
+        .filter(|tool| !READS.contains(tool))
+        .filter(|tool| narrowing != "call" || *tool != SEARCH)
+        .map(|tool| format!("\"{tool}\""))
+        .collect();
+    let tools = format!("tools = [{}]", served.join(", "));
     let head = format!(
         r#"revision = "{revision}"
 servers = []
@@ -158,14 +171,14 @@ tools = []
 name = "{ENTRY}"
 system = "github"
 permissions = {permissions}
-tools = ["{GET_FILE}", "{GET_ISSUE}", "{GET_PR}"]
+{tools}
 credential = {{ mode = "team_service_identity", principal = "switchboard-test-app" }}
 narrowing = "{narrowing}"
 permits = "read"
 
 [[surfaces]]
 name = "{SURFACE}"
-tools = ["{GET_FILE}", "{GET_ISSUE}", "{GET_PR}"]
+{tools}
 teams = ["team-a", "team-b"]
 principals = "any_in_teams_and_groups"
 
@@ -190,13 +203,7 @@ team-b = [{{ system = "github", kind = "repository", identifier = "{ACCOUNT}/cos
     );
     // The surface names the tools before they are approved, so the entry alone is loaded to
     // hash it.
-    let entry_only = head.replace(
-        &format!(
-            r#"tools = ["{GET_FILE}", "{GET_ISSUE}", "{GET_PR}"]
-teams"#
-        ),
-        "tools = []\nteams",
-    );
+    let entry_only = head.replace(&format!("{tools}\nteams"), "tools = []\nteams");
     // The newer reads on an entry and a surface of their own, after the first entry's
     // approvals.
     let reads = reads_text(narrowing);
@@ -212,7 +219,10 @@ teams"#
         .into_iter()
         .partition(|definition| READS.contains(&definition.name));
     let mut text = head;
-    for definition in first {
+    for definition in first
+        .into_iter()
+        .filter(|definition| served.contains(&format!("\"{}\"", definition.name)))
+    {
         text.push_str(&approval(&definition, ENTRY, &binding(ENTRY)));
     }
     text.push_str(&reads);
@@ -253,7 +263,7 @@ fn reads_list() -> String {
 }
 
 /// The `[[built_in_tools]]` approval of `definition` on `entry`, whose binding hashes to
-/// `binding`, declared from its `owner` and `repo`.
+/// `binding`, declared from its `owner` and `repo`, or, for the search, `checks_own_scope`.
 fn approval(definition: &connector_github::Definition, entry: &str, binding: &str) -> String {
     let schema = toml::Value::try_from(&definition.input_schema).unwrap();
     let mut approval = toml::Table::new();
@@ -269,11 +279,15 @@ fn approval(definition: &connector_github::Definition, entry: &str, binding: &st
     );
     approval.insert("definition_sha256".into(), definition.sha256().into());
     approval.insert("binding_sha256".into(), binding.into());
-    let resources: toml::Value = toml::from_str::<toml::Table>(
-        r#"r = { from_arguments = [{ from_argument = "repo", qualified_by = "owner", system = "github", kind = "repository" }] }"#,
-    )
-    .unwrap()["r"]
-        .clone();
+    let resources: toml::Value = if definition.name == SEARCH {
+        "checks_own_scope".into()
+    } else {
+        toml::from_str::<toml::Table>(
+            r#"r = { from_arguments = [{ from_argument = "repo", qualified_by = "owner", system = "github", kind = "repository" }] }"#,
+        )
+        .unwrap()["r"]
+            .clone()
+    };
     approval.insert("resources".into(), resources);
     let mut wrapper = toml::Table::new();
     wrapper.insert(

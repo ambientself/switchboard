@@ -37,13 +37,19 @@
 //! section 4). Its token is the key custodian's one installation-wide exception.
 //!
 //! [`tools`] has the first three read tools, `github__get_file`, `github__get_pr` and
-//! `github__get_issue`, and [`reads`] the other five this connector serves,
-//! `github__get_checks`, `github__get_job_log`, `github__list_releases`, `github__pr_template`
-//! and `github__repo_conventions`; [`definitions`] gives each one's definition, which its
-//! approval in the registry must hash to. Each bounds its result and tags it as external
-//! evidence, as Otto's gateway does. None checks its own scope: each is declared from its
-//! arguments, so its row records the repository it reached. The first three ask for their
-//! entry's whole permission set; the other five each ask for their own, within the entry's.
+//! `github__get_issue`, and [`reads`] five more, `github__get_checks`, `github__get_job_log`,
+//! `github__list_releases`, `github__pr_template` and `github__repo_conventions`;
+//! [`definitions`] gives each one's definition, which its approval in the registry must hash
+//! to. Each bounds its result and tags it as external evidence, as Otto's gateway does. None of
+//! these eight checks its own scope: each is declared from its arguments, so its row records the
+//! repository it reached. The first three ask for their entry's whole permission set; the other
+//! five each ask for their own, within the entry's.
+//!
+//! [`search`] has one more read tool, `github__search`, which is declared `checks_own_scope`
+//! (decision 0011): which repositories a search reaches is known only once GitHub answers. It
+//! builds its query as Otto's gateway does, withholds every result from a repository outside
+//! the caller's limit, and reports the repositories its results came from as the resources
+//! the call reached, which its row records when it finishes.
 //!
 //! GitHub's errors are told apart: a 404, which GitHub also answers for a repository the token
 //! cannot see; a 403, the kind `vendor_refusal`; and its rate limit. A token never appears in
@@ -62,6 +68,7 @@ mod connector;
 pub mod fake;
 pub mod reads;
 pub mod report;
+pub mod search;
 pub mod tools;
 
 pub use api::{ApiError, MAX_ANSWER_BYTES};

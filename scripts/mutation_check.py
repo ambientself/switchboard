@@ -1001,6 +1001,14 @@ mutate("finish-refusal-sentence-differs", "the refusal the caller reads is not t
 mutate("core-finish-error-kind-dropped", "finish records every error as other, whatever its kind", SRC + "audit.rs",
        "            (Outcome::Error { error_kind }, Answer::Error(message))",
        "            (Outcome::Error { error_kind: { let _ = error_kind; ErrorKind::Other } }, Answer::Error(message))")
+# What a tool that checks its own scope reached (decision 0011, #12): finish hands it to the store
+# in place of the row's unknown resources, and refuses it from any other tool. tests/audit_flow.rs
+# and the contract suite's reach functions catch these.
+mutate("core-reach-not-recorded", "what a self-scoped tool reached is not recorded, and its row stays unknown", SRC + "audit.rs",
+       "                reached = Some(reached_resources(&resources));\n",
+       "                let _ = reached_resources(&resources);\n")
+mutate("core-reach-accepted-from-unscoped-tool", "a tool not declared checks_own_scope may report what it reached", SRC + "audit.rs",
+       "            Reach::Recorded => {\n", "            Reach::Recorded | Reach::Refused => {\n")
 # A guard given up (decision 0009): its row is completed as error, of the kind other, never ok,
 # through the store.
 GIVE_UP_OUTCOME = "            outcome: Outcome::Error {\n                error_kind: ErrorKind::Other,\n            },\n            latency_ms: 0,"
@@ -1762,6 +1770,14 @@ mutate("fake-audit-fail-next-begin-ignored", "a begin told to fail does not", A,
        "            if state.begin_failing.take() {\n                return Err(down());\n            }\n            if state.list_rows",
        "            if false {\n                return Err(down());\n            }\n            if state.list_rows")
 mutate("fake-audit-fail-next-finish-ignored", "a finish told to fail does not", A, "            if state.finish_failing.take() {", "            if false {")
+# What a tool that checks its own scope reached (decision 0011): the contract suite's reach
+# functions catch these.
+mutate("fake-audit-reached-not-written", "the in-memory store completes a row and drops what its tool reached", A,
+       "                    row.resources = RecordedResources::Named(reached.resources.clone());\n",
+       "")
+mutate("fake-audit-reached-not-passed", "the in-memory store's finish does not pass on what was reached", A,
+       "                completion.reference(),\n                completion.reached(),\n",
+       "                completion.reference(),\n                None,\n")
 mutate("fake-audit-fail-next-is-fail-all", "a failure meant for the next call is never cleared", A,
        "            Failing::Next => {\n                *self = Failing::Never;\n                true\n            }", "            Failing::Next => true,")
 mutate("fake-audit-fail-all-is-fail-next", "a failure meant for every call is cleared after one", A,
@@ -1848,7 +1864,7 @@ mutate("testkit-unknown-resources-omitted-accepted", "the in-memory store writes
        "    if record.resources == RecordedResources::Unknown && record.resources_omitted != 0 {",
        "    if false {")
 mutate("testkit-completion-unchecked", "the in-memory store writes any completion", A,
-       "            refused_at_finish(completion.completion())?;\n", "")
+       "            refused_at_finish(completion.completion(), completion.reached())?;\n", "")
 mutate("testkit-allowance-wraps", "a call deadline near the largest wraps round to a short deadline", A,
        "        .saturating_add(call_deadline_ms)", "        .wrapping_add(call_deadline_ms)")
 mutate("testkit-allowance-rounds-up", "a budget is counted in part milliseconds, not whole ones as Postgres counts it", A,
@@ -1909,6 +1925,10 @@ mutate("testkit-row-bound-groups-uncounted", "the in-memory store leaves a user'
        "                groups.iter().map(|group| group.as_str().len()).sum::<usize>() * 0,")
 mutate("testkit-list-kind-uncounted", "the in-memory store leaves a list row's kind out of its size", ROW_BOUND,
        '        ("kind", kind(RowKind::List).len()),', '        ("kind", 0),')
+mutate("testkit-unknown-counted-as-written", "the in-memory store's begin leaves no room for a reach", ROW_BOUND,
+       "        held.max(MAX_REACHED_BYTES)\n", "        held\n")
+mutate("testkit-reach-uncapped", "the in-memory store writes a reach of any length at finish", ROW_BOUND,
+       "    if bytes > MAX_REACHED_BYTES {\n", "    if false {\n")
 
 # Receipts in the in-memory store (decision 0009, part 2), as its contract suite's item 6 and
 # the end-to-end reuse test check them.
@@ -4045,24 +4065,27 @@ PG = "crates/audit-postgres/"
 PG_SQL = PG + "sql/migrations/0001_call_rows.sql"
 # 0003 replaces set_times, so the mutations of its body edit 0003, not 0001.
 PG_ROW_DEADLINE = PG + "sql/migrations/0003_row_deadline.sql"
-# 0004 replaces complete_once and decision_shape, so the mutations of their bodies edit 0004.
+# 0004 replaces decision_shape, so the mutations of its body edit 0004.
 PG_LIST_ROWS = PG + "sql/migrations/0004_list_rows.sql"
+# 0004, 0006 and then 0011 replace complete_once, so the mutations of its body edit 0011's, the
+# one in force: an edit to an earlier body is undone by the next migration.
+PG_COMPLETE_ONCE = PG + "sql/migrations/0011_reached_resources.sql"
 PG_STORE = PG + "src/store.rs"
 PG_COLUMNS = PG + "src/columns.rs"
-mutate("pg-trigger-second-completion-allowed", "a completed row can be completed again", PG_LIST_ROWS,
+mutate("pg-trigger-second-completion-allowed", "a completed row can be completed again", PG_COMPLETE_ONCE,
        "    IF OLD.outcome IS NOT NULL THEN", "    IF false THEN")
-mutate("pg-trigger-denial-completed", "the trigger lets a denial be completed", PG_LIST_ROWS,
+mutate("pg-trigger-denial-completed", "the trigger lets a denial be completed", PG_COMPLETE_ONCE,
        "    IF OLD.decision IS DISTINCT FROM 'allow' THEN", "    IF false THEN")
-mutate("pg-trigger-empty-completion-allowed", "an update with no outcome passes the trigger", PG_LIST_ROWS,
+mutate("pg-trigger-empty-completion-allowed", "an update with no outcome passes the trigger", PG_COMPLETE_ONCE,
        "        RAISE EXCEPTION 'a completion of audit row % has no outcome', OLD.id;", "        NULL;")
-mutate("pg-trigger-other-columns-allowed", "a completion may change other columns", PG_LIST_ROWS,
+mutate("pg-trigger-other-columns-allowed", "a completion may change other columns", PG_COMPLETE_ONCE,
        "        RAISE EXCEPTION 'only the completion of audit row % may be written', OLD.id;", "        NULL;")
-mutate("pg-trigger-finished-at-not-set", "the database does not set the completion time", PG_LIST_ROWS,
+mutate("pg-trigger-finished-at-not-set", "the database does not set the completion time", PG_COMPLETE_ONCE,
        "    NEW.finished_at := clock_timestamp();\n", "")
 mutate("pg-trigger-not-created", "the write-once trigger is never attached", PG_SQL,
        "CREATE TRIGGER complete_once\n    BEFORE UPDATE ON switchboard_audit.call_rows\n"
        "    FOR EACH ROW EXECUTE FUNCTION switchboard_audit.complete_once();\n", "")
-mutate("pg-trigger-search-path-unpinned", "the write-once trigger looks names up in the session's search path", PG_LIST_ROWS,
+mutate("pg-trigger-search-path-unpinned", "the write-once trigger looks names up in the session's search path", PG_COMPLETE_ONCE,
        "    LANGUAGE plpgsql\n    SET search_path = pg_catalog\nAS $complete_once$", "    LANGUAGE plpgsql\nAS $complete_once$")
 mutate("pg-times-search-path-unpinned", "the trigger that sets the times looks names up in the session's search path", PG_ROW_DEADLINE,
        "    LANGUAGE plpgsql\n    SET search_path = pg_catalog\nAS $set_times$", "    LANGUAGE plpgsql\nAS $set_times$")
@@ -4153,7 +4176,8 @@ mutate("pg-finish-uses-begin-pool", "finish waits on the begin pool", PG_STORE,
        "            pool: self.finish.clone(),\n            cancel: Arc::clone(&self.cancel),\n            row: row.as_str().to_owned(),\n            finish,\n",
        "            pool: self.begin.clone(),\n            cancel: Arc::clone(&self.cancel),\n            row: row.as_str().to_owned(),\n            finish,\n")
 mutate("pg-finish-overwrites", "finish does not skip a completed row", PG_COLUMNS,
-       "WHERE id = ($1::text)::uuid AND outcome IS NULL", "WHERE id = ($1::text)::uuid")
+       "latency_ms = $5\n        WHERE id = ($1::text)::uuid AND outcome IS NULL",
+       "latency_ms = $5\n        WHERE id = ($1::text)::uuid")
 mutate("pg-finish-same-again-refused", "the same completion written again is an error", PG_STORE,
        "        Some(outcome)\n            if finish.is(\n",
        "        Some(outcome)\n            if false && finish.is(\n")
@@ -4234,6 +4258,15 @@ mutate("pg-columns-list-row-unbounded", "a list row over 512 KiB is sent to the 
 mutate("pg-columns-list-kind-uncounted", "a list row's kind, which its statement writes itself, is left out of its size", PG_COLUMNS,
        '            ("kind", text_bytes(kind(RowKind::List))),\n',
        '            ("kind", 0),\n')
+# A tool that checks its own scope (decision 0011, #12): begin counts an allowed row's unknown
+# resources as the longest reach finish may write in their place, and finish refuses a longer
+# reach. columns.rs's a_self_scoped_row_leaves_room_for_the_longest_reach, the contract suite's
+# a_call_row_over_begins_bound_is_refused_naming_its_largest_column and tests/store.rs's
+# the_largest_self_scoped_row_finished_with_the_longest_reach_is_within_the_bound catch these.
+mutate("pg-columns-unknown-counted-as-written", "begin leaves no room for a reach, so a self-scoped row may finish over 512 KiB", PG_COLUMNS,
+       "            held.max(MAX_REACHED_BYTES)\n", "            held\n")
+mutate("pg-columns-reach-uncapped", "finish writes a reach of any length", PG_COLUMNS,
+       "                if bytes > MAX_REACHED_BYTES {\n", "                if false {\n")
 mutate("pg-sql-resources-nullable", "a call row may record no resources at all", PG_LIST_ROWS,
        "                AND resources IS NOT NULL AND resources_omitted IS NOT NULL\n",
        "                AND resources_omitted IS NOT NULL\n")
@@ -4908,11 +4941,12 @@ mutate("pg-error-kind-shape-removed", "a row may have an error kind without an e
        "        coalesce(outcome = 'error', false) = (error_kind IS NOT NULL)\n", "        true\n")
 mutate("pg-error-kind-known-removed", "an error kind may be any text", PG_ERROR_KIND,
        "        'other', 'before-0006'\n    )),", "        'other', 'before-0006'\n    ) OR true),")
+# 0011 replaces complete_once again, so this edits both its bodies.
 mutate_all("pg-error-kind-not-in-complete-once", "complete_once refuses a completion that writes the error kind",
-           (PG_ERROR_KIND, "    IF to_jsonb(NEW) - ARRAY['outcome', 'outcome_sentence', 'error_kind', 'latency_ms',",
-            "    IF to_jsonb(NEW) - ARRAY['outcome', 'outcome_sentence', 'latency_ms',"),
-           (PG_ERROR_KIND, "       to_jsonb(OLD) - ARRAY['outcome', 'outcome_sentence', 'error_kind', 'latency_ms',",
-            "       to_jsonb(OLD) - ARRAY['outcome', 'outcome_sentence', 'latency_ms',"))
+           *[(path, f"    {side} - ARRAY['outcome', 'outcome_sentence', 'error_kind', 'latency_ms',",
+              f"    {side} - ARRAY['outcome', 'outcome_sentence', 'latency_ms',")
+             for path in (PG_ERROR_KIND, PG + "sql/migrations/0011_reached_resources.sql")
+             for side in ("IF to_jsonb(NEW)", "   to_jsonb(OLD)")])
 mutate("pg-error-kind-grant-missing", "the gateway's role cannot write the error kind", PG_ERROR_KIND,
        "GRANT UPDATE (error_kind) ON switchboard_audit.call_rows TO switchboard_gateway;\n", "")
 mutate("pg-error-kind-backfill-skipped", "error rows written before 0006 are not given a kind", PG_ERROR_KIND,
@@ -4979,6 +5013,23 @@ mutate("pg-columns-failure-digest-not-written", "a failure's digest is not writt
        "            delegation_digest: failure\n                .and_then(|_| None::<gateway_core::DelegationDigest>)\n")
 mutate("pg-check-misses-currency", "the boot check does not require the currency column", PG_CHECK,
        '    ("currency", "text"),\n];', "];")
+
+# Migration 0011: what a tool that checks its own scope reached replaces the row's unknown
+# resources in finish's own statement (decision 0011, #12). The schema test
+# a_completion_replaces_only_unknown_resources_with_what_was_reached and the contract suite's
+# reach functions catch these against Postgres; the boot check's own tests catch the grant
+# without a server.
+PG_REACHED = PG + "sql/migrations/0011_reached_resources.sql"
+mutate("pg-reached-not-written", "finish completes the row and drops what its tool reached", PG_STORE,
+       "    let updated = match &finish.reached {", "    let updated = match &None::<(serde_json::Value, i64)> {")
+mutate("pg-reached-repeat-overwrites", "finish writes what was reached over a completed row", PG_COLUMNS,
+       "resources_omitted = $7\n        WHERE id = ($1::text)::uuid AND outcome IS NULL",
+       "resources_omitted = $7\n        WHERE id = ($1::text)::uuid")
+mutate("pg-reached-replaces-named", "complete_once lets a completion replace named resources or a reach", PG_REACHED,
+       "            OLD.resources = '\"unknown\"'::jsonb AND jsonb_typeof(NEW.resources) = 'array',",
+       "            true,")
+mutate("pg-reached-grant-missing", "the gateway's role cannot write what a tool reached", PG_REACHED,
+       "GRANT UPDATE (resources, resources_omitted) ON switchboard_audit.call_rows TO switchboard_gateway;\n", "")
 
 # --- demo-checks ---------------------------------------------------------------------------
 # The demo's scripts and manifests in deploy/, watched by crates/demo-checks.
@@ -6477,9 +6528,10 @@ mutate("github-token-not-narrowed", "the token is asked for with no repositories
        "            repositories,\n            permissions: entry.permissions.clone(),",
        "            repositories: Vec::new(),\n            permissions: entry.permissions.clone(),")
 mutate("github-limit-not-held-to-the-organization", "a token is asked for the limit's repositories of other organizations too", GHC,
-       "                    .filter(|identifier| identifier.starts_with(&prefix))", "")
+       "            .filter(|identifier| identifier.starts_with(&prefix))\n", "")
 mutate("github-custodian-bypassed", "GitHub is sent a token the connector made up, not the custodian's", GHC,
-       "        self.read(&parsed, token.expose()).await", "        self.read(&parsed, request.team.as_str()).await")
+       "        self.read(&parsed, token.expose()).await",
+       "        self.read(&parsed, call.policy_revision().as_str()).await")
 mutate("github-credential-in-error", "a vendor error names the token it was read with", GHC,
        "            Answered::Json(value) => Ok(value),\n            other => Err(vendor_error(other, what, call)),",
        '            Answered::Json(value) => Ok(value),\n            other => Err(vendor_error(other, &format!("{what} {token}"), call)),')
@@ -6540,6 +6592,30 @@ mutate("github-reads-entry-unchecked", "an entry that serves a newer read withou
 mutate("gateway-job-log-hosts-dropped", "the deployment file's [github] job_log_hosts do not reach the connector",
        "crates/gateway/src/deployment.rs",
        "            job_log_hosts: self.job_log_hosts,", "            job_log_hosts: Vec::new(),")
+# github__search checks its own scope (decision 0011): its query is built as Otto's gateway builds
+# it, its results are held to the caller's limit, and a self-scoped built-in call is begun with
+# unknown resources so that what it reached replaces them. crates/gateway/tests/github_search.rs
+# and search.rs's own tests catch these.
+GHS = GH + "search.rs"
+mutate("github-search-limit-filter-removed", "a search returns results from repositories outside the caller's limit", GHS,
+       "        let Some(resource) = repository(item).and_then(|name| limit.get(&name).copied()) else {\n"
+       "            continue;\n        };\n",
+       "        let Some(name) = repository(item) else {\n            continue;\n        };\n"
+       "        let _ = limit;\n"
+       "        let resource = &Resource {\n            system: SYSTEM.into(),\n            kind: REPOSITORY.into(),\n"
+       "            identifier: name,\n        };\n")
+mutate("github-search-organization-not-appended", "a search's query is sent without the organization qualifier", GHS,
+       '    format!("({query}) org:{organization}")', '    format!("({query}) {}", { let _ = organization; "" })')
+mutate("github-search-query-not-parenthesised", "a search's query is sent as the caller wrote it, not in parentheses", GHS,
+       '    format!("({query}) org:{organization}")', '    format!("{query} org:{organization}")')
+mutate("github-search-unbalanced-accepted", "a query that opens a parenthesis it does not close is sent", GHS,
+       "    if depth != 0 {", "    if false {")
+mutate("github-search-other-account-sent", "a query naming another organization is sent", GHC,
+       "        if let Some(other) = search::other_account(&query, &self.organization) {",
+       "        if let Some(other) = None::<&str> {")
+mutate("gateway-self-scoped-begun-as-named", "a self-scoped built-in call is begun as naming nothing, so what it reached is not recorded",
+       "crates/gateway/src/proxied.rs",
+       "    if tool.resources == ResourceDeclaration::ChecksOwnScope {\n        return Resources::Unknown;\n    }\n", "")
 mutate("core-caller-limit-not-carried", "an allowed call's decision carries no limit to narrow its token to",
        "crates/gateway-core/src/decision.rs",
        "                .is_some_and(|entry| entry.narrowing == Narrowing::Limit) =>",

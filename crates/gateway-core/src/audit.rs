@@ -31,7 +31,9 @@
 //!   and `give_up` can make, and only then gives out the answer, including a connector's
 //!   refusal sentence. A side effect's receipt is settled in the same write, unless the row's
 //!   deadline has passed by the store's clock, when the row is completed and the receipt stays
-//!   `pending` for reconciliation or a person.
+//!   `pending` for reconciliation or a person. So are the resources a tool declared
+//!   `checks_own_scope` reports it reached, in place of the `unknown` its row was begun with
+//!   (decision 0011).
 //! - [`give_up`] consumes a guard instead of running it, calls no connector, and completes the
 //!   row as `error` with a latency of zero. It returns a [`GaveUp`], which holds no answer:
 //!   nothing ran, so the caller chooses its own reply.
@@ -70,7 +72,8 @@ use crate::names::{
     PolicyRevision, ProfileName, SessionId, SurfaceName, TeamId, ToolUseId, TurnId,
 };
 use crate::policy::{
-    ApprovedTool, ConnectorEntry, CredentialMode, PolicySnapshot, Resource, Resources,
+    ApprovedTool, ConnectorEntry, CredentialMode, PolicySnapshot, Resource, ResourceDeclaration,
+    Resources,
 };
 use crate::principal::{
     Delegation, DelegationDigest, DelegationFailure, Egress, PresentedDelegation, Principal,
@@ -126,6 +129,19 @@ pub enum RecordedResources {
     Reach(ConnectorName),
     /// The tool could not say which resources the call names until it ran.
     Unknown,
+}
+
+/// The resources a tool declared `checks_own_scope` reports it reached when it finishes, as its
+/// row records them in place of `unknown` (decision 0011): escaped, capped and counted as
+/// [`AuditRecord::resources`] records named ones. [`finish`] makes them from the tool's report
+/// and hands them to the store in the [`RowCompletion`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReachedResources {
+    /// The first [`MAX_RECORDED_RESOURCES`] distinct resources, in the order reported, each
+    /// escaped and capped. Empty when the tool reached nothing.
+    pub resources: Vec<RecordedResource>,
+    /// How many distinct resources were left out of `resources`.
+    pub omitted: usize,
 }
 
 /// The credential identity a row records: the configured identity of the tool's connector
@@ -353,6 +369,11 @@ pub struct AuditRecord {
     ///
     /// A tool declared as its connector entry's reach records the entry, as
     /// [`RecordedResources::Reach`], with nothing left out, whatever the decision.
+    ///
+    /// A tool declared `checks_own_scope` is begun with `unknown` resources, and they stay
+    /// `unknown` unless it reports what it reached when it finishes. The store then writes
+    /// those, [`ReachedResources`], here and in `resources_omitted`, in the same write as the
+    /// completion: the only change finish makes outside the completion (decision 0011).
     pub resources: RecordedResources,
     /// How many distinct named resources were left out of `resources`. Zero when none were.
     /// Repeats are not counted.
@@ -549,6 +570,13 @@ pub trait AuditStore: Send + Sync {
     /// time of the write: it stays `pending` for reconciliation or a person.
     /// An `unknown` outcome or a vendor reference for a row that reserved no receipt is
     /// refused, since a read reports neither, and so is a `duplicate`, which only begin writes.
+    ///
+    /// A completion that carries the resources its tool reached
+    /// ([`reached`](RowCompletion::reached)) writes them as the row's resources and their count
+    /// as its `resources_omitted`, in the same write, in place of `unknown`. It is refused, and
+    /// nothing is written, for a row whose resources are not `unknown`. A repeat is compared
+    /// as any other is, on the completion alone, not on what was reached: the Postgres store's
+    /// role cannot read what a call named, so no store compares it.
     fn finish<'a>(&'a self, completion: &'a RowCompletion)
     -> BoxFuture<'a, Result<(), StoreError>>;
 
@@ -591,6 +619,7 @@ pub struct RowCompletion {
     row: AuditRowId,
     completion: Completion,
     reference: Option<VendorReference>,
+    reached: Option<ReachedResources>,
 }
 
 impl RowCompletion {
@@ -608,6 +637,14 @@ impl RowCompletion {
     /// call that reserved a receipt and whose connector reported one, made safe and capped.
     pub fn reference(&self) -> Option<&VendorReference> {
         self.reference.as_ref()
+    }
+
+    /// The resources the call's tool reached, for its row's resources in place of `unknown`:
+    /// set only for a tool declared `checks_own_scope`, begun with `unknown` resources, that
+    /// reported them with its success (decision 0011). `None` leaves the resources as begin
+    /// wrote them.
+    pub fn reached(&self) -> Option<&ReachedResources> {
+        self.reached.as_ref()
     }
 }
 
@@ -975,6 +1012,13 @@ fn recorded(resources: &Resources, denied: Option<&Resource>) -> (RecordedResour
         Resources::Reach { entry, .. } => return (RecordedResources::Reach(entry.clone()), 0),
         Resources::Unknown => return (RecordedResources::Unknown, 0),
     };
+    let (recorded, omitted) = recorded_named(named, denied);
+    (RecordedResources::Named(recorded), omitted)
+}
+
+/// Named resources as a row records them, and how many distinct ones were left out: see
+/// [`recorded`].
+fn recorded_named(named: &[Resource], denied: Option<&Resource>) -> (Vec<RecordedResource>, usize) {
     let mut seen = BTreeSet::new();
     let distinct: Vec<&Resource> = named
         .iter()
@@ -1000,7 +1044,14 @@ fn recorded(resources: &Resources, denied: Option<&Resource>) -> (RecordedResour
             identifier: sentences::escape(&resource.identifier, MAX_RECORDED_IDENTIFIER),
         })
         .collect();
-    (RecordedResources::Named(recorded), omitted)
+    (recorded, omitted)
+}
+
+/// The resources a tool reported it reached, as its row records them: as [`recorded`] records
+/// the resources a call names.
+fn reached_resources(reached: &[Resource]) -> ReachedResources {
+    let (resources, omitted) = recorded_named(reached, None);
+    ReachedResources { resources, omitted }
 }
 
 /// The receipt to reserve for `call`, an allowed call of `tool`, which is not classified `read`:
@@ -1060,11 +1111,38 @@ pub struct Ran {
     row: AuditRowId,
     outcome: ToolOutcome,
     reserved: bool,
+    reach: Reach,
+}
+
+/// What a call's row does with the resources its tool reports it reached
+/// ([`ToolOutcome::Reached`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reach {
+    /// The tool is not declared `checks_own_scope`, so a report is a broken contract.
+    Refused,
+    /// The tool is declared `checks_own_scope` and its row was begun with `unknown` resources:
+    /// a report takes their place.
+    Recorded,
+    /// The tool is declared `checks_own_scope`, but the call named its resources before it ran,
+    /// and check 6 checked them. The row keeps them, and a report is not recorded.
+    Named,
+}
+
+impl Reach {
+    /// What a row does with the report of a call of `tool` that named `resources`.
+    fn of(tool: &ApprovedTool, resources: &Resources) -> Self {
+        match (tool.resources, resources) {
+            (ResourceDeclaration::ChecksOwnScope, Resources::Unknown) => Self::Recorded,
+            (ResourceDeclaration::ChecksOwnScope, _) => Self::Named,
+            _ => Self::Refused,
+        }
+    }
 }
 
 /// Runs the guarded call on `connector`, consuming the guard.
 pub async fn run(connector: &dyn Connector, guard: AuditGuard) -> Ran {
     let reserved = guard.reserved();
+    let reach = Reach::of(&guard.tool, &guard.call.resources);
     let AuditGuard {
         row,
         call,
@@ -1079,6 +1157,7 @@ pub async fn run(connector: &dyn Connector, guard: AuditGuard) -> Ran {
         row,
         outcome,
         reserved,
+        reach,
     }
 }
 
@@ -1101,6 +1180,7 @@ pub async fn run_unless(
     if guard.tool.classification != Classification::Read {
         return run(connector, guard).await;
     }
+    let reach = Reach::of(&guard.tool, &guard.call.resources);
     let AuditGuard {
         row,
         call,
@@ -1117,6 +1197,7 @@ pub async fn run_unless(
             row,
             outcome: cancelled(),
             reserved: false,
+            reach,
         };
     }
     let mut running = connector.run(ToolCall::new(call, tool, arguments, granted));
@@ -1133,6 +1214,7 @@ pub async fn run_unless(
         row,
         outcome,
         reserved: false,
+        reach,
     }
 }
 
@@ -1184,13 +1266,24 @@ impl Finished {
 ///
 /// A connector that reports [`ToolOutcome::Unknown`] for a `read` tool, which has no receipt,
 /// has its call recorded as an error of the kind `other`: a read never reports `unknown`.
+///
+/// A tool declared `checks_own_scope` that reports the resources it reached
+/// ([`ToolOutcome::Reached`]) has them recorded in place of the `unknown` its row was begun
+/// with, escaped, capped and counted as begin records named resources, in the same write as
+/// the completion, `ok`. A call that named its resources before it ran keeps those. A tool not
+/// declared `checks_own_scope` may not report what it reached: its connector broke its
+/// contract, so nothing of the report is recorded and the result is withheld. The call is
+/// recorded as an error of the kind `other`, or, for a side effect, which may have taken
+/// effect, as `unknown`.
 pub async fn finish(store: &dyn AuditStore, ran: Ran, latency_ms: u64) -> Finished {
     let Ran {
         row,
         outcome,
         reserved,
+        reach,
     } = ran;
     let mut reference = None;
+    let mut reached = None;
     let (recorded, answer) = match outcome {
         ToolOutcome::Ok(result) => (Outcome::Ok, Answer::Ok(result)),
         ToolOutcome::Completed(result, made) => {
@@ -1216,6 +1309,23 @@ pub async fn finish(store: &dyn AuditStore, ran: Ran, latency_ms: u64) -> Finish
             },
             Answer::Refused(sentence),
         ),
+        ToolOutcome::Reached(result, resources) => match reach {
+            Reach::Recorded => {
+                reached = Some(reached_resources(&resources));
+                (Outcome::Ok, Answer::Ok(result))
+            }
+            Reach::Named => (Outcome::Ok, Answer::Ok(result)),
+            Reach::Refused if reserved => (
+                Outcome::Unknown,
+                Answer::Unknown(sentences::render_unknown(&row)),
+            ),
+            Reach::Refused => (
+                Outcome::Error {
+                    error_kind: ErrorKind::Other,
+                },
+                Answer::Error(sentences::REACH_FROM_UNSCOPED_TOOL.to_owned()),
+            ),
+        },
     };
     let completion = RowCompletion {
         row,
@@ -1224,6 +1334,7 @@ pub async fn finish(store: &dyn AuditStore, ran: Ran, latency_ms: u64) -> Finish
             latency_ms,
         },
         reference,
+        reached,
     };
     match store.finish(&completion).await {
         Ok(()) => Finished {
@@ -1283,6 +1394,7 @@ pub async fn give_up(store: &dyn AuditStore, guard: AuditGuard) -> GaveUp {
             latency_ms: 0,
         },
         reference: None,
+        reached: None,
     };
     let failure = store
         .finish(&completion)

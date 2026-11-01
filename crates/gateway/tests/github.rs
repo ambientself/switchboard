@@ -590,10 +590,11 @@ async fn a_github_table_with_no_github_entry_refuses_the_start() {
         let end = text.find("[[surfaces]]").unwrap();
         let mut text = format!("{}{}", &text[..start], &text[end..]);
         text.truncate(text.find("\n[[built_in_tools]]").unwrap());
-        let text = text.replace(
-            &format!("tools = [\"{GET_FILE}\", \"{GET_ISSUE}\", \"{GET_PR}\"]\nteams"),
-            "tools = []\nteams",
-        );
+        // The surface serves none of the tools, whichever the connector has.
+        let surface = text.find("[[surfaces]]").unwrap();
+        let from = surface + text[surface..].find("tools = [").unwrap();
+        let to = from + text[from..].find(']').unwrap() + 1;
+        text.replace_range(from..to, "tools = []");
         std::fs::write(dir.join("registry.toml"), text).unwrap();
     });
     match prepared(deployment).await {

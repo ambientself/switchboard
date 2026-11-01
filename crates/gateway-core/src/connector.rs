@@ -133,6 +133,14 @@ pub enum ToolOutcome {
     /// read never reports it: from a `read` tool it is recorded as an error of the kind
     /// `other`.
     Unknown,
+    /// A tool declared `checks_own_scope` succeeded: its result, for the caller, and the
+    /// resources it reached, which its row records when it finishes, in place of the `unknown`
+    /// it was begun with (decision 0011). Recorded as `ok`. An empty list says the tool reached
+    /// nothing, and the row records it as an empty list, not as `unknown`. Only such a tool may
+    /// report what it reached: from any other tool this is a broken contract, recorded as an
+    /// `error` of the kind `other` with the result withheld, or, from a side effect, as
+    /// `unknown` (see [`audit::finish`](crate::audit::finish)).
+    Reached(serde_json::Value, Vec<Resource>),
 }
 
 impl ToolOutcome {

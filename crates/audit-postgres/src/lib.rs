@@ -36,7 +36,9 @@
 //!   and their count, and none of a call's columns. For the answer to a reused key it inserts
 //!   the row complete, with its outcome, sentence, latency and the earlier receipt a
 //!   `duplicate` names.
-//! - It updates only the completion columns: outcome, its sentence, and latency.
+//! - It updates only the completion columns: outcome, its sentence, and latency; and, for a
+//!   row begun with unknown resources, the resources its tool reached, which replace them in
+//!   the same statement (decision 0011, migration 0011).
 //! - It selects only the identifier, the decision, the completion, the kind and the deadline.
 //!   It cannot read who called what on `call_rows`, and it cannot delete.
 //! - It selects from the view `open_call_rows`, which shows each open row's identifier,
@@ -56,7 +58,8 @@
 //!
 //! And for every role, through four triggers: both times and the deadline come from the
 //! database's clock, whatever an insert or a completion carries; a row is completed at most
-//! once, a denial or a list row is never completed, and a completion writes nothing else; a
+//! once, a denial or a list row is never completed, and a completion writes nothing else but,
+//! on a row begun with unknown resources, a list of the resources reached in their place; a
 //! receipt moves only as the core's `may_move` allows, judging its row's deadline by the
 //! database's clock as it writes, is settled by reconciliation only on a lookup recorded on it
 //! that establishes the state, and has its lease and hand-off written only while it is in
@@ -93,7 +96,8 @@ mod tests;
 
 pub use check::{BootCheckError, Problem};
 pub use columns::{
-    COMPLETION_RESERVE, MAX_BEGUN_ROW_BYTES, MAX_OUTCOME_SENTENCE_BYTES, MAX_ROW_BYTES,
+    COMPLETION_RESERVE, MAX_BEGUN_ROW_BYTES, MAX_OUTCOME_SENTENCE_BYTES, MAX_REACHED_BYTES,
+    MAX_ROW_BYTES,
 };
 pub use migrate::{
     GATEWAY_ROLE, MIGRATIONS, MigrateError, Migration, OWNER_ROLE, ROLES, SCHEMA, migrate,
