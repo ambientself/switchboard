@@ -679,7 +679,10 @@ impl PolicySnapshot {
     /// settlement, and a `read` tool that declares one (decision 0009, "Reconciliation"). Then
     /// it refuses a tool `declared` as the reach whose connector has no entry, which a snapshot
     /// with no entries at all could otherwise hold: there would be no reach for its calls to
-    /// name. Last, it checks each profile's exceptions, as [`check_exceptions`] says.
+    /// name. Last, it checks each profile's exceptions (decision 0011, section 9): it refuses
+    /// an exception that names no tool, two of one profile's exceptions with one name or one
+    /// tool, a list on a profile that does not require currency, and a tool named that is not
+    /// approved, not classified `write`, or settled by a person.
     pub fn new(data: SnapshotData) -> Result<Self, SnapshotError> {
         let mut tools = BTreeMap::new();
         for tool in data.tools {
