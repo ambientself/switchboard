@@ -1978,8 +1978,9 @@ impl AuditStore for Changing<'_> {
 /// (migration 0010), and writes nothing for them, so a test here fails if the core ever writes
 /// one: a failure beside anything from the delegation's claims, a digest with a failure that is
 /// not a binding's, a failure on a row check 3 did not deny for it, a denial at check 3 with no
-/// failure, and a verified delegation without its team or person, on a call row, on one begun
-/// with a receipt, or on a list row. What the core writes itself, it accepts.
+/// failure, and a verified delegation without its team or person or with an epoch past a
+/// `bigint`, on a call row, on one begun with a receipt, or on a list row. What the core writes
+/// itself, it accepts.
 #[test]
 fn the_test_store_refuses_the_delegation_shapes_the_other_stores_refuse() {
     let digest = DelegationDigest::of(b"a grant as presented");
@@ -2050,6 +2051,14 @@ fn the_test_store_refuses_the_delegation_shapes_the_other_stores_refuse() {
             claimed_acting_person: None,
             ..allowed_row.clone()
         },
+        // An epoch past a bigint.
+        AuditRecord {
+            delegation: verified.clone().map(|delegation| RecordedDelegation {
+                epoch: u64::MAX,
+                ..delegation
+            }),
+            ..allowed_row.clone()
+        },
     ];
     for record in &cannot_hold {
         let store = MemoryStore::default();
@@ -2094,7 +2103,8 @@ fn the_test_store_refuses_the_delegation_shapes_the_other_stores_refuse() {
         assert!(store.receipts().is_empty());
     }
 
-    // A list row with a verified delegation without its team or its person.
+    // A list row with a verified delegation without its team or its person, or with an epoch
+    // past a bigint.
     let caller = call("fixture__read").caller;
     let _ = common::ready(audit::listed(
         &written,
@@ -2114,6 +2124,16 @@ fn the_test_store_refuses_the_delegation_shapes_the_other_stores_refuse() {
         },
         ListRecord {
             claimed_acting_person: None,
+            ..listed.clone()
+        },
+        ListRecord {
+            delegation: listed
+                .delegation
+                .clone()
+                .map(|delegation| RecordedDelegation {
+                    epoch: u64::MAX,
+                    ..delegation
+                }),
             ..listed.clone()
         },
     ] {

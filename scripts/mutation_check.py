@@ -934,12 +934,14 @@ mutate("core-store-check-3-without-failure", "the core's test store writes a den
        "        return if at_check_3 {\n            Err(violates(\"delegation_failure_shape\"))\n        } else {\n            Ok(())\n        };",
        "        return Ok(());")
 mutate("core-store-delegation-without-team", "the core's test store records a verified delegation without its team or person", CORE_STORE,
-       "    if delegation && !(team && person) {", "    if false {")
+       "    if !(team && person) {", "    if false {")
+mutate("core-store-epoch-past-bigint", "the core's test store records a delegation's epoch past a Postgres bigint", CORE_STORE,
+       "    if i64::try_from(delegation.epoch).is_err() {", "    if false {")
 mutate("core-store-receipt-begin-unchecked", "the core's test store's begin with a receipt writes any delegation shape", CORE_STORE,
        "        refused_shape(record)?;\n", "")
 mutate("core-store-list-unchecked", "the core's test store writes a list row with a verified delegation without its team or person", CORE_STORE,
-       "        } else if let Err(refused) = refused_delegation(\n            record.delegation.is_some(),",
-       "        } else if let Err(refused) = refused_delegation(\n            false,")
+       "        } else if let Err(refused) = refused_delegation(\n            record.delegation.as_ref(),",
+       "        } else if let Err(refused) = refused_delegation(\n            None,")
 mutate("outcome-ok-renamed", "the Ok outcome is written as `success`", SRC + "audit.rs",
        "    Ok,\n    /// The ", "    #[serde(rename = \"success\")]\n    Ok,\n    /// The ")
 mutate("outcome-error-renamed", "the Error outcome is written as `failed`", SRC + "audit.rs",

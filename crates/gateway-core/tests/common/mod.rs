@@ -12,8 +12,8 @@ use std::task::{Context, Poll, Waker};
 
 use gateway_core::ReasonKind;
 use gateway_core::audit::{
-    AuditRowId, DecisionKind, ListRecord, Outcome, RecordedResources, RowCompletion, RowStart,
-    StoreError,
+    AuditRowId, DecisionKind, ListRecord, Outcome, RecordedDelegation, RecordedResources,
+    RowCompletion, RowStart, StoreError,
 };
 use gateway_core::receipt::{EstablishedBy, ReceiptRequest, Reservation, may_move};
 use gateway_core::{
@@ -334,7 +334,7 @@ impl AuditStore for MemoryStore {
         let result = if self.fail_begin {
             Err("the store is down".into())
         } else if let Err(refused) = refused_delegation(
-            record.delegation.is_some(),
+            record.delegation.as_ref(),
             record.proved_delegation_team.is_some(),
             record.claimed_acting_person.is_some(),
         ) {
@@ -354,13 +354,14 @@ impl AuditStore for MemoryStore {
 
 /// Why the Postgres store would refuse a call record's delegation columns, if it would, as its
 /// table's constraints say (migration 0010) and the testkit's store holds them: a verified
-/// delegation is written with its team and its person (`delegation_shape`); a failure exactly on
+/// delegation is written with its team and its person (`delegation_shape`), and an epoch a
+/// `bigint` holds; a failure exactly on
 /// a row check 3 denied for a delegation that did not verify (`delegation_failure_shape`),
 /// beside nothing from the delegation's claims (`delegation_failure_unclaimed`), and with a
 /// digest only for a binding's failure (`delegation_digest_shape`).
 pub fn refused_shape(record: &AuditRecord) -> Result<(), StoreError> {
     refused_delegation(
-        record.delegation.is_some(),
+        record.delegation.as_ref(),
         record.proved_delegation_team.is_some(),
         record.claimed_acting_person.is_some(),
     )?;
@@ -388,10 +389,20 @@ pub fn refused_shape(record: &AuditRecord) -> Result<(), StoreError> {
 }
 
 /// Why the Postgres store would refuse a verified delegation, on a call row or a list row: one
-/// is written with its team and its person (`delegation_shape`).
-fn refused_delegation(delegation: bool, team: bool, person: bool) -> Result<(), StoreError> {
-    if delegation && !(team && person) {
+/// is written with its team and its person (`delegation_shape`), and its epoch is a `bigint`.
+fn refused_delegation(
+    delegation: Option<&RecordedDelegation>,
+    team: bool,
+    person: bool,
+) -> Result<(), StoreError> {
+    let Some(delegation) = delegation else {
+        return Ok(());
+    };
+    if !(team && person) {
         return Err(violates("delegation_shape"));
+    }
+    if i64::try_from(delegation.epoch).is_err() {
+        return Err("a delegation's epoch is past what a Postgres bigint holds".into());
     }
     Ok(())
 }
