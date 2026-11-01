@@ -1111,14 +1111,16 @@ receipt.
   effect settles the receipt `completed` with the vendor's reference; anything else is recorded
   and leaves it `unknown`. It reads through a credential narrowed to the receipt's team, vendor
   target and resources, which comes with the built-in connectors (#12). Every instance works
-  the queue of receipts in `unknown`, the state `unknown` or `pending` past its row's deadline,
-  with no separate deployment: it claims a receipt by setting a short lease, committed before
+  the queue of receipts in `unknown`, the state `unknown` or `pending`, once its row's deadline
+  has passed, with no separate deployment: it claims a receipt by setting a short lease,
+  committed before
   any lookup is made, so no lock or connection is held across one, and records each lookup on
   the receipt, appended and never changed. Each claim is counted on the receipt in the claim's
   own write, and counts as an attempt whether or not the lookup made under it was recorded, so
   a store that fails to save lookups still lets a receipt be looked up at most the number of
   attempts (migration 0012). A receipt with nothing to look in, or whose connector has no
-  lookup, goes to a person at once; one whose attempts are used up goes to a person on its
+  lookup, goes to a person at its first claim; one whose attempts are used up goes to a person
+  on its
   last lookup, or at its next claim when a lookup's record was lost. The interval, the lease and the number of attempts are deployment-file
   settings, 60 s, 120 s and 5 by default, accepted by the owner on 2026-10-14 and revisited
   once a connector has a lookup (`crates/gateway/src/reconcile.rs`). A lookup has half the
@@ -1148,16 +1150,23 @@ receipt.
   more, so the first lookup comes at least a lease after the side effect ended, by which time a
   vendor's search has had a lease to show it. The instance's own reconciliation also skips,
   before claiming, every receipt whose late side effect still runs in its process, held or
-  not. Another replica is kept off only by the lease, so across replicas the hold lasts only
-  while the instance can write to the store. A hold that is not written (the store failed, its
-  2 s ran out, or another holder has the receipt) is logged as
-  `in_process_late_side_effect_unheld`, once for each run of them, and tried again a second
-  later, not at the next renewal, until one is written. So a single first hold that is not
-  written leaves the receipt claimable by another replica from the moment the call's finish
-  records it `unknown` until a retry is written: a few seconds while the store answers. An
-  instance that stops, or cannot write to the store while its lease runs out, lets the receipt
-  be looked up. The first hold has 2 s, so a late side effect is answered at most that much
-  after its deadline. A gateway
+  not. Another replica is kept off by the lease, and before the first hold is written by the
+  row's deadline: no receipt is due on any instance until its row's deadline has passed, in
+  `unknown` as well as in `pending` (`DUE` and `CLAIM` in
+  `crates/audit-postgres/src/reconcile.rs`, and the testkit's in-memory store). The deadline
+  includes the 30 s finish deadline,
+  so a call answered `unknown` at its own deadline leaves its receipt out of every instance's
+  queue for most of 30 s more. A hold that is not written (the store failed, its 2 s ran out,
+  or another holder has the receipt) is logged as `in_process_late_side_effect_unheld`, once
+  for each run of them, and tried again a second later, not at the next renewal, until one is
+  written. So a first hold that is not written has until the row's deadline to be written
+  again, as a renewal that is not written has the rest of the lease. Every `unknown` receipt
+  waits for its row's deadline before its first lookup, not only a late side effect's: the
+  queue cannot tell them apart, and the wait is the conservative choice. Across replicas the
+  hold lasts only while the instance can write to the store: an instance that stops, or cannot
+  write to the store until its row's deadline or its lease runs out, lets the receipt be looked
+  up. The first hold has 2 s, so a late side effect is answered at most that much after its
+  deadline. A gateway
   shutting down waits for such tasks within the time it already waits for its rows to
   complete, and never cancels one; one still running when that time is up is logged as
   `late_side_effects_left_running`, and its receipt stays `unknown` for reconciliation or a
@@ -2860,8 +2869,9 @@ the attempts are bounded, the last handing the receipt to a person; an authorita
 that found nothing settles `not_performed` and no other answer does; a found effect settles
 `completed` with its reference; a lookup record is append-only; a receipt settled by
 reconciliation is not moved by a late finish, and a late finish that disagrees with it is
-counted once; each claim is counted as an attempt; and a receipt held for its call, `pending`
-or `unknown`, is not due and no one else claims it until the hold ends (#206, #217). The
+counted once; each claim is counted as an attempt; a receipt held for its call, `pending`
+or `unknown`, is not due and no one else claims it until the hold ends; and a receipt answered
+`unknown` is not due, nor claimed, before its row's deadline (#206, #217). The
 Postgres runner ends a lease by moving it, as
 the superuser, a second into the past. The
 Postgres runner passes a row's deadline by moving it, as the superuser, to the row's time at

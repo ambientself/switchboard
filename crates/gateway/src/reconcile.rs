@@ -3,7 +3,9 @@
 //! Every instance works the queue of `unknown` receipts, so no separate deployment is needed.
 //! [`Reconciler::run`] makes a [`pass`](Reconciler::pass) every `reconciliation.interval_seconds`
 //! (see [`crate::deployment`]). Each pass reads up to [`RECONCILE_BATCH`] receipts due, the
-//! longest reserved first, and for each one:
+//! longest reserved first. No receipt is due before its row's deadline has passed, in `unknown`
+//! as well as `pending` ([`ReceiptQueue`]), so a call answered `unknown` that still runs has
+//! until then to hold its receipt. For each receipt due, a pass:
 //!
 //! 1. Claims it, with a lease of `reconciliation.lease_seconds`, through the store. The claim is
 //!    committed before anything else happens, so no lookup is made without it, and no lock or

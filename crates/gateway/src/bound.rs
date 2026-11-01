@@ -55,11 +55,13 @@
 //! [`LATE_SIDE_EFFECT_UNHELD_EVENT`] and tried again [`HOLD_RETRY`] later, not a quarter of a
 //! lease later, and so on until one is written. Meanwhile this instance's own reconciliation
 //! still never claims the receipt: it skips every receipt whose late side effect runs here
-//! ([`LateCalls::runs`]). Another instance is kept off only by the lease, so the guarantee
-//! across instances holds only while this one can write to the store. A first hold that is not
-//! written leaves the receipt claimable by another instance from the moment the call's finish
-//! records it `unknown` until a retry is written, a few seconds at most while the store
-//! answers; an instance cut off from the store, or stopped, lets its lease run out.
+//! ([`LateCalls::runs`]). Another instance is kept off by the lease and, until the first hold
+//! is written, by the row's deadline: no receipt is due on any instance before its row's
+//! deadline has passed ([`ReceiptQueue`]), and that deadline includes the store's finish
+//! deadline, so a first hold that is not written has most of that to be written again, as a
+//! renewal that is not written has the rest of the lease. The guarantee across instances holds
+//! only while this one can write to the store: an instance cut off from the store past its
+//! row's deadline or its lease, or stopped, lets the receipt be looked up.
 //!
 //! Running a call needs a Tokio runtime, for the deadline's timer and the task a late side
 //! effect moves to.
@@ -117,8 +119,9 @@ pub const OVER_QUOTA_EVENT: &str = "call_over_quota";
 /// The `event` field of the error logged when a late side effect's task could not hold its
 /// receipt's lease, with the `receipt`, and the `cause`: `store_failed`, `timed_out` or
 /// `not_held` (another holder has it, or it is settled or handed to a person). Logged once for
-/// each run of holds not written, at its first. Until a hold is written again, another instance
-/// may look the receipt up while the side effect may still act.
+/// each run of holds not written, at its first. Once the row's deadline or the last lease written
+/// has passed, and until a hold is written again, another instance may look the receipt up
+/// while the side effect may still act.
 pub const LATE_SIDE_EFFECT_UNHELD_EVENT: &str = "in_process_late_side_effect_unheld";
 
 /// How long one hold of a late side effect's receipt may take before it counts as not written.
@@ -127,8 +130,8 @@ pub const LATE_SIDE_EFFECT_UNHELD_EVENT: &str = "in_process_late_side_effect_unh
 pub const HOLD_BUDGET: Duration = Duration::from_secs(2);
 
 /// How long a late side effect's task waits before trying again a hold of its receipt that was
-/// not written. Until one is, the lease keeps no other instance off the receipt, so this is far
-/// shorter than the quarter of a lease between renewals.
+/// not written. Until one is, only the row's deadline keeps another instance off the receipt,
+/// so this is far shorter than the quarter of a lease between renewals.
 pub const HOLD_RETRY: Duration = Duration::from_secs(1);
 
 /// A connector in the gateway's own process's bounds on each call.
