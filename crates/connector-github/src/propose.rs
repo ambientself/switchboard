@@ -24,7 +24,7 @@
 //!    did not open for the caller is `refused`;
 //! 3. with none, the branch `heads/otto/<key>`: one that exists is `refused`;
 //! 4. the default branch's head commit and its tree;
-//! 5. each file's contents at that commit ([`GitHubConnector::changes`]): a path that is not a
+//! 5. each file's contents at that commit (`GitHubConnector::changes`): a path that is not a
 //!    regular file there is `refused`, and files that are all the same as there are an `error`,
 //!    "no change", with nothing written.
 //!
@@ -32,7 +32,7 @@
 //! on the head's tree, a commit whose message is the title and whose one parent is the head,
 //! and the branch `refs/heads/otto/<key>` (`POST /git/refs`); and, with the token for reads, the
 //! pull request into the default branch, a draft always, whose body is the claims block, the
-//! call's marker, and the caller's body ([`crate::proposals::body`]). It never deletes, moves or
+//! call's marker, and the caller's body (`proposals::body`). It never deletes, moves or
 //! forces a ref, and never opens a second pull request for a key. The first blob is its first
 //! write, so a failure from there on is `unknown` ([`crate::writes`]); a 422 on the branch
 //! included.

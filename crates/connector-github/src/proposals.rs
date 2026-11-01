@@ -19,7 +19,7 @@
 //! - a title, body or claim whose first word is `atlantis` ([`crate::writes::command_text`]);
 //! - a title, body or claim that holds the marker's text ([`crate::writes::holds_marker`]).
 //!
-//! The write entry must be narrowed `call` ([`crate::writes::check_entry`]), the caller must
+//! The write entry must be narrowed `call` (`writes::check_entry`), the caller must
 //! be a team's workload, and the connector must have the gateway's receipts to read
 //! ([`crate::GitHubConnector::read_receipts_from`]): without them a call is an `error` and
 //! nothing is sent, since no pull request could be told to be the caller's.

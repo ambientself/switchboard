@@ -21,12 +21,12 @@
 //!    removed;
 //! 2. the head branch's commit and its tree. An `expected_head` other than that commit is an
 //!    `error`;
-//! 3. each file's contents at that commit ([`GitHubConnector::changes`]): a path that is not a
+//! 3. each file's contents at that commit (`GitHubConnector::changes`): a path that is not a
 //!    regular file there is `refused`; files all the same as there are an `error` saying
 //!    `expected_head` is required, or, with it, `ok` with `state: "no_change"`, nothing written.
 //!
 //! Then it writes: with the token for git writes, a blob for each file, a tree on the head's
-//! tree, a commit "Amend pull request #<n>" whose one parent is the head, and the branch moved
+//! tree, a commit `Amend pull request #<n>` whose one parent is the head, and the branch moved
 //! to it, `PATCH /git/refs/heads/<branch>` with `force: false`, which GitHub refuses unless it
 //! is a fast-forward; and, with the token for reads, `PATCH /pulls/{n}` with the body alone:
 //! the new claims block, the marker block it found with this call's marker added, and the
