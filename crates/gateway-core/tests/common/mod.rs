@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
+use gateway_core::ReasonKind;
 use gateway_core::audit::{
     AuditRowId, DecisionKind, ListRecord, Outcome, RecordedResources, RowCompletion, RowStart,
     StoreError,
@@ -111,6 +112,9 @@ pub fn fresh_key() -> IdempotencyKey {
 /// accepts an identical repeat and refuses a different one. Either half can be told to fail.
 /// List rows are kept apart, idempotent on the identifier too, and fail with begin.
 ///
+/// It refuses the delegation shapes the Postgres store's table refuses (migration 0010), as the
+/// testkit's store does, so a test fails if the core ever writes one: see [`refused_shape`].
+///
 /// It keeps receipts as the interface says (decision 0009, part 2): a begin with a receipt
 /// checks the key's scope for a receipt under another row, and either writes the row complete
 /// with the answer or writes it open and reserves the receipt, all under one lock; finish
@@ -177,6 +181,7 @@ impl MemoryStore {
         if record.decision != DecisionKind::Allow {
             return Err("a denial reserves no receipt".into());
         }
+        refused_shape(record)?;
         let mut rows = self.rows.lock().unwrap();
         let mut receipts = self.receipts.lock().unwrap();
         let mut reused = self.reused.lock().unwrap();
@@ -280,6 +285,8 @@ impl AuditStore for MemoryStore {
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         let result = if self.fail_begin {
             Err("the store is down".into())
+        } else if let Err(refused) = refused_shape(record) {
+            Err(refused)
         } else {
             let mut rows = self.rows.lock().unwrap();
             let listed = self
@@ -326,6 +333,12 @@ impl AuditStore for MemoryStore {
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         let result = if self.fail_begin {
             Err("the store is down".into())
+        } else if let Err(refused) = refused_delegation(
+            record.delegation.is_some(),
+            record.proved_delegation_team.is_some(),
+            record.claimed_acting_person.is_some(),
+        ) {
+            Err(refused)
         } else if self.rows.lock().unwrap().iter().any(|(id, _)| id == row) {
             Err(format!("row {} is a call row", row.as_str()).into())
         } else {
@@ -337,4 +350,53 @@ impl AuditStore for MemoryStore {
         };
         Box::pin(now(result))
     }
+}
+
+/// Why the Postgres store would refuse a call record's delegation columns, if it would, as its
+/// table's constraints say (migration 0010) and the testkit's store holds them: a verified
+/// delegation is written with its team and its person (`delegation_shape`); a failure exactly on
+/// a row check 3 denied for a delegation that did not verify (`delegation_failure_shape`),
+/// beside nothing from the delegation's claims (`delegation_failure_unclaimed`), and with a
+/// digest only for a binding's failure (`delegation_digest_shape`).
+pub fn refused_shape(record: &AuditRecord) -> Result<(), StoreError> {
+    refused_delegation(
+        record.delegation.is_some(),
+        record.proved_delegation_team.is_some(),
+        record.claimed_acting_person.is_some(),
+    )?;
+    let at_check_3 = record.reason == Some(ReasonKind::DelegationUnverified);
+    let Some(failure) = &record.delegation_failure else {
+        return if at_check_3 {
+            Err(violates("delegation_failure_shape"))
+        } else {
+            Ok(())
+        };
+    };
+    if !at_check_3 || record.decision != DecisionKind::Deny {
+        return Err(violates("delegation_failure_shape"));
+    }
+    if record.delegation.is_some()
+        || record.proved_delegation_team.is_some()
+        || record.claimed_acting_person.is_some()
+    {
+        return Err(violates("delegation_failure_unclaimed"));
+    }
+    if failure.digest.is_some() && !failure.failure.follows_signature() {
+        return Err(violates("delegation_digest_shape"));
+    }
+    Ok(())
+}
+
+/// Why the Postgres store would refuse a verified delegation, on a call row or a list row: one
+/// is written with its team and its person (`delegation_shape`).
+fn refused_delegation(delegation: bool, team: bool, person: bool) -> Result<(), StoreError> {
+    if delegation && !(team && person) {
+        return Err(violates("delegation_shape"));
+    }
+    Ok(())
+}
+
+/// The refusal of a row that breaks the check constraint `constraint`.
+fn violates(constraint: &str) -> StoreError {
+    format!("the row violates the check constraint \"{constraint}\"").into()
 }

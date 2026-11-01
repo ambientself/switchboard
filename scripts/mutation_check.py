@@ -919,6 +919,27 @@ mutate("record-delegation-failure-on-earlier-denial",
        "a delegation's failure is recorded on a row denied before check 3", SRC + "audit.rs",
        "        delegation_failure.filter(|_| reason == Some(ReasonKind::DelegationUnverified));",
        "        delegation_failure.filter(|_| reason.is_some());")
+# The core's own test store refuses the delegation shapes the testkit's store and Postgres refuse
+# (migration 0010, #211), so the core's tests fail if it ever writes one. audit_flow.rs's
+# the_test_store_refuses_the_delegation_shapes_the_other_stores_refuse catches these.
+CORE_STORE = CRATE + "tests/common/mod.rs"
+mutate("core-store-failure-beside-claims", "the core's test store records a delegation's failure beside its claims", CORE_STORE,
+       "    if record.delegation.is_some()\n        || record.proved_delegation_team.is_some()\n        || record.claimed_acting_person.is_some()\n    {",
+       "    if false {")
+mutate("core-store-digest-without-binding", "the core's test store records a digest with a failure that is not a binding's", CORE_STORE,
+       "    if failure.digest.is_some() && !failure.failure.follows_signature() {", "    if false {")
+mutate("core-store-failure-on-any-row", "the core's test store records a delegation's failure on a row check 3 did not deny for it", CORE_STORE,
+       "    if !at_check_3 || record.decision != DecisionKind::Deny {", "    if false {")
+mutate("core-store-check-3-without-failure", "the core's test store writes a denial at check 3 that records no failure", CORE_STORE,
+       "        return if at_check_3 {\n            Err(violates(\"delegation_failure_shape\"))\n        } else {\n            Ok(())\n        };",
+       "        return Ok(());")
+mutate("core-store-delegation-without-team", "the core's test store records a verified delegation without its team or person", CORE_STORE,
+       "    if delegation && !(team && person) {", "    if false {")
+mutate("core-store-receipt-begin-unchecked", "the core's test store's begin with a receipt writes any delegation shape", CORE_STORE,
+       "        refused_shape(record)?;\n", "")
+mutate("core-store-list-unchecked", "the core's test store writes a list row with a verified delegation without its team or person", CORE_STORE,
+       "        } else if let Err(refused) = refused_delegation(\n            record.delegation.is_some(),",
+       "        } else if let Err(refused) = refused_delegation(\n            false,")
 mutate("outcome-ok-renamed", "the Ok outcome is written as `success`", SRC + "audit.rs",
        "    Ok,\n    /// The ", "    #[serde(rename = \"success\")]\n    Ok,\n    /// The ")
 mutate("outcome-error-renamed", "the Error outcome is written as `failed`", SRC + "audit.rs",
