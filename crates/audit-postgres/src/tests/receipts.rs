@@ -532,6 +532,73 @@ async fn values(client: &Client, sql: &str) -> Vec<Value> {
         .collect()
 }
 
+/// Migration 0014 is additive: a receipt reserved before it keeps every value it had and reads
+/// no team, so a lookup of it fails and it goes to a person. The team is written once, at the
+/// insert: the gateway's role may not update it, and the trigger refuses any role that tries.
+#[tokio::test]
+async fn the_receipt_team_migration_keeps_the_receipts_already_reserved() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let admin = db.admin().await;
+    // The database as 0013 left it.
+    admin
+        .batch_execute(
+            "ALTER TABLE switchboard_audit.receipts DROP COLUMN team;
+             DELETE FROM switchboard_audit.migrations WHERE version = 14;",
+        )
+        .await
+        .unwrap();
+    let id = fresh_id(&admin).await;
+    // Its row's deadline has passed, so the receipt is due.
+    receipt_in(&admin, &id, "key-before-0014", "unknown", true).await;
+    let read =
+        format!("SELECT to_jsonb(r) FROM switchboard_audit.receipts r WHERE row_id = '{id}'");
+    let before = values(&admin, &read).await;
+
+    let mut owner = db.connect_as(OWNER_ROLE).await;
+    assert_eq!(migrate(&mut owner).await.unwrap(), vec![14]);
+    let after = values(
+        &admin,
+        &format!(
+            "SELECT to_jsonb(r) - 'team' FROM switchboard_audit.receipts r WHERE row_id = '{id}'"
+        ),
+    )
+    .await;
+    assert_eq!(after, before);
+    let store = db.store(PoolSizes::default());
+    let due = gateway_core::ReceiptQueue::due(&store, 10).await.unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].team, None);
+
+    let gateway = db.connect_as(GATEWAY_ROLE).await;
+    let error = gateway
+        .execute(
+            &format!("UPDATE switchboard_audit.receipts SET team = 'team-a' WHERE row_id = '{id}'"),
+            &[],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        code(&error),
+        Some(INSUFFICIENT_PRIVILEGE),
+        "{}",
+        message(&error)
+    );
+    let error = owner
+        .execute(
+            &format!("UPDATE switchboard_audit.receipts SET team = 'team-a' WHERE row_id = '{id}'"),
+            &[],
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        message(&error).contains("may be written"),
+        "{}",
+        message(&error)
+    );
+}
+
 /// Migration 0008 is additive: rows written before it keep every value they had, and none of
 /// them names a receipt.
 #[tokio::test]
@@ -594,7 +661,7 @@ async fn the_receipts_migration_keeps_the_rows_already_written() {
 
     assert_eq!(
         migrate(&mut owner).await.unwrap(),
-        vec![8, 9, 10, 11, 12, 13]
+        vec![8, 9, 10, 11, 12, 13, 14]
     );
     let after = values(
         &owner,

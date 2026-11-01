@@ -49,6 +49,14 @@
 //! repository it reached. The first three ask for their entry's whole permission set; the other
 //! five each ask for their own, within the entry's.
 //!
+//! [`create_pr`] has the first write tool, `github__create_pr`, which is `propose`: it opens a
+//! draft pull request, and [`writes`] has what every write shares: the outcome of a write, the
+//! marker a lookup finds it by, the guards a proposal makes before any request, and the check
+//! of an entry that serves a write, which must be narrowed `call`. Its token is narrowed to the
+//! call's one repository, with the tool's own permission set. [`lookup`] has the lookup by
+//! marker that reconciliation settles such a call's `unknown` receipt by; the gateway registers
+//! it for each entry that serves a write.
+//!
 //! [`search`] has one more read tool, `github__search`, which is declared `checks_own_scope`
 //! (decision 0011): which repositories a search reaches is known only once GitHub answers. It
 //! builds its query as Otto's gateway does, withholds every result from a repository outside
@@ -68,12 +76,15 @@
 
 mod api;
 mod connector;
+pub mod create_pr;
 #[cfg(feature = "test-support")]
 pub mod fake;
+pub mod lookup;
 pub mod reads;
 pub mod report;
 pub mod search;
 pub mod tools;
+pub mod writes;
 
 pub use api::{ApiError, MAX_ANSWER_BYTES};
 pub use connector::{DEFAULT_CUSTODIAN_DEADLINE, GitHubConnector, GitHubSettings, SettingsError};

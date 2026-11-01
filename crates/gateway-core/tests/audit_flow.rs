@@ -1552,6 +1552,7 @@ fn an_allowed_side_effect_reserves_a_pending_receipt_with_its_row() {
                 principal: principal().id,
                 delegation: Some(delegation().key_scope()),
             },
+            team: Some("payments".into()),
             key: key.clone(),
             tool: tool_name("fixture__propose"),
             tool_use_id: Some("toolu_fixture_1".into()),

@@ -766,8 +766,12 @@ the entry says: `limit`, the caller's limit as the snapshot the call was decided
 it, its GitHub
 repositories on the one organization the deployment configures, which the decision carries to
 the connector with the call; or `call`, the one repository the call names. The connector
-refuses to be built for an entry narrowed `none`. A token is used for its one call and
-dropped; it never appears in an answer, a row or a log line. A refusal by the custodian is an
+refuses to be built for an entry narrowed `none`. A write tool's token is narrowed to the
+call's one repository with the tool's own permission set, never the entry's whole set, and an
+entry that serves one must be narrowed `call` (section 13). A lookup by marker asks for a token
+of its own: for the team the receipt recorded, the receipt's tool, its target repository alone
+and `pull_requests: read` alone, under the revision in force. A token is used for its one call
+and dropped; it never appears in an answer, a row or a log line. A refusal by the custodian is an
 `error` of the kind `custodian_refusal`, GitHub's refusal to issue the token `vendor_refusal`,
 and a custodian that cannot be reached or does not answer in time `other`. The deployment
 file's `[github]` table names the organization, GitHub's API URL and its CA file, the
@@ -1109,7 +1113,9 @@ of each cutover stage's go/no-go.
 ### Receipts
 
 A receipt is the gateway's durable record of one side effect it was asked to cause. It holds
-the proved principal, the delegation fields that scope its key, the tool, the key, the
+the proved principal and, for a workload, its team when the call was begun (migration 0014;
+none for a person, and none on a receipt reserved before it), the delegation fields that scope
+its key, the tool, the key, the
 caller's tool-use identifier, a digest of the arguments, the audit row, the resources the call
 named and the vendor target a lookup needs, a state, how that state was established, the
 lookups made, and the vendor's reference once known. It is not a copy of the result. Reads
@@ -1180,11 +1186,16 @@ receipt.
   writes no audit row, and it never sends anything that could cause an effect. It concludes
   `not_performed` only from a search the vendor documents as complete and current; a found
   effect settles the receipt `completed` with the vendor's reference; anything else is recorded
-  and leaves it `unknown`. It reads through a credential narrowed to the receipt's team, vendor
-  target and resources, which comes with the built-in connectors (#12). Every instance works
-  the queue of receipts in `unknown`, the state `unknown` or `pending`, once its row's deadline
-  has passed, with no separate deployment: it claims a receipt by setting a short lease,
-  committed before
+  and leaves it `unknown`. It reads through a credential narrowed to the receipt's team and
+  vendor target: the reconciler gives a lookup the team the receipt recorded and the policy
+  revision in force. A connector registers its lookup with the wiring; the GitHub connector
+  registers one for each entry that serves a write (section 13), and a GitHub lookup is never
+  authoritative, since GitHub does not document its list of pull requests as complete and
+  current, so it settles a receipt `completed` or leaves it `unknown`, never `not_performed`.
+  A lookup of a receipt with no team fails, and the receipt goes to a person once its attempts
+  are used up. Every instance works the queue of receipts in `unknown`, the state `unknown` or
+  `pending`, once its row's deadline has passed, with no separate deployment: it claims a
+  receipt by setting a short lease, committed before
   any lookup is made, so no lock or connection is held across one, and records each lookup on
   the receipt, appended and never changed. Each claim is counted on the receipt in the claim's
   own write, and counts as an attempt whether or not the lookup made under it was recorded, so
@@ -1272,11 +1283,13 @@ receipt.
 
 The gateway refuses any snapshot that serves a tool not classified `read` unless the audit
 store is the Postgres store, which keeps receipts, audit is on and identity is on (section 12).
-No release build serves one all the same: the snapshot loader's rule 2 refuses every proxied
-tool not classified `read` (decision 0011), and the one built-in connector, GitHub's, serves
-reads alone so far (#12). The first
-side effect to reach a real system also waits until someone is named to settle a receipt by
-hand and a way to record that exists (decision 0009, Still open 9 and 10).
+The snapshot loader's rule 2 refuses every proxied tool not classified `read` (decision 0011),
+but the GitHub connector now serves a `propose` tool, `github__create_pr` (section 13), so a
+release build with a registry that approves it reaches this gate, and it is the gate that
+refuses such a registry without the Postgres store. No deployment, demo or example registry
+in this repository has a GitHub entry that writes: the first side effect to reach a real system
+waits until someone is named to settle a receipt by hand and a way to record that exists
+(decision 0009, Still open 9 and 10).
 
 ## 12. Boot gates
 
@@ -1453,9 +1466,11 @@ each opt-out, and runs the receipt-store gate, as soon as the registry loads, be
 a credential, fetches a key or connects to the audit database. A proxied tool cannot reach
 the receipt-store gate: the snapshot loader's rule 2 (decision 0011) refuses every proxied tool
 not classified `read` first, so CI's `propose` step checks that refusal instead (#26 below).
-Only a built-in tool could, and the one built-in connector serves reads alone so far (#12). That still holds now that the gate passes with the
-Postgres store, audit and identity: a release registry cannot serve a tool that is not `read`,
-and CI's check is unchanged. The loopback refusal and its step are built (#11):
+A built-in tool can: the GitHub connector serves `github__create_pr`, which is `propose`
+(#12), and a registry that approves it with no receipt store is refused by the gate in a
+release build, which `crates/gateway/tests/github_writes.rs` tests through the release path's
+check. CI's step still starts the release artifact with a proxied `propose` tool, so it checks
+rule 2's refusal, not this gate. The loopback refusal and its step are built (#11):
 connector-proxy's own `test-support` feature, which the gateway's turns on, is the only way to
 reach loopback, and CI starts the release binary with a server at `127.0.0.1` and expects
 that refusal. With identity disabled a development build lists nothing and refuses every
@@ -1484,10 +1499,11 @@ grant issuer to a selector rule, and any configured issuer's grant verifies for 
 `pod`: the pod gate holds only when every issuer requires it, once a tool not classified `read`
 is served to such a profile's team. A registry rule for workloads covers every team in its
 issuer's manifest. The pod gate runs at boot on both configuration paths and on every registry
-reload, where a version that breaks it is refused and the running one kept. While the
-snapshot loader's rule 2 refuses every proxied tool not classified `read`, a registry cannot
-reach the pod gate, as it cannot reach the receipt-store gate; its tests run on in-process
-snapshots.
+reload, where a version that breaks it is refused and the running one kept. The snapshot
+loader's rule 2 refuses every proxied tool not classified `read`, but a registry that approves
+the GitHub connector's `github__create_pr` for a profile that requires a delegation reaches
+the pod gate, and its test does so from the registry path; the rest of its tests run on
+in-process snapshots.
 
 Currency needs a resolver ([decision 0012](decisions/0012-what-a-turn-grant-binds.md),
 "Currency"). The deployment file's `[resolver]` table names Otto's resolver interface: its URL,
@@ -1644,9 +1660,109 @@ records them in place of `unknown` when it finishes (section 11); a search that 
 records an empty list. GitHub's 422, a query it cannot run, is `invalid_arguments`. A search
 runs only under an entry narrowed to the caller's limit, as the loader requires of a tool that
 checks its own scope, and a caller whose limit holds no repository of the organization is
-refused before any request. The write tools, Jira, `otto__declare_unverified_claim`,
-`github__skill_body`, the lookup by marker and the comment tools are not built. The core's
-exception mechanism for them is built (section 8), and lists no tool.
+refused before any request. The proposal tools after `github__create_pr`, Jira,
+`otto__declare_unverified_claim`, `github__skill_body` and the comment tools are not built.
+The core's exception mechanism for them is built (section 8), and lists no tool.
+
+**The first write tool, `github__create_pr`,** opens a draft pull request from one branch into
+another of a repository of the organization (#12). It is `propose`: the connector states it so,
+declared from `owner` and `repo` as the reads are, and the gateway refuses an approval that
+declares otherwise at boot and on every reload. Its approval declares
+`settlement = { lookup = { system = "github", kind = "repository" } }`. The connector's own
+statement of each tool (#220) holds a classification and how resources are known, and has no
+place for a settlement, so the settlement rests on the approval alone. An entry that serves
+it must be narrowed `call` and state `contents` and `pull_requests: write`, or the connector
+refuses to be built, naming the entry. Before anything is asked of the custodian or of GitHub:
+
+- the tool must be approved `propose` and its call must carry its receipt, the audit row the
+  call reserved as its receipt (`ToolCall::receipt`), or nothing is sent and the call is an
+  `error`: the connector does not trust the approval alone;
+- its arguments parse into its own types, or the call is `invalid_arguments`: an argument the
+  schema does not list; a title that is empty, over 256 characters or holds a control
+  character ("title contains a control character"); a head or base that is not a git branch
+  name (no `:`, `..`, control character, whitespace, `~^?*[\`, leading `-`, trailing `/` or
+  `.`, empty segment, segment beginning with `.` or ending with `.lock`, `@{` or `@` alone; 255
+  bytes at most); or a body that with the marker line is over 65,536 characters, GitHub's own
+  bound, which the schema keeps the caller's body within by allowing it 65,000;
+- an owner other than the organization is `refused` with Otto's sentence; so is a title or body
+  whose first word, after any leading whitespace, is `atlantis` in any case, which Atlantis
+  would read as a command (Otto's comment rule, applied to a proposal's text); and so is a
+  title or body that holds `switchboard-receipt` in any case, the marker's text.
+
+Then one token is asked for, narrowed to the call's one repository with the tool's own set,
+`contents: read` and `pull_requests: write`, and the call's revision, never the entry's whole
+set (#223). With it the connector reads GitHub's comparison of the base with the head,
+`GET /repos/{owner}/{repo}/compare/{base}...{head}`, and refuses the call when a file it
+changes, under its name or its former one, is in the automation group below, or when the
+comparison does not list its files whole: no list, a file it cannot read the name of, or 300
+files or more, where GitHub cuts the list. Until the automation owners answer, a proposal may
+not change a CI workflow file or Atlantis configuration (decision 0011, section 6), and this
+check is how `github__create_pr` keeps to it. A comparison GitHub cannot make, a 404, a 422 or
+a 5xx, is `error`: nothing was written. The write is `POST /repos/{owner}/{repo}/pulls` with
+`draft: true` always, the title, the head, the base, and the body: the caller's, a blank line,
+and the marker line. No argument or setting turns the draft off; Otto's `CreateReadyPRs` is not
+carried over. The result is `{pr: {number, url, draft, head, base}, provenance}`, the
+provenance naming the classification the tool was approved with, `propose`, and tagged as
+external evidence; the receipt records `pull/<number>`.
+
+The write machinery is shared by every GitHub write tool (`crates/connector-github/src/writes.rs`):
+
+- **Writes in the API client.** A `POST` or `PATCH` carries a JSON body the connector builds
+  from its own types, never the caller's bytes, with the reads' headers, pinned TLS, no
+  redirect and no proxy, and its answer read up to 2 MiB. It goes on a client of its own that
+  keeps no idle connection and turns off hyper-util's one resend, of a request handed a pooled
+  connection that closed before any of it was written: each write opens its own connection,
+  and nothing is ever sent twice. Its answer is told apart: not sent (no connection could be
+  made); definite (a 2xx with JSON, any 3xx, any 4xx, GitHub's rate-limit 403 and 429
+  included); and no definite answer (a 5xx, an exchange broken off after the connection was
+  made, a 2xx that cannot be read or is not JSON).
+- **The outcome of a write.** Everything refused or failed before a call's first write may
+  have been sent is `error` or `refused`, as for a read, a failed comparison included. GitHub's
+  definite refusal of the first write is `error`, `vendor_refusal` for a 403 that is not its
+  rate limit and `other` otherwise, with a sentence naming the status and never GitHub's text.
+  Once a write may have been sent, every failure and every answer that is not definite is
+  `unknown`. Success is `ok` with GitHub's reference, and a 2xx whose number cannot be read is
+  `unknown`. A call whose answer shows it wrote nothing is `ok` with no reference. GitHub
+  documents no idempotency key for these endpoints, and none is sent.
+- **The marker.** One line the connector controls, `<!-- switchboard-receipt: <receipt> -->`,
+  the receipt being the call's audit row. A caller cannot write it: text holding its prefix is
+  refused, as above.
+- **The guards.** One predicate for command text, shared with the comment tools when they come;
+  and one for refused paths, Otto's four groups with Otto's sentences, in any case: a file named
+  `AGENTS.md` in any directory and any path with a `.agents` segment, the instruction-authority
+  group; any path under `.github/workflows/` and a file named `atlantis.yaml` or `atlantis.yml`
+  anywhere, the automation group. `.github`, `.github/workflows` and `.agents` themselves are
+  refused too, since a file there would replace the directory. `.github/actions/` and other CI
+  files are not in either group. `github__create_pr` applies the automation group to its
+  comparison; the proposal tools with files apply both to the files they write.
+
+**The lookup by marker** settles an `unknown` receipt of a GitHub write (section 11). It is not
+a tool call: it writes no row and only reads. It asks the custodian for a token for the team
+the receipt recorded, the receipt's tool, the receipt's target repository alone and
+`pull_requests: read` alone, under the revision in force, and reads
+`GET /repos/{owner}/{repo}/pulls?state=all&sort=updated&direction=desc&per_page=100`, at most
+three pages. The first pull request whose body has a line exactly equal to the marker is found,
+with `pull/<number>`: a whole line, never a substring, a branch name or anything else the caller
+chose. Nothing found is `not_found`, never authoritative, since GitHub does not document the
+list as complete and current and a pull request may sit past the pages read; so a lookup never
+settles a receipt `not_performed`. A receipt with no team, a target that is not one repository
+of the organization, a custodian refusal and any error or unreadable answer are `failed`. The
+gateway registers the lookup for each GitHub entry that serves a write.
+
+The deliberate differences from Otto's `github_create_pr`: the comparison's refusal of
+automation files, which Otto does not make, and which a push to the head between the
+comparison and the pull request's creation gets past; the receipt's marker line at the end of
+the body; the refusal of the marker's text and of command text in the title and body; no
+setting that makes a pull request ready for review; unlisted arguments `invalid_arguments`;
+and a write entry narrowed per call. What conformance (#23) must account for: a side effect
+needs a key and the suite sends none, so its `github_create_pr` calls are denied for want of
+one; this gateway's sentences name `github__…` tools; the Go fake has no compare endpoint, and
+its `github_create_pr` cases name heads that do not exist; the body ends with a marker line;
+and the provenance says `propose`, which the Otto adapter maps to `write`.
+
+No deployment, demo or example registry has a GitHub entry that writes. A real side effect
+waits for decision 0009's Still open 9 and 10: who settles a receipt by hand, and how that is
+recorded.
 
 A GitHub entry that names a `reach_report` has its reach checked against GitHub's own report,
 the first kind of reach check in decision 0011, section 4 (#193). Reading the report needs a
@@ -2092,10 +2208,14 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   target, its connector has no lookup or its attempts are used up, and otherwise asks the
   lookup, with half the lease to answer, and records what it found. Lookups by result and
   receipts handed to a person are counted on the metrics listener, and each hand-off is logged
-  as `receipt_handed_to_person`. No connector registers a lookup until the built-in GitHub
-  and Jira connectors (#12), so today every `unknown` receipt goes to a person at once, and
-  stays `unknown`: no resolution path is built (decision 0009, Still open 9 and 10). The
-  marker a connector attaches, and the custodian-narrowed read credential, come with #12.
+  as `receipt_handed_to_person`. The GitHub connector registers a lookup for each entry
+  that serves a write, and finds a pull request by the marker line it attached, with a token
+  for the receipt's team, target and `pull_requests: read` (#12, section 13); a receipt
+  records its team for it (migration 0014), and the reconciler gives a lookup that team and the
+  revision in force. A GitHub lookup is never authoritative, so a receipt it does not find goes
+  to a person once its attempts are used up, and stays `unknown`: no resolution path is built
+  (decision 0009, Still open 9 and 10). Every other connector's `unknown` receipt goes to a
+  person at once.
 - With #25, the harness's in-memory store can also write and then report failure, lose the
   process between run and finish, and keep the answer budget, so the contract suite runs on
   it: built. Already built for both test stores, the core's and the harness's: an identical second
@@ -2539,10 +2659,10 @@ listing their exception in any deployed policy, which waits on the security owne
   entry's permissions and the revision; a custodian refusal and a custodian that is not there;
   each vendor error; no token in an answer, a row or a log line; the in-process bound, late
   and oversized; the team's rate quota, from the wiring and from the deployment file; each
-  start refusal; and a reload that changes an entry. Not built: the write tools, Jira,
-  lookups, the comment tools (the core's exception mechanism is, under #12's list below), and
-  any deployment of a GitHub entry, which needs a real
-  App. Left as they are: GitHub names are compared case-sensitively, so a call that
+  start refusal; and a reload that changes an entry. Not built: the write tools but
+  `github__create_pr` (the entry below), Jira, the comment tools (the core's exception
+  mechanism is, under #12's list below), and any deployment of a GitHub entry, which needs a
+  real App. Left as they are: GitHub names are compared case-sensitively, so a call that
   writes an owner or a repository in another case than its limit does is denied; and each
   GitHub entry has quota buckets of its own, not GitHub as a whole.
 
@@ -2580,6 +2700,36 @@ listing their exception in any deployed policy, which waits on the security owne
   cannot run, `invalid_arguments` with nothing reached; and a qualifier naming another
   organization refused before any request. The search's filter compares repository names
   without regard to case, as GitHub does, and records the limit's own spelling.
+
+- Built: the GitHub write machinery and the first write tool, `github__create_pr` (section
+  13): `ToolCall::receipt`, the receipt a call reserved, which a write tool needs before it
+  sends anything; writes in the API client on a client that never resends; the outcome of a
+  write, `error` only when nothing was sent or GitHub definitely refused the first write and
+  `unknown` for everything but success once one may have been sent; the marker line; the
+  command-text and refused-path predicates; the comparison's refusal of automation files; an
+  entry serving a write held to `call` and its permissions; the receipt's team, in both stores
+  and Postgres's migration 0014, which the boot check requires with its grants; and the lookup
+  by marker, registered for each entry that writes, with the reconciler giving it the
+  receipt's team and the revision in force. Its tests (`crates/gateway/tests/github_writes.rs`)
+  run over HTTP against the fake GitHub API, which opens, lists and compares pull requests and
+  gives a write a fault: the draft and its marker on one token for the call's repository and
+  the tool's own set; no key denied; another organization, command text and the marker's text
+  refused, a repository outside the limit denied and each malformed argument
+  `invalid_arguments`, each with no request; the comparison refusals with no write; a
+  custodian that refuses or is not there; a write refused without being applied `error`, and
+  one applied then answered 502, applied then closed with no answer, applied then answered
+  201 with a body broken off or not JSON, or answered 502 unapplied `unknown`, with one
+  reconciliation pass settling the four applied by the marker and handing the fifth to a
+  person; a write past the in-process deadline settled only after it ends; a
+  repeated call a `duplicate`; a write that cannot connect `error`; an approval declaring
+  otherwise refused at the start and on a reload; and the receipt-store gate and the pod gate,
+  each reached from a registry with this tool. Not built: the proposal tools that write files
+  and amend a proposal, the comment tools, and the connector's own statement of a tool's
+  settlement, which its statement has no place for. Left as they are: a push to the head
+  between the comparison and the pull request's creation is not caught; a lookup does not check
+  who opened the pull request it finds; no log capture checks a write's token, which the reads'
+  log test covers for the shared client; and no deployment, demo or example registry has an
+  entry that writes.
 
 **#12, the bound around in-process connectors and the rate quotas** (decision 0014, sections 1
 and 2). Built before any built-in connector, so the first one is bounded from its first call:

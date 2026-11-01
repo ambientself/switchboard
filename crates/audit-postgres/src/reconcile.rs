@@ -35,7 +35,7 @@ use gateway_core::audit::{AuditRowId, StoreError};
 use gateway_core::receipt::EstablishedBy;
 use gateway_core::{
     ArgumentDigest, BoxFuture, IdempotencyKey, LeaseHolder, LookupAnswer, LookupRecord, Receipt,
-    ReceiptQueue, ReceiptState, Recorded, Resource, ToolName, ToolUseId, VendorReference,
+    ReceiptQueue, ReceiptState, Recorded, Resource, TeamId, ToolName, ToolUseId, VendorReference,
 };
 use serde_json::{Value, json};
 use tokio::time::{Instant, timeout_at};
@@ -53,7 +53,7 @@ macro_rules! receipt_columns {
         "r.row_id::text, r.principal_issuer, r.principal_subject, r.delegation_scope,
          r.idempotency_key, r.tool, r.tool_use_id, r.digest, r.resources, r.resources_omitted,
          r.state, r.established_by, r.established_person, r.reference, r.target_system,
-         r.target_kind, r.target_identifier, r.handed_to_person_at, r.claims"
+         r.target_kind, r.target_identifier, r.handed_to_person_at, r.claims, r.team"
     };
 }
 
@@ -228,6 +228,7 @@ pub(crate) fn receipt_from(
         handed_to_person: row.try_get::<_, Option<SystemTime>>(17)?,
         claims: u32::try_from(row.try_get::<_, i32>(18)?)
             .map_err(unreadable("a receipt's count of claims"))?,
+        team: text(19)?.map(TeamId::new),
     })
 }
 
