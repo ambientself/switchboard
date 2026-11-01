@@ -22,8 +22,8 @@ use gateway_identity::{Clock, SystemClock};
 use gateway_mcp::TOOL_USE_ID_META;
 use gateway_testkit::{
     CONNECTOR, Caller, DOCUMENT_ARGUMENT, DRAFT_TOOL, FakeCredentialSource, FakeLookup, Fixture,
-    FixtureConnector, InMemoryAuditStore, SURFACE_ALL, TEAM_A_DOCUMENT, document, fresh_key,
-    policy_data, policy_data_with_draft_lookup,
+    FixtureConnector, InMemoryAuditStore, SURFACE_ALL, TEAM_A, TEAM_A_DOCUMENT, document,
+    fresh_key, policy_data, policy_data_with_draft_lookup,
 };
 use serde_json::{Value, json};
 use support::{FixtureResources, Server, eventually, legacy};
@@ -183,7 +183,8 @@ impl World {
 
 /// A side effect whose answer was lost is left `unknown`, with the vendor target the draft
 /// tool's settlement takes from the call, and a later pass settles it: the lookup is asked for
-/// the receipt's marker in that document, finds the draft, and the receipt is `completed` by
+/// the receipt's marker in that document, with the team the receipt recorded and the revision
+/// in force, finds the draft, and the receipt is `completed` by
 /// reconciliation with the draft as its reference. The same call under the same key is then a
 /// `duplicate`, answered as a success with that reference, and nothing is sent again.
 #[tokio::test]
@@ -214,6 +215,10 @@ async fn a_side_effect_left_unknown_is_settled_by_the_queue() {
     );
     assert_eq!(looked_up[0].target, document(TEAM_A_DOCUMENT));
     assert_eq!(looked_up[0].tool.as_str(), DRAFT_TOOL);
+    assert_eq!(receipt.team, Some(TEAM_A.into()));
+    assert_eq!(looked_up[0].team, receipt.team);
+    let row = world.server.store.rows().pop().expect("the call's row");
+    assert_eq!(looked_up[0].revision, row.policy_revision);
     let settled = world.receipt(&receipt);
     assert_eq!(
         (
