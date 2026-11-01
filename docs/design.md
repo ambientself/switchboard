@@ -201,8 +201,9 @@ Callers connect to `/mcp/{surface}`. Every `tools/call` goes through these steps
      is present is verified and agrees with the principal;
    - check 4, the delegation lists the tool;
    - check 5, the profile permits the classification. `write` and `destructive` are denied
-     before the profile is read, except a tool named in the profile's list of excepted tools
-     once #12 builds it (decision 0011);
+     whatever classifications the profile lists, except a tool whose exact name the calling
+     profile's own list of excepted tools names (decision 0011, section 9; section 8), which
+     then meets every later check;
    - the currency check, under a profile that requires it, such as the profile for Otto's
      sandboxes: a call of a tool not classified `read` needs Otto's answer that the turn is
      current (decision 0012);
@@ -460,13 +461,13 @@ register of exceptions that decision 0010 keeps, with this project as its owner,
 the owner, and to be signed by a named security owner, who has not yet been named. It is
 reviewed every 90 days and before each milestone's rollout, so before milestone 4, when it
 first comes into force, and when Otto's cutover (#13) completes. `addOrEditJiraIssueComment`
-gets no exception, because it can edit other people's comments. The core has no way yet to
-express the exception. Under #12, check 5 itself changes: it denies `write` and `destructive`
-unless the tool is named in the calling profile's list of excepted tools, and an allowed call
-records the exception that allowed it in a field of its own, not as a reason. The list names
-tools, never a classification. The exception comes into force only once #12 has built it and
-the security owner has signed its entry. Until then Otto's callers are denied both tools,
-which loses parity with Otto's gateway.
+gets no exception, because it can edit other people's comments. The core's mechanism is built
+(#12): check 5 denies `write` and `destructive` unless the tool's exact name is in the calling
+profile's own list of excepted tools, and an allowed call records the exception that allowed it
+in a field of its own, not as a reason. The list names tools, never a classification. The
+exception comes into force only once the security owner has signed its entry. Until then no
+policy the project deploys lists it, this gateway serves neither tool, and Otto's callers are
+denied both, which loses parity with Otto's gateway.
 
 **Profile rules, per caller type.** Classification, proved versus claimed identity, the denial
 contract, audit before execution or ordinary denial, and fail-closed enforcement apply to all
@@ -474,7 +475,7 @@ profiles. `write` and `destructive` are denied in every profile by the decision 
 no profile's data can permit them as a classification. That is how production mutation is
 denied for every profile initially: anything that changes production without a person acting
 is one of the two. The one exception is the recorded one for Otto's two comment tools, above,
-which names tools in the profile for Otto's sandboxes and needs a change to check 5.
+which names tools in the profile for Otto's sandboxes.
 Permitting direct writes needs a decision that replaces part of
 [decision 0006](decisions/0006-what-the-decision-function-sees.md). This binds calls through
 the gateway. Where an environment's claim is the governed path, it says nothing about other
@@ -540,6 +541,32 @@ records. An example of the profile for Otto's sandboxes, which sets `requires_cu
 the one for Otto's control-plane surface, which does not, is in
 [examples/otto-profiles.toml](examples/otto-profiles.toml); neither demo serves them.
 
+**A profile can list exceptions,** each `{ name, tools }`, with `exceptions = [...]` in the
+registry file and `"exceptions": [...]` in the JSON configuration
+([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md), section 9). A
+profile lists none unless a policy says so, so no policy written before the list changes
+meaning. An exception's name is 1 to 64 lowercase letters, digits and `-`, not starting or
+ending with `-`, and the row records it; an exception refuses any other key. Check 5 lets a
+`write` or `destructive` tool past only when its exact name is in the calling profile's own
+list: never another profile's list, never a classification, never a part of a name. Nothing
+returns early on it: the currency check, check 6 and the key check still run, and only a call
+that passes all of them is allowed and names the exception. `tools/list` lists an excepted tool
+to its own profile's callers only. The snapshot loader, for the JSON configuration and the
+registry alike, refuses a list on a profile that does not require currency, so every call an
+exception allows is fenced; an exception naming a tool that is not approved, or is not
+classified `write`; an excepted `write` tool whose `unknown` receipts are settled by a person
+(decision 0009, "Reconciliation"; section 11, Receipts); an exception that names no tool; and
+two exceptions of one profile with one name, or one tool in two of them, since a call is
+allowed by exactly one. Holding a list to `write` tools is narrower than decision 0011's text,
+which says the list names tools: it means an exception can never let a `destructive` tool past
+check 5, and never stands in for a profile's classifications. A withdrawal leaves profiles as
+they are: a withdrawn tool leaves the approved tools and every surface, so check 2 denies it
+before check 5 reads a list. The mechanism is built and lists nothing: no deployment, demo or
+example registry lists an exception, and the example profiles in
+[examples/otto-profiles.toml](examples/otto-profiles.toml) show the comment-tool exception only
+as a comment, until the security owner signs its entry in
+[route-exceptions.md](route-exceptions.md).
+
 **A profile can declare that its callers set the `Idempotency-Key` header per request,** with
 `idempotency_key_header = true`. It is false unless a policy says so, in the JSON
 configuration and in the registry file alike, and only then does the gateway read a side
@@ -598,9 +625,13 @@ An earlier version of this section said a destructive tool could be held only in
 Otto profile's run path does not accept. That was not built, and it has been dropped. Every
 profile shares one run path, so a type per profile would need a run path per profile, and the
 rule is about every profile, not Otto's. Instead the decision function refuses a `write` or
-`destructive` tool before it reads the profile. That is a runtime check, and tests watch it:
-a property that such a tool is never allowed or listed, decision-table cases for each
-profile, and mutations that remove each half of the check
+`destructive` tool whatever classifications the profile lists, and reads only the profile's
+list of excepted tools, by exact name, to let one past (decision 0011, section 9). That is a
+runtime check, and tests watch it: a property that such a tool is never allowed or listed
+except a `write` tool its calling profile's own list names, and then only while its turn is
+current and with a key, a property that another profile's list never allows it,
+decision-table cases for each profile, and mutations that remove each half of the check, ignore
+the list, read any profile's list, match a name by its prefix, or skip the checks after it
 ([decision 0006](decisions/0006-what-the-decision-function-sees.md), amended 2026-10-04).
 
 **Freshness.** Each replica serves one snapshot at a time, with a revision every row records. A
@@ -921,6 +952,18 @@ written complete, has no finish, and is never open.
   answer. The issuer, key, session, turn and execution are escaped and capped at 128 characters,
   like the surface. Rows written before migration 0010 hold NULL in every one, which means not
   recorded. The gateway fills the delegation's columns from the grants it verifies (#22).
+- **A call an exception allowed records which** (decision 0011, section 9): the name of the
+  exception in the caller's profile that let its `write` tool past check 5, in a field of its
+  own, `allowed_by_exception`. It is not a reason, which belongs to a denial. It is set only on
+  an allowed call's row, the answer to a reused key included, and empty on every denial, a call
+  that passed check 5 by the exception and was then denied at the currency check, check 6 or
+  the key check included, and on every list row. Built in the core and both stores (#12, #56):
+  migration 0012 adds the column, which the gateway's role inserts at begin and does not read,
+  with `allowed_by_exception_known` for the name's shape and `allowed_by_exception_shape`,
+  which holds it to an allowed call row of a `write` or `destructive` tool. The in-memory store
+  refuses what that shape refuses. The name is the configuration's, capped at 64 characters
+  when the policy loads. Rows written before migration 0012 hold NULL, which means not
+  recorded.
 - Otto's `gateway_audit` table has none of these. They stay in this gateway's own record unless
   Otto adds them. Whether it does is part of the question about that table in Q18.
 
@@ -972,7 +1015,10 @@ failure exactly on a call row denied at check 3 for it (`delegation_failure_shap
 nothing from the delegation's claims (`delegation_failure_unclaimed`); a digest only with a
 verified delegation or a failure that follows a verified signature
 (`delegation_digest_shape`); a currency answer only on a call row (`currency_shape`); a pod UID
-only for a workload (`proved_pod_shape`); and each value one the core names. The boot check
+only for a workload (`proved_pod_shape`); and each value one the core names. Migration 0012
+adds `allowed_by_exception`, which the role inserts at begin and does not read, held to an
+allowed call row of a `write` or `destructive` tool (`allowed_by_exception_shape`) and to the
+name's shape (`allowed_by_exception_known`). The boot check
 requires the columns, their types and the role's grants on them. Deletion for retention uses a
 separate
 role, created before the first production deployment; until it exists nothing is deleted
@@ -1121,8 +1167,9 @@ receipt.
   10, and who settles a receipt by hand is its Still open 9. A `propose` tool may be approved
   with no lookup. A `write` tool allowed under a recorded exception
   ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md)) needs a key, a
-  receipt and the gate below like any side effect, and declares a lookup by marker unless its
-  exception says otherwise.
+  receipt and the gate below like any side effect, and declares a lookup by marker: the loader
+  refuses an excepted `write` tool settled by a person, and nothing lets an exception say
+  otherwise (#206).
 - **A side effect's `error` means its connector knows nothing took effect,** and settles its
   receipt as `not_performed`: the request failed before it was sent, or the vendor definitely
   rejected it. A side-effecting connector reports `unknown` whenever it cannot know that. A
@@ -1503,7 +1550,8 @@ records an empty list. GitHub's 422, a query it cannot run, is `invalid_argument
 runs only under an entry narrowed to the caller's limit, as the loader requires of a tool that
 checks its own scope, and a caller whose limit holds no repository of the organization is
 refused before any request. The write tools, Jira, `otto__declare_unverified_claim`,
-`github__skill_body`, the lookup by marker and the comment exception are not built.
+`github__skill_body`, the lookup by marker and the comment tools are not built. The core's
+exception mechanism for them is built (section 8), and lists no tool.
 
 A GitHub entry that names a `reach_report` has its reach checked against GitHub's own report,
 the first kind of reach check in decision 0011, section 4 (#193). Reading the report needs a
@@ -1803,8 +1851,9 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   check covers them, and the contract suite runs them and their refusals on both stores. Rows
   written before it hold NULL in each, which means not recorded. The gateway fills the
   delegation's columns from the grants it verifies, and the currency answer from Otto's
-  resolver when it asks (#22). Not built: with #12, a column for the exception that allowed a call, since the row's
-  shape constraint rightly allows no reason on an allowed row.
+  resolver when it asks (#22). The column for the exception that allowed a call: built with
+  #12 (section 11), in a column of its own, since the row's shape constraint rightly allows no
+  reason on an allowed row. Migration 0012 adds it.
 - Rows of kind `list`, written complete, with a list form of the record in the core: built in
   the core and the stores, and wired into `tools/list` (#40). The core's `listed` writes a
   `ListRecord`, with the caller columns, the policy revision and the first 64 tool names, each
@@ -2340,12 +2389,19 @@ checked; a schema that needs them cannot be approved yet.
   demonstrations entry under #11 above). The configurable audit pools and the row's size bound
   are in the #11 list above.
 
-**#12, Otto's GitHub and Jira tools.** The list of excepted tools on a profile, and check 5
-consulting it; the column for the exception that allowed a call (with #10); the loader's
-refusal of that list on a profile that does not require currency; the restated property; a
-decision-table case for each comment tool, a case showing them denied in every other profile,
-and one showing `addOrEditJiraIssueComment` denied; and the mutations `check-5-removed` and one
-that removes the exception-list check.
+**#12, Otto's GitHub and Jira tools.** The exception mechanism is built, and no excepted
+tool is served (section 8): the list of excepted tools on a profile, and check 5 consulting
+only the calling profile's list; the column for the exception that allowed a call (with #10,
+migration 0012); the loader's refusal of that list on a profile that does not require
+currency, of a tool not approved or not `write`, and of an excepted `write` tool settled by a
+person; the restated property, and one that another profile's list never allows; decision-table
+cases for each comment tool, allowed under a profile that requires currency and denied in every
+other profile, at the currency check, check 6, check 4 and the key check, and one showing
+`addOrEditJiraIssueComment` denied; and the mutations `check-5-removed` and
+`exception-list-ignored`, which removes the exception-list check, with the rest in
+`scripts/mutation_check.py`. Not built: serving `github__pr_comment` and `jira__comment`, and
+listing their exception in any deployed policy, which waits on the security owner's signature
+([route-exceptions.md](route-exceptions.md)).
 
 - Built, as the crate `key-custodian`: the key custodian and its client (section 9). Its
   tests run it against a fake GitHub App API that checks the App JWT and issues dummy tokens
@@ -2377,7 +2433,8 @@ that removes the exception-list check.
   each vendor error; no token in an answer, a row or a log line; the in-process bound, late
   and oversized; the team's rate quota, from the wiring and from the deployment file; each
   start refusal; and a reload that changes an entry. Not built: the write tools, Jira,
-  lookups, the comment exception, and any deployment of a GitHub entry, which needs a real
+  lookups, the comment tools (the core's exception mechanism is, under #12's list below), and
+  any deployment of a GitHub entry, which needs a real
   App. Left as they are: GitHub names are compared case-sensitively, so a call that
   writes an owner or a repository in another case than its limit does is denied; and each
   GitHub entry has quota buckets of its own, not GitHub as a whole.
