@@ -162,7 +162,7 @@ lines only once the interfaces between them have settled.
 | `gateway-identity` | Token verifiers, one per issuer type, and the team manifest loader. |
 | `audit-postgres` | The audit store over Postgres: the schema, its two roles, the migrations and the boot check. |
 | `connector-github` | The GitHub connector, in the gateway's own process: Otto's GitHub tools, so far its nine reads other than skill bodies. Every token comes from the key custodian, through the client in `key-custodian`. A fake GitHub REST API behind `test-support`. |
-| `key-custodian` | The key custodian (`switchboard-custodian`), the one process that holds the GitHub App key, and its client, a library module the GitHub connector depends on. The gateway never starts the key-holding process; it links the whole crate, server code too, until the crate gains a client-only feature (#219). |
+| `key-custodian` | The key custodian (`switchboard-custodian`), the one process that holds the GitHub App key, and its client, a library module the GitHub connector depends on. The gateway never starts the key-holding process, and links only the client, the crate's `client` feature; the server, which reads the key, is its `server` feature. |
 | `gateway-otto` | The Otto adapter: Otto's policy profile, the turn-grant verifier and the client for Otto's resolver interface. The core crates do not depend on it. |
 | `connector-proxy` | The connector that forwards to a separate MCP server. |
 | `gateway-registry` | The registry file: approved tool definitions, surfaces, profiles, limits and profile selection, loaded into a core snapshot. |
@@ -672,37 +672,53 @@ carries the policy revision it was decided under.
 **The custodian as built** (#12, the crate `key-custodian`). `switchboard-custodian` reads the
 GitHub App's private key from a file at start, and refuses to start if the file is missing,
 unreadable, not an RSA key in PEM, or gives its group or others any access. It serves token
-requests on a Unix socket whose mode it sets, refusing a mode that gives others any access,
-and answers only the UID it is configured for, read from the kernel (`SO_PEERCRED` on Linux,
-`getpeereid` elsewhere). A request names the team, the tool, the repositories (`owner/name`,
-at least one and at most 500), the permissions (at least one) and the revision the call was
-decided under, which while tools are withdrawn is the derived `{base}+withdrawn:{names}` of
-section 13. Its copy of policy is loaded from the registry file by the gateway's own loader
-and read again every few seconds, as the gateway reloads it: each team's repositories are the
-resources of system `github` and kind `repository` in its limit, and each tool's permission
-set is stated on its built-in connector entry, `[[connectors]]` in the registry file, with the
-tools it serves. The set is on the entry, not the approval, because decision 0011 gives an
-entry one credential and registers several permission sets as several entries. The custodian
-applies only the loader's checks, not those the gateway's boot and reload add (a changed
-server or route, the boot gates, bytes that are not UTF-8). A file that passes the loader but
-not the gateway's reload is served by the custodian alone, and if it names a new revision,
-every request is refused as stale until the two agree again, when the gateway restarts on the
-file or the file is fixed. A request is refused if the base of its revision, the part before
-the first `+`, is not the custodian's revision, its team or tool is unknown, a repository is
-outside the team's limit or on another account, or a permission is outside the tool's set or
-above its level there; a refusal comes back typed, and the client turns it into the
-`custodian_refusal` error kind. A withdrawal removes only proxied tools, which the custodian's
-copy does not hold, so the base gives the same copy. Each team has a token bucket, 30 requests
-a minute with a burst of 10 by default, provisionally. A token is asked of GitHub for exactly
-the repositories and permissions requested, and one GitHub issues broader is revoked and not
-handed out. Its lifetime is five minutes by default, never past GitHub's own expiry, and the
-custodian revokes it through GitHub's revoke endpoint when the lifetime ends first. A
-revocation GitHub does not accept is counted, logged and tried again, waiting from a second up
-to a minute between attempts, until GitHub accepts it or the token reaches GitHub's expiry; so
-while GitHub refuses revocations a token works past its lifetime, until GitHub's expiry at
-most, an hour after it was issued. Each request writes one JSON line to
-the custodian's own record, with the revision it was checked against and never the token, and
-is counted on a metrics listener of its own. No demo deploys it: that needs a real App.
+requests on a Unix socket whose mode it sets, refusing a mode that gives others any access, and
+answers only the UID it is configured for, read from the kernel (`SO_PEERCRED` on Linux,
+`getpeereid` elsewhere). It refuses to start when that UID is its own, since any process
+running as the custodian could then ask for tokens. A request names the team, the tool, the
+repositories (`owner/name`, at least one and at most 500), the permissions (at least one) and
+the revision the call was decided under, which while tools are withdrawn is the derived
+`{base}+withdrawn:{names}` of section 13. Its copy of policy is loaded from the registry file
+by the gateway's own loader and read again every few seconds, as the gateway reloads it: each
+team's repositories are the resources of system `github` and kind `repository` in its limit,
+and each tool's permission set is stated on its built-in connector entry, `[[connectors]]` in
+the registry file, with the tools it serves. The set is on the entry, not the approval, because
+decision 0011 gives an entry one credential and registers several permission sets as several
+entries. The loader does not hold a built-in entry's tools to its system, so the custodian
+does: a file in which an entry of system `github` lists a tool not named `github__<tool>` gives
+it no copy, and it refuses to start on it or, at a reload, keeps the copy it serves. The
+custodian applies only the loader's checks, not those the gateway's boot and reload add (a
+changed server or route, the boot gates, bytes that are not UTF-8). A file that passes the
+loader but not the gateway's reload is served by the custodian alone, and if it names a new
+revision, every request is refused as stale until the two agree again, when the gateway
+restarts on the file or the file is fixed. A request is refused if the base of its revision,
+the part before the first `+`, is not the custodian's revision, its team or tool is unknown, a
+repository is outside the team's limit or on another account, or a permission is outside the
+tool's set or above its level there; a refusal comes back typed, and the client turns it into
+the `custodian_refusal` error kind. A withdrawal removes only proxied tools, which the
+custodian's copy does not hold, so the base gives the same copy. Each team has a token bucket,
+30 requests a minute with a burst of 10 by default, provisionally. A token is asked of GitHub
+for exactly the repositories and permissions requested, and one GitHub issues broader is
+revoked and not handed out. The repositories GitHub names are compared with those asked for
+without regard to ASCII case, as GitHub compares names, and must be as many. Its lifetime is
+five minutes by default, never past GitHub's own expiry, and the custodian revokes it through
+GitHub's revoke endpoint when the lifetime ends first. A revocation GitHub does not accept is
+counted, logged and tried again, waiting from a second up to a minute between attempts, until
+GitHub accepts it or the token reaches GitHub's expiry; so while GitHub refuses revocations a
+token works past its lifetime, until GitHub's expiry at most, an hour after it was issued.
+GitHub's 401, to a token it no longer accepts because it already revoked or expired it, counts
+as revoked. A graceful stop (a terminate signal or an interrupt) stops accepting, waits for the
+requests in flight and revokes every token the custodian handed out, or issued and did not hand
+out, that is not yet revoked or expired, retrying as above, all within ten seconds, which the
+termination grace must cover. A token not revoked by then is logged and works until GitHub's
+expiry, as does every token when the custodian is killed rather than stopped. A stop also ends
+a token the gateway is using for a call in flight, which then fails. Each request writes one
+JSON line to the custodian's own record, with the revision it was checked against and never the
+token (a malformed request's line keeps its tool, and its team unless the team is what is
+malformed), and is counted on a metrics listener of its own. The gateway links the crate's
+client alone, its `client` feature: the code that reads the key, signs the App's JWTs, calls
+GitHub and serves the socket is the `server` feature, which the gateway's build leaves off. No
+demo deploys it: that needs a real App.
 
 **The GitHub connector as built** (#12, the crate `connector-github`). It runs in the
 gateway's own process and holds no key. For each call it asks the custodian for a token,
@@ -2347,23 +2363,23 @@ decision-table case for each comment tool, a case showing them denied in every o
 and one showing `addOrEditJiraIssueComment` denied; and the mutations `check-5-removed` and one
 that removes the exception-list check.
 
-- Built, as the crate `key-custodian`: the key custodian and its client (section 9). Its
-  tests run it against a fake GitHub App API that checks the App JWT and issues dummy tokens
-  scoped as asked, with keys generated per run: a token within policy, narrowed exactly; each
-  refusal (a repository outside the team's limit or on another account, a permission outside
-  the tool's set or above its level, more than 500 repositories, an unknown team or tool, a
-  stale revision, a peer of another UID); a revision derived by withdrawals checked by its
-  base; the rate limit; revocation at the end of the lifetime; a revocation GitHub fails tried
-  again until it is accepted, and given up at GitHub's expiry; a widened token revoked and
-  counted; the record holding no token; nothing a client receives, nor the record or the
-  metrics, holding the key; and each start refusal. The peer check is tested the same way on
-  Linux and macOS: the socket is served to another UID than the test's. The registry's
-  `[[connectors]]` states each built-in entry's permission set and tools. Not built: any
-  deployment of the custodian. Left as they are: a token whose revocation GitHub keeps refusing,
-  and any token not yet revoked when the custodian stops, works until GitHub's expiry, an hour
-  at most after it was issued; and a registry file under a new revision that the loader accepts
-  but the gateway's reload refuses makes the custodian refuse every request as stale until the
-  two agree.
+- Built, as the crate `key-custodian`: the key custodian and its client (section 9). Its tests
+  run it against a fake GitHub App API that checks the App JWT and issues dummy tokens scoped
+  as asked, with keys generated per run: a token within policy, narrowed exactly; each refusal
+  (a repository outside the team's limit or on another account, a permission outside the tool's
+  set or above its level, more than 500 repositories, an unknown team or tool, a stale
+  revision, a peer of another UID); a revision derived by withdrawals checked by its base; the
+  rate limit; revocation at the end of the lifetime; a revocation GitHub fails tried again
+  until it is accepted, and given up at GitHub's expiry; a widened token revoked and counted;
+  the record holding no token; nothing a client receives, nor the record or the metrics,
+  holding the key; and each start refusal. The peer check is tested the same way on Linux and
+  macOS: the socket is served to another UID than the test's. The registry's `[[connectors]]`
+  states each built-in entry's permission set and tools. Not built: any deployment of the
+  custodian. Left as they are: a token whose revocation GitHub keeps refusing, or does not
+  accept within the stop's deadline, and any token when the custodian is killed rather than
+  stopped, works until GitHub's expiry, an hour at most after it was issued; and a registry
+  file under a new revision that the loader accepts but the gateway's reload refuses makes the
+  custodian refuse every request as stale until the two agree.
 
 - Built, as the crate `connector-github`: the GitHub connector and its first three read
   tools, `github__get_file`, `github__get_pr` and `github__get_issue` (section 13), with
