@@ -88,7 +88,8 @@ likes, and nothing re-serializes it after signing.
 More precisely:
 
 - An integer is written as digits only: no sign, fraction or exponent, and at most
-  2^63 − 1. `1800000000` is an integer; `1.8e9`, `1800000000.0` and `"1800000000"` are not.
+  2^63 − 1. `1800000000` is an integer; `1.8e9`, `1800000000.0` and `"1800000000"` are not, and
+  neither is `-0`, which a JSON parser may read as zero.
 - A claim in the table is never `null`, and never appears twice in one object. `pod` and `egress`
   may be left out until the issuer requires them; when present, they must be valid.
 - A member the table does not name is ignored, whatever its value, so a claim can be added later

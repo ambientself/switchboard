@@ -1616,6 +1616,15 @@ mutate("otto-grant-unknown-key-falls-back", "an unknown key ID is verified with 
        "            .and_then(|id| self.keys.keys.get_key_value(id).or_else(|| self.keys.keys.iter().next()))\n")
 mutate("otto-grant-epoch-zero-accepted", "a grant with epoch 0 is accepted", OV,
        ".filter(|epoch| *epoch > 0)", ".filter(|epoch| *epoch >= 0)")
+# An integer is digits only (#211): `-0`, which JSON reads as a float, is not read as zero.
+# tests/forgery.rs catches this.
+mutate_all("otto-grant-negative-zero-read-as-zero", "iat is read through a float, so -0 and 1800000000.0 are read as integers",
+           (OV, '    #[serde(default, deserialize_with = "present")]\n    iat: Option<i64>,',
+            '    #[serde(default, deserialize_with = "through_float")]\n    iat: Option<i64>,'),
+           (OV, "/// A member that is present is its value, never `null`.",
+            "fn through_float<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<i64>, D::Error> {\n"
+            "    Ok(Some(f64::deserialize(deserializer)? as i64))\n}\n\n"
+            "/// A member that is present is its value, never `null`."))
 mutate("otto-grant-required-pod-optional", "a grant without pod is accepted when the issuer requires it", OV,
        "        if require_pod && claims.pod.is_none() {", "        if false {")
 mutate("otto-grant-required-egress-optional", "a grant without egress is accepted when the issuer requires it", OV,

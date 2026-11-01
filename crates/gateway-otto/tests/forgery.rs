@@ -414,6 +414,24 @@ fn signed_claims_of_the_wrong_shape_are_malformed() {
         &strict,
         &minter.mint_bytes(format!(" \n{}", claims()).as_bytes()),
     );
+    // An integer is digits only: no sign, not even on zero, no fraction and no exponent. JSON
+    // reads `-0` as a number, so each spelling is written into the claims' text as it is.
+    let compact = claims().to_string();
+    for (name, value) in [("iat", NOW), ("exp", NOW + 600), ("epoch", 7)] {
+        let written = format!("\"{name}\":{value}");
+        assert!(compact.contains(&written), "{compact}");
+        for spelling in [
+            "-0".to_owned(),
+            "-0.0".to_owned(),
+            format!("-{value}"),
+            format!("{value}.0"),
+            format!("{value}e0"),
+            format!("{value}E0"),
+        ] {
+            let changed = compact.replacen(&written, &format!("\"{name}\":{spelling}"), 1);
+            malformed(changed.as_bytes());
+        }
+    }
     // A claim this format names, given twice.
     let twice = claims()
         .to_string()
