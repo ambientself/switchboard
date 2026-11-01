@@ -855,8 +855,8 @@ mutate_all(
     "a connector can be called around the audited path",
     (SRC + "connector.rs", "    pub(crate) fn new(\n        call: CallContext,", "    pub fn new(\n        call: CallContext,"),
     (SRC + "connector.rs",
-     "pub(crate) struct Granted {\n    pub(crate) policy_revision: PolicyRevision,\n    pub(crate) caller_limit: Option<Vec<Resource>>,\n}",
-     "pub struct Granted {\n    pub policy_revision: PolicyRevision,\n    pub caller_limit: Option<Vec<Resource>>,\n}"),
+     "pub(crate) struct Granted {\n    pub(crate) policy_revision: PolicyRevision,\n    pub(crate) caller_limit: Option<Vec<Resource>>,\n    pub(crate) row: AuditRowId,\n}",
+     "pub struct Granted {\n    pub policy_revision: PolicyRevision,\n    pub caller_limit: Option<Vec<Resource>>,\n    pub row: AuditRowId,\n}"),
     (SRC + "lib.rs",
      "pub use connector::{BoxFuture, Connector, ErrorKind, ToolCall, ToolOutcome};",
      "pub use connector::{BoxFuture, Connector, ErrorKind, Granted, ToolCall, ToolOutcome};"),
@@ -1163,6 +1163,12 @@ mutate("core-tool-call-row-wrong", "a connector is given another row than its ca
 mutate("reconcile-target-not-recorded", "begin records no vendor target, so every receipt goes to a person", SRC + "audit.rs",
        "            .and_then(|settlement| settlement.target(&call.resources)),",
        "            .and_then(|_| None),")
+mutate("core-tool-call-receipt-none", "a connector is never given its call's receipt, so a write tool sends nothing", SRC + "connector.rs",
+       "        (self.tool.classification != Classification::Read).then_some(&self.granted.row)",
+       "        (self.tool.classification == Classification::Destructive).then_some(&self.granted.row)")
+mutate("core-receipt-team-not-recorded", "begin reserves a receipt without its principal's team, so a lookup has none to ask for", SRC + "audit.rs",
+       "    let team = call.caller.principal.get().team().cloned();",
+       "    let team = call.caller.principal.get().team().cloned().filter(|_| false);")
 # The gateway answers a duplicate as a success, with the receipt and the reference.
 mutate("gw-duplicate-answered-as-refusal", "the gateway answers a duplicate as a refusal", "crates/gateway/src/path.rs",
        "        Reuse::Duplicate {\n            receipt, reference, ..\n        } => Reply::ToolOk(",
@@ -5165,6 +5171,13 @@ mutate("pg-reached-replaces-named", "complete_once lets a completion replace nam
        "            true,")
 mutate("pg-reached-grant-missing", "the gateway's role cannot write what a tool reached", PG_REACHED,
        "GRANT UPDATE (resources, resources_omitted) ON switchboard_audit.call_rows TO switchboard_gateway;\n", "")
+# The receipt's team (migration 0013): written at reservation, required by the boot check.
+PG_TEAM = PG + "sql/migrations/0013_receipt_team.sql"
+mutate("pg-receipt-team-not-recorded", "the Postgres store reserves a receipt without its principal's team", PG_COLUMNS,
+       '            team: optional("team", request.team().map(TeamId::as_str))?,',
+       '            team: optional("team", request.team().map(TeamId::as_str).filter(|_| false))?,')
+mutate("pg-check-receipt-team-unrequired", "the boot check accepts a database whose receipts have no team column, or one of another type", PG_CHECK,
+       '    ("claims", "integer"),\n    ("team", "text"),\n', '    ("claims", "integer"),\n')
 
 # --- demo-checks ---------------------------------------------------------------------------
 # The demo's scripts and manifests in deploy/, watched by crates/demo-checks.
@@ -6870,6 +6883,52 @@ mutate("registry-reach-report-entry-narrowed-accepted", "a reach-report entry ma
 mutate("registry-reach-report-unapproved-accepted", "a reach report's tool may be withdrawn while the entry it checks keeps its tools",
        "crates/gateway-registry/src/registry.rs",
        "            && built_in_tools.values().any(|on| *on == entry.name)\n", "            && false\n")
+# The write machinery and github__create_pr (#12): the outcome of a write, the marker, the guards
+# before any request, the comparison's refusal, the token's set and the write entry's narrowing,
+# and the lookup by marker. crates/gateway/tests/github_writes.rs, connector.rs's, create_pr.rs's
+# and lookup.rs's own tests catch these.
+GHW = GH + "create_pr.rs"
+GHA = GH + "api.rs"
+GHL = GH + "lookup.rs"
+mutate("github-create-pr-not-a-draft", "a pull request is opened ready for review", GHW,
+       "            body: &body,\n            draft: true,\n", "            body: &body,\n            draft: false,\n")
+mutate("github-marker-not-attached", "the body is sent without the receipt's marker line", GHW,
+       '        format!("{body}\\n\\n{marker}")', "        body.to_owned()")
+mutate("github-marker-other-id", "the marker carries another identifier than the call's receipt", GHW,
+       "        let body = match with_marker(&parsed.body, &writes::marker(receipt)) {",
+       "        let body = match with_marker(&parsed.body, &writes::marker(&gateway_core::audit::AuditRowId::new(call.policy_revision().as_str()))) {")
+mutate("github-callers-marker-accepted", "a title or body holding the marker's text is sent", GHW,
+       "            if writes::holds_marker(text) {", "            if false && writes::holds_marker(text) {")
+mutate("github-command-text-guard-removed", "a title or body Atlantis would read as a command is sent", GHW,
+       "            if writes::command_text(text) {", "            if false && writes::command_text(text) {")
+mutate("github-comparison-refusal-removed", "a pull request whose head changes a workflow or Atlantis file is opened", GHW,
+       "                && refused.group == PathGroup::Automation\n", "                && false\n")
+mutate("github-cut-comparison-accepted", "a comparison GitHub cut at 300 files is taken as whole", GHW,
+       "    if files.len() >= MAX_COMPARED_FILES {", "    if false && files.len() >= MAX_COMPARED_FILES {")
+mutate("github-write-5xx-reported-error", "a 5xx to a write that may have been applied is an error, settling its receipt not_performed", GHA,
+       "        if !status.is_success() {\n            return Wrote::NoDefiniteAnswer;\n        }",
+       "        if !status.is_success() {\n            return Wrote::Refused {\n                status,\n                rate_limited: false,\n            };\n        }")
+mutate_all("github-write-broken-off-reported-error", "a write whose answer broke off after its connection was made is an error",
+       (GHA, "            Err(error) => {\n                tracing::warn!(%error, \"a write to GitHub's API got no answer\");\n                return Wrote::NoDefiniteAnswer;\n            }",
+        "            Err(error) => {\n                tracing::warn!(%error, \"a write to GitHub's API got no answer\");\n                return Wrote::NotSent;\n            }"),
+       (GHA, "        else {\n            return Wrote::NoDefiniteAnswer;\n        };",
+        "        else {\n            return Wrote::NotSent;\n        };"))
+mutate("github-connect-failure-reported-unknown", "a write that could not connect, so was never sent, is unknown", GHA,
+       "            Err(error) if error.is_connect() => {", "            Err(error) if false && error.is_connect() => {")
+mutate("github-create-pr-asks-the-entrys-set", "github__create_pr asks for its entry's whole permission set, not its own", GHW,
+       "            permissions: PERMISSIONS\n                .iter()\n                .map(|(permission, access)| ((*permission).to_owned(), *access))\n                .collect(),",
+       '            permissions: [("contents".to_owned(), Access::Write), ("pull_requests".to_owned(), Access::Write)].into_iter().collect(),')
+mutate("github-write-entry-narrowed-limit-accepted", "an entry serving a write narrowed to the caller's limit is served", GH + "writes.rs",
+       "        if narrowing != Narrowing::Call {", "        if false && narrowing != Narrowing::Call {")
+mutate("github-lookup-authoritative", "a lookup that finds nothing says so authoritatively, settling a receipt not_performed", GHL,
+       "        LookupAnswer::NotFound {\n            authoritative: false,\n        }",
+       "        LookupAnswer::NotFound {\n            authoritative: true,\n        }")
+mutate("github-lookup-marker-substring", "a lookup finds the marker anywhere in a body, not as a line of its own", GHL,
+       "        .is_some_and(|body| body.lines().any(|line| line == marker))",
+       "        .is_some_and(|body| body.contains(marker))")
+mutate("github-lookup-entry-set", "a lookup's token asks for the write entry's whole set, not pull_requests: read", GHL,
+       "            permissions: BTreeMap::from([(LOOKUP_PERMISSION.to_owned(), Access::Read)]),",
+       '            permissions: BTreeMap::from([("contents".to_owned(), Access::Write), (LOOKUP_PERMISSION.to_owned(), Access::Write)]),')
 
 # --- Which tests can see a mutation ----------------------------------------------------------
 #
