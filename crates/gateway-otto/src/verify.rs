@@ -65,7 +65,8 @@ impl FailureKind {
         FailureKind::WrongPod,
     ];
 
-    /// The kind's name, for a row, a log line or a counter's label.
+    /// The kind's name, for a log line or a counter's label: the name the audit row records
+    /// for the core's failure of the same kind.
     pub fn as_str(self) -> &'static str {
         match self {
             FailureKind::Version => "version",
@@ -76,7 +77,7 @@ impl FailureKind {
             FailureKind::Malformed => "malformed",
             FailureKind::Expired => "expired",
             FailureKind::NotYetValid => "not_yet_valid",
-            FailureKind::LifetimeOverCeiling => "lifetime",
+            FailureKind::LifetimeOverCeiling => "lifetime_over_ceiling",
             FailureKind::WrongAudience => "wrong_audience",
             FailureKind::WrongPod => "wrong_pod",
         }
@@ -118,8 +119,9 @@ impl fmt::Debug for GrantDigest {
     }
 }
 
-/// Why a grant was not verified: which check failed and, only if its signature verified, its
-/// digest. Nothing from the grant's claims, so neither its Debug nor its Display can show any.
+/// Why a grant was not verified: which check failed and, only for a binding's failure (the
+/// audience, the lifetime or the pod), its digest. Nothing from the grant's claims, so neither
+/// its Debug nor its Display can show any.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 #[error("turn grant refused: {kind}")]
 pub struct GrantFailure {
@@ -133,7 +135,9 @@ impl GrantFailure {
         self.kind
     }
 
-    /// The grant's digest, if its signature verified; `None` otherwise.
+    /// The grant's digest, for a binding's failure; `None` for any other. A grant refused for
+    /// its encoding or its claims' shape has no digest though its signature verified: decision
+    /// 0012 records a digest only once the signature verified and a binding then failed.
     pub fn digest(&self) -> Option<GrantDigest> {
         self.digest
     }
@@ -241,7 +245,7 @@ impl GrantVerifier {
     ///
     /// The checks run in decision 0012's order, and the first that fails is the answer: the
     /// version, before anything else is read; the key ID; the signature, before the claims are
-    /// decoded; canonical encoding; then the claims. The clock is `now`, never read here.
+    /// decoded; canonical encoding; the claims' shape; then the bindings. The clock is `now`, never read here.
     pub fn verify(
         &self,
         grant: &[u8],
@@ -289,9 +293,11 @@ impl GrantVerifier {
             )
             .map_err(|_| refuse(FailureKind::Signature))?;
 
-        // From here the signature verified, so a failure carries the digest.
+        // From here the signature verified. Only a binding's failure, once the claims are read,
+        // carries the digest; canonical encoding and the claims' shape are refused with nothing
+        // of the grant, as the checks before the signature are.
         let digest = GrantDigest::of(grant);
-        let refuse = |kind| GrantFailure {
+        let bind = |kind| GrantFailure {
             kind,
             digest: Some(digest),
         };
@@ -306,25 +312,27 @@ impl GrantVerifier {
             return Err(refuse(FailureKind::Encoding));
         }
 
-        // 5. The claims.
+        // 5. The claims' shape.
         let issuer = &self.keys.issuers[key.issuer];
         let claims = Claims::parse(&claims_bytes, issuer.require_pod, issuer.require_egress)
             .ok_or(refuse(FailureKind::Malformed))?;
+
+        // 6. The bindings: the audience, the lifetime and the pod.
         if !claims.aud.iter().any(|aud| aud == self.deployment.as_str()) {
-            return Err(refuse(FailureKind::WrongAudience));
+            return Err(bind(FailureKind::WrongAudience));
         }
         let now = unix_seconds(now);
         if i128::from(claims.iat) > now + i128::from(LEEWAY_SECONDS) {
-            return Err(refuse(FailureKind::NotYetValid));
+            return Err(bind(FailureKind::NotYetValid));
         }
         if i128::from(claims.exp) <= now - i128::from(LEEWAY_SECONDS) {
-            return Err(refuse(FailureKind::Expired));
+            return Err(bind(FailureKind::Expired));
         }
         if i128::from(claims.exp) - i128::from(claims.iat) > i128::from(MAX_LIFETIME_SECONDS) {
-            return Err(refuse(FailureKind::LifetimeOverCeiling));
+            return Err(bind(FailureKind::LifetimeOverCeiling));
         }
         if issuer.require_pod && claims.pod.as_ref() != caller.get().pod() {
-            return Err(refuse(FailureKind::WrongPod));
+            return Err(bind(FailureKind::WrongPod));
         }
 
         Ok(VerifiedGrant {

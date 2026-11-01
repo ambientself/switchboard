@@ -11,7 +11,8 @@ use gateway_otto::FailureKind::{self, *};
 use gateway_otto::GrantDigest;
 use gateway_otto::format::{MAX_GRANT_BYTES, VERSION};
 use gateway_otto::minter::{
-    TestMinter, encode, padded, parts, with_non_canonical_s, with_part, with_trailing_bits,
+    SmallOrderRMinter, TestMinter, encode, padded, parts, with_non_canonical_s, with_part,
+    with_trailing_bits,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha512};
@@ -199,6 +200,43 @@ fn a_signature_that_does_not_verify_is_refused_without_a_digest() {
     );
 }
 
+/// Verification is strict: a signature whose R is of small order is refused as a bad
+/// signature, with no digest, though it meets RFC 8032's equation under an ordinary key and a
+/// lax verifier accepts it.
+#[test]
+fn a_signature_only_a_lax_verifier_accepts_is_refused() {
+    let minter = SmallOrderRMinter::generate();
+    let mut config = issuer("otto-prod", &TestMinter::generate());
+    config.current_key = minter.public_key_pem();
+    let verifier = verifier_with(vec![config]);
+    let grant = minter.mint(&claims());
+
+    // The grant is what the strict rule alone refuses: the key is configured, S is canonical,
+    // and the lax check passes.
+    let parts = parts(&grant);
+    assert_eq!(parts[1], minter.key_id().as_str());
+    let signature: [u8; 64] = URL_SAFE_NO_PAD
+        .decode(&parts[3])
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&minter.public_key()).unwrap();
+    assert!(!key.is_weak());
+    let signed = gateway_otto::format::signed_bytes(
+        parts[0].as_bytes(),
+        parts[1].as_bytes(),
+        parts[2].as_bytes(),
+    );
+    let signature = ed25519_dalek::Signature::from_bytes(&signature);
+    assert!(
+        ed25519_dalek::Verifier::verify(&key, &signed, &signature).is_ok(),
+        "the lax check refuses the grant, so it tests nothing"
+    );
+    assert!(key.verify_strict(&signed, &signature).is_err());
+
+    refused_as(&verifier, &grant, Signature, false);
+}
+
 #[test]
 fn the_signature_is_checked_before_the_claims_are_read() {
     let minter = TestMinter::generate();
@@ -376,6 +414,24 @@ fn signed_claims_of_the_wrong_shape_are_malformed() {
         &strict,
         &minter.mint_bytes(format!(" \n{}", claims()).as_bytes()),
     );
+    // An integer is digits only: no sign, not even on zero, no fraction and no exponent. JSON
+    // reads `-0` as a number, so each spelling is written into the claims' text as it is.
+    let compact = claims().to_string();
+    for (name, value) in [("iat", NOW), ("exp", NOW + 600), ("epoch", 7)] {
+        let written = format!("\"{name}\":{value}");
+        assert!(compact.contains(&written), "{compact}");
+        for spelling in [
+            "-0".to_owned(),
+            "-0.0".to_owned(),
+            format!("-{value}"),
+            format!("{value}.0"),
+            format!("{value}e0"),
+            format!("{value}E0"),
+        ] {
+            let changed = compact.replacen(&written, &format!("\"{name}\":{spelling}"), 1);
+            malformed(changed.as_bytes());
+        }
+    }
     // A claim this format names, given twice.
     let twice = claims()
         .to_string()
@@ -495,7 +551,11 @@ fn the_baseline_kinds_are_refused_in_the_new_format() {
     for (name, grant, kind, signed) in cases {
         let failure = refused(&verifier, &grant);
         assert_eq!(failure.kind(), kind, "{name}");
-        assert_eq!(failure.digest().is_some(), signed, "{name}");
+        assert_eq!(
+            failure.digest().is_some(),
+            signed && carries_digest(kind),
+            "{name}"
+        );
     }
     // Two of the suite's cases differ here. `legacy_headers` sends no grant, which is the
     // request path's to refuse, not the verifier's. `qualified_tool` names a tool by its

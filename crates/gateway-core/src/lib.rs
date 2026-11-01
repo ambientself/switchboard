@@ -40,8 +40,8 @@ pub use classification::{Classification, UnrecognizedClassification};
 pub use connector::{BoxFuture, Connector, ErrorKind, ToolCall, ToolOutcome};
 pub use credential::{CredentialError, CredentialHandle, CredentialSource};
 pub use decision::{
-    CallContext, CallerContext, Currency, CurrencyAnswer, Decision, DelegationProblem, Reason,
-    ReasonKind, ResourceProblem, Verdict, decide, list_tools,
+    CallContext, CallKey, CallerContext, Currency, CurrencyAnswer, Decision, DelegationProblem,
+    Reason, ReasonKind, ResourceProblem, Verdict, decide, list_tools,
 };
 pub use names::{
     ConnectorName, DelegationIssuer, DeploymentName, ExceptionName, ExecutionId, GroupId,

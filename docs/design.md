@@ -162,7 +162,7 @@ lines only once the interfaces between them have settled.
 | `gateway-identity` | Token verifiers, one per issuer type, and the team manifest loader. |
 | `audit-postgres` | The audit store over Postgres: the schema, its two roles, the migrations and the boot check. |
 | `connector-github` | The GitHub connector, in the gateway's own process: Otto's GitHub tools, so far its nine reads other than skill bodies. Every token comes from the key custodian, through the client in `key-custodian`. A fake GitHub REST API behind `test-support`. |
-| `key-custodian` | The key custodian (`switchboard-custodian`), the one process that holds the GitHub App key, and its client, a library module the GitHub connector depends on. The gateway never starts the key-holding process; it links the whole crate, server code too, until the crate gains a client-only feature (#219). |
+| `key-custodian` | The key custodian (`switchboard-custodian`), the one process that holds the GitHub App key, and its client, a library module the GitHub connector depends on. The gateway never starts the key-holding process, and links only the client, the crate's `client` feature; the server, which reads the key, is its `server` feature. |
 | `gateway-otto` | The Otto adapter: Otto's policy profile, the turn-grant verifier and the client for Otto's resolver interface. The core crates do not depend on it. |
 | `connector-proxy` | The connector that forwards to a separate MCP server. |
 | `gateway-registry` | The registry file: approved tool definitions, surfaces, profiles, limits and profile selection, loaded into a core snapshot. |
@@ -185,7 +185,8 @@ Callers connect to `/mcp/{surface}`. Every `tools/call` goes through these steps
    verifier needs no profile. For Otto this is the turn grant: its version, key, canonical
    encoding, signature, audience, lifetime and, once required, pod are checked. The verifier
    does not deny. A delegation that cannot be verified is passed on as unverified, carrying the
-   kind of failure and, for a grant whose signature verified, its digest, and step 5 denies it
+   kind of failure and, for a binding that failed once its signature verified (the audience,
+   the lifetime or the pod), its digest, and step 5 denies it
    at check 3 with a single reason kind of its own. That holds under a profile that does not
    require a delegation too: check 3 denies any delegation that is present and unverified. A
    grant that verifies but names a team other than the proved team is denied at check 3 too,
@@ -503,8 +504,8 @@ of any tool not classified `read` also needs a current control plane
 
 **A delegation that does not verify is denied at check 3.** The delegation's verifier never
 denies. A delegation that fails one of its checks reaches the decision function as present and
-unverified, carrying which check failed and, only when its signature verified, its digest, and
-nothing from its claims. Which check failed is one of a closed set the core defines and an
+unverified, carrying which check failed and, only when its signature verified and a binding
+then failed (the audience, the lifetime or the pod), its digest, and nothing from its claims. Which check failed is one of a closed set the core defines and an
 adapter maps its own failures into: version, unknown key, retired key, encoding, signature,
 malformed, expired, not yet valid, lifetime over the ceiling, wrong audience and wrong pod. Check
 3 denies such a delegation whether or not the profile requires one, under the reason kind
@@ -703,37 +704,55 @@ carries the policy revision it was decided under.
 **The custodian as built** (#12, the crate `key-custodian`). `switchboard-custodian` reads the
 GitHub App's private key from a file at start, and refuses to start if the file is missing,
 unreadable, not an RSA key in PEM, or gives its group or others any access. It serves token
-requests on a Unix socket whose mode it sets, refusing a mode that gives others any access,
-and answers only the UID it is configured for, read from the kernel (`SO_PEERCRED` on Linux,
-`getpeereid` elsewhere). A request names the team, the tool, the repositories (`owner/name`,
-at least one and at most 500), the permissions (at least one) and the revision the call was
-decided under, which while tools are withdrawn is the derived `{base}+withdrawn:{names}` of
-section 13. Its copy of policy is loaded from the registry file by the gateway's own loader
-and read again every few seconds, as the gateway reloads it: each team's repositories are the
-resources of system `github` and kind `repository` in its limit, and each tool's permission
-set is stated on its built-in connector entry, `[[connectors]]` in the registry file, with the
-tools it serves. The set is on the entry, not the approval, because decision 0011 gives an
-entry one credential and registers several permission sets as several entries. The custodian
-applies only the loader's checks, not those the gateway's boot and reload add (a changed
-server or route, the boot gates, bytes that are not UTF-8). A file that passes the loader but
-not the gateway's reload is served by the custodian alone, and if it names a new revision,
-every request is refused as stale until the two agree again, when the gateway restarts on the
-file or the file is fixed. A request is refused if the base of its revision, the part before
-the first `+`, is not the custodian's revision, its team or tool is unknown, a repository is
-outside the team's limit or on another account, or a permission is outside the tool's set or
-above its level there; a refusal comes back typed, and the client turns it into the
-`custodian_refusal` error kind. A withdrawal removes only proxied tools, which the custodian's
-copy does not hold, so the base gives the same copy. Each team has a token bucket, 30 requests
-a minute with a burst of 10 by default, provisionally. A token is asked of GitHub for exactly
-the repositories and permissions requested, and one GitHub issues broader is revoked and not
-handed out. Its lifetime is five minutes by default, never past GitHub's own expiry, and the
-custodian revokes it through GitHub's revoke endpoint when the lifetime ends first. A
-revocation GitHub does not accept is counted, logged and tried again, waiting from a second up
-to a minute between attempts, until GitHub accepts it or the token reaches GitHub's expiry; so
-while GitHub refuses revocations a token works past its lifetime, until GitHub's expiry at
-most, an hour after it was issued. Each request writes one JSON line to
-the custodian's own record, with the revision it was checked against and never the token, and
-is counted on a metrics listener of its own. No demo deploys it: that needs a real App.
+requests on a Unix socket whose mode it sets, refusing a mode that gives others any access, and
+answers only the UID it is configured for, read from the kernel (`SO_PEERCRED` on Linux,
+`getpeereid` elsewhere). It refuses to start when that UID is its own, since any process
+running as the custodian could then ask for tokens. A request names the team, the tool, the
+repositories (`owner/name`, at least one and at most 500), the permissions (at least one) and
+the revision the call was decided under, which while tools are withdrawn is the derived
+`{base}+withdrawn:{names}` of section 13. Its copy of policy is loaded from the registry file
+by the gateway's own loader and read again every few seconds, as the gateway reloads it: each
+team's repositories are the resources of system `github` and kind `repository` in its limit,
+and each tool's permission set is stated on its built-in connector entry, `[[connectors]]` in
+the registry file, with the tools it serves. The set is on the entry, not the approval, because
+decision 0011 gives an entry one credential and registers several permission sets as several
+entries. The loader does not hold a built-in entry's tools to its system, so the custodian
+does: a file in which an entry of system `github` lists a tool not named `github__<tool>` gives
+it no copy, and it refuses to start on it or, at a reload, keeps the copy it serves. The
+custodian applies only the loader's checks, not those the gateway's boot and reload add (a
+changed server or route, the boot gates, bytes that are not UTF-8). A file that passes the
+loader but not the gateway's reload is served by the custodian alone, and if it names a new
+revision, every request is refused as stale until the two agree again, when the gateway
+restarts on the file or the file is fixed. A request is refused if the base of its revision,
+the part before the first `+`, is not the custodian's revision, its team or tool is unknown, a
+repository is outside the team's limit or on another account, or a permission is outside the
+tool's set or above its level there; a refusal comes back typed, and the client turns it into
+the `custodian_refusal` error kind. A withdrawal removes only proxied tools, which the
+custodian's copy does not hold, so the base gives the same copy. Each team has a token bucket,
+30 requests a minute with a burst of 10 by default, provisionally. A token is asked of GitHub
+for exactly the repositories and permissions requested, and one GitHub issues broader is
+revoked and not handed out. The repositories GitHub names are compared with those asked for
+without regard to ASCII case, as GitHub compares names, and must be as many. Its lifetime is
+five minutes by default, never past GitHub's own expiry, and the custodian revokes it through
+GitHub's revoke endpoint when the lifetime ends first. A revocation GitHub does not accept is
+counted, logged and tried again, waiting from a second up to a minute between attempts, until
+GitHub accepts it or the token reaches GitHub's expiry; so while GitHub refuses revocations a
+token works past its lifetime, until GitHub's expiry at most, an hour after it was issued.
+GitHub's 401, to a token it no longer accepts because it already revoked or expired it, counts
+as revoked. A graceful stop (a terminate signal or an interrupt) stops accepting and at once
+revokes every token the custodian handed out, or issued and did not hand out, that is not yet
+revoked or expired, retrying as above; meanwhile it waits for the requests in flight and
+revokes each token GitHub issues for one as it is issued; all within ten seconds, which the
+termination grace must cover. A token not revoked by then is logged and works until GitHub's
+expiry, as does one GitHub issues after then to a request still in flight, and every token when
+the custodian is killed rather than stopped. A stop also ends a token the gateway is using for
+a call in flight, which then fails. Each request writes one JSON line to the custodian's own
+record, with the revision it was checked against and never the token (a malformed request's
+line keeps its tool, and its team unless the team is what is malformed), and is counted on a
+metrics listener of its own. The gateway links the crate's client alone, its `client` feature:
+the code that reads the key, signs the App's JWTs, calls GitHub and serves the socket is the
+`server` feature, which the gateway's build leaves off. No demo deploys it: that needs a real
+App.
 
 **The GitHub connector as built** (#12, the crate `connector-github`). It runs in the
 gateway's own process and holds no key. For each call it asks the custodian for a token,
@@ -1071,7 +1090,8 @@ as an argument, so a call path that skips the audit write does not compile.
 egress setting or currency answer. Those are kept in this gateway's record unless Otto adds
 columns ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). Grant verification
 failures are counted by kind: version, unknown key, retired key, encoding, signature, malformed,
-expired, not yet valid, lifetime over the ceiling, wrong audience and wrong pod. Also counted:
+expired, not yet valid, lifetime over the ceiling, wrong audience and wrong pod, each labelled
+with the name the row records (`lifetime_over_ceiling` for the ceiling). Also counted:
 accepted grants by key ID, which shows a rotation's progress, currency answers by result, and
 the resolver's latency and timeouts. The resolver's are exported on the metrics listener as
 `switchboard_resolver_answers_total{answer}`, every failure counted as `unconfirmed`,
@@ -1125,8 +1145,13 @@ receipt.
   text, is dropped with a warning and leaves the call with no key. It is not passed over for
   the next carrier: a call keyed by its tool-use identifier in place of the key its caller
   chose would lose that key's cover of a replay. A side effect is then denied for want of a
-  key, and its tool-use identifier is still recorded. A `_meta` value of `null` is read as no
-  key sent. A tool-use identifier outside that bound is dropped with a warning too.
+  key, with the reason kind `key_missing` and a sentence of its own: the key the call sent is
+  not valid, what a key is, and that the tool-use identifier is not used in its place; it does
+  not repeat what was sent. Its tool-use identifier is still recorded. The header is read only
+  when the `_meta` field holds nothing, so a header passed over for a `_meta` key is not read,
+  and its warning never says the call carries no key when the `_meta` key keys it. A `_meta`
+  value of `null` is read as no key sent. A tool-use identifier outside that bound is dropped
+  with a warning too.
 - **A key is scoped** to the proved principal and, when a delegation is present, to its
   identifying fields. For Otto those are agreed with Otto's owners; the session and the turn
   are recommended, and whether the execution is needed too is asked.
@@ -1460,7 +1485,9 @@ every tool. Its `[[connectors]]` entry declares its credential's mode and vendor
 principal, its narrowing, what it permits and, for a tool declared as the reach, its reach,
 given together or not at all; an entry that declares them is a connector entry of the
 snapshot, of kind built-in, so the loader's rules apply to its tools, and one that does not
-serves no approved tool and keeps the meaning it had for the key custodian alone. Each tool is
+serves no approved tool and keeps the meaning it had for the key custodian alone. The loader
+refuses a tool declared as the reach on an entry that records no reach, or an empty one, as it
+refuses a proxied entry with none (rule 3): every call would name nothing, and be denied. Each tool is
 approved in `[[built_in_tools]]`, on an entry that lists it: its classification, its
 definition, how its resources are known (from its arguments, as the reach, none, or checked by
 the connector itself, which only gateway code may be), its settlement, and two hashes. One is
@@ -1469,9 +1496,21 @@ system, credential, narrowing, what it permits, permission set and reach. The lo
 recomputes both, as it does a proxied tool's. A resource source may be qualified by a second
 argument, so `{ from_argument = "repo", qualified_by = "owner" }` names the repository
 `owner/repo` exactly as a limit holds it. The gateway registers the connector under each
-entry's name, reads its calls with the registry's adapters behind the argument check, wraps it
-in its bound and quotas, and refuses, at boot and on every reload, an approved definition that
-is not the one the connector serves. The narrowing gate refuses a proxied entry narrowed per
+entry's name, with the tools it serves on that entry, reads its calls with the registry's
+adapters behind the argument check, and wraps it in its bound and quotas.
+
+A built-in connector is gateway code, so its code, not the approval, states what each tool is:
+its classification, and how the resources it reaches are known, from which arguments, as the
+reach, checked by the tool itself, or none (#220). At boot and on every reload the gateway
+refuses an approval on an entry whose connector does not serve the tool there, an approved
+definition that is not the one the connector serves, and an approval that declares other than
+the connector states, with a sentence naming the entry, the tool and both sides. So an approval
+cannot declare `checks_own_scope` or `no_resources` for a tool that checks nothing while it
+runs, which would let check 6 allow a repository outside the caller's limit and leave the row
+with no resources where decision 0011 says `unknown`. What a connector serves is keyed by entry
+and tool, so what it serves on one entry says nothing of another: the GitHub connector serves
+the reach report's tool on a reach-report entry alone, and every other tool on every other
+entry. The narrowing gate refuses a proxied entry narrowed per
 call or to the limit, and no built-in entry: its connector narrows. A reload that changes a
 built-in entry under the same revision is refused as an unchanged revision, as the custodian
 refuses it, and under a new one until a restart, since the connector was built with the entry.
@@ -1559,8 +1598,9 @@ credential that sees the installation's whole list of repositories, since GitHub
 token only the ones it can see, so that credential is a `[[connectors]]` entry of its own, with
 `reports_reach = true`. The loader holds such an entry to that one job: it declares its
 credential, narrowed `none`, permitting `read`, with no reach or reach report of its own; every
-tool approved on it is `read`; and its tools are served only on surfaces restricted to named
-principals, the registry's `registry-reach`. Its one tool,
+tool approved on it is `read`; and its tools are served only on `registry-reach`, restricted
+to one named principal, the registry's own identity (decision 0011, section 4), and on no
+other surface, whoever it admits. Its one tool,
 `github__list_installation_repositories`, takes no arguments and reads
 `GET /installation/repositories`, every page up to 1,000 repositories; a longer list, or one
 short of GitHub's total, is an error, never a list read in part. The key custodian makes one stated
@@ -1568,11 +1608,13 @@ exception for it: a request that names no repository, which GitHub reads as ever
 refused unless its tool is a reach-report entry's and it asks for `metadata: read` and nothing
 else. The flag is in the entry's binding. An entry whose reach is checked this way names the
 tool in `reach_report`, and declares a reach of its own system's repositories; the tool stays
-approved while any of the entry's tools is. The check is opt-in: no rule yet requires a
-`reach_report` of a GitHub entry with a reach, as one requires a proxied entry's `reach_check`,
-so an entry that names none loads, is served, and is never compared with GitHub's report. Its
-tokens are still narrowed to the caller's limit or the call's repository. The drift pass makes
-the check (Drift, below). What the credential permits, its permission set, is not in GitHub's
+approved while any of the entry's tools is. The check is required: a GitHub entry that
+declares a reach and names no `reach_report` is refused, as a proxied entry with a reach and no
+`reach_check` is (#220; when #193 built the report, the check was opt-in). An entry of another
+system may still declare a reach without one, since no other vendor's report is built. The
+drift pass makes the check (Drift, below), each entry's report on a schedule of its own: a
+tick while the last report is still out starts none, and a report's call is given the call
+deadline of the report tool's connector, `[connectors.<name>] deadline_seconds`, plus 5 s. What the credential permits, its permission set, is not in GitHub's
 report; the custodian checks it on every token, and refuses one GitHub issued with any
 permission beyond those asked for. Jira's report, and any proxied server's, are not built.
 
@@ -1966,10 +2008,17 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   first, and records the tool-use identifier beside it (#55; section 11); the profile setting
   `idempotency_key_header`, false unless a policy says so, is the declaration the header needs.
   An explicit key that is not valid leaves the call with no key, so a side effect is denied for
-  want of one. The core's docs say a side effect's `error` means its connector knows nothing
-  took effect, and the proxy connector reports every outcome of a side effect but a success as
-  `unknown` once its request may have been sent, its server's `4xx`, JSON-RPC errors and failed
-  tool results included, since no approval can yet say a proxied tool's errors are safe.
+  want of one; the call context says so (`CallKey::Invalid`), and the denial's sentence says the
+  key it sent is not valid rather than that it carried none (#204). The core's docs say a side
+  effect's `error` means its connector knows nothing took effect, and the proxy connector
+  reports every outcome of a side effect but a success as `unknown` once its request may have
+  been sent, its server's `4xx`, JSON-RPC errors and failed tool results included, since no
+  approval can yet say a proxied tool's errors are safe. Each such outcome is logged at `WARN`
+  as `proxied_side_effect_unknown`, naming the connector, the tool, the kind of answer that
+  came in place of a definite one (`status`, `rpc_error`, `tool_failed`, `not_mcp`,
+  `too_large`, `broken_off`, `timed_out` or `exchange_failed`), the HTTP status when an
+  answer's head arrived and a JSON-RPC error's code; never the server's body, a JSON-RPC
+  error's message or a failed tool result's text (#204).
   Receipts in Postgres and the signals for `unknown` receipts are built (#55, part 2; above, and
   #47 below), and so is reconciliation (#55, part 4; below). Not built: resolution records.
 - Reconciliation of `unknown` receipts: built (#55, part 4), up to where a person must settle
@@ -2222,8 +2271,8 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   start refused with an interval shorter than a call deadline. The vendor-report kind is built
   for GitHub (#193; section 13): each built-in entry with a `reach_report` is checked on a
   schedule of its own, every interval, at once when the pass starts and at each tick unless the
-  last is out, as a canary is. An entry that names no `reach_report` is not checked, and no rule
-  yet requires one of a GitHub entry with a reach (not built). The check sends the report's
+  last is out, as a canary is. A GitHub entry that declares a reach must name one (section 13);
+  an entry of another system need not, and is not checked. The check sends the report's
   tool, a reach-report entry's, through the same listener as the same principal, so it is
   decided and audited like any call, with the deadline `[connectors.<name>]` sets for the tool's
   entry plus the 5 s allowance, and compares the repositories it lists with the entry's recorded
@@ -2313,7 +2362,8 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   policy's age (#132), and each server's drift polls, withdrawals, probe results and
   reach-check results (#166, #167, #176) are exported, labelled only by registry names. The
   late or oversized count is of reads only: a side effect's late or oversized answer is the
-  outcome `unknown` (#55), counted with the errors (the limits entry below).
+  outcome `unknown` (#55), counted under its own outcome, `unknown`, not with the errors
+  (#204; the limits entry below).
 
 **#11, the argument check against the approved schema.** Built (#122): the loader accepts a
 subset of JSON Schema 2020-12 and refuses anything else at load, including a `$schema` naming
@@ -2381,11 +2431,11 @@ checked; a schema that needs them cannot be approved yet.
   and calls to other servers, are not held up. `tests/limits.rs` shows it.
 - The metrics of section 9 that these give: built. `switchboard_calls_shed_total{scope}`, with
   `scope` one of `instance`, `server` and `team`; and, labelled by the server's name in the
-  registry only, `switchboard_proxied_calls_total{server,outcome}`,
-  `switchboard_proxied_call_seconds{server}` and
+  registry only, `switchboard_proxied_calls_total{server,outcome}`, `outcome` one of `ok`,
+  `error`, `refused` and `unknown`, `switchboard_proxied_call_seconds{server}` and
   `switchboard_proxied_late_or_oversized_total{server}`, the last from the error kind
-  `oversized_or_late_read`, so it counts reads only; a side effect's is the outcome `unknown`,
-  counted with the errors (#55). Both demos show overload and a hanging server (the
+  `oversized_or_late_read`, so it counts reads only; a side effect's is the outcome `unknown`
+  (#55), counted under `outcome="unknown"`, not with the errors (#204). Both demos show overload and a hanging server (the
   demonstrations entry under #11 above). The configurable audit pools and the row's size bound
   are in the #11 list above.
 
@@ -2403,23 +2453,24 @@ other profile, at the currency check, check 6, check 4 and the key check, and on
 listing their exception in any deployed policy, which waits on the security owner's signature
 ([route-exceptions.md](route-exceptions.md)).
 
-- Built, as the crate `key-custodian`: the key custodian and its client (section 9). Its
-  tests run it against a fake GitHub App API that checks the App JWT and issues dummy tokens
-  scoped as asked, with keys generated per run: a token within policy, narrowed exactly; each
-  refusal (a repository outside the team's limit or on another account, a permission outside
-  the tool's set or above its level, more than 500 repositories, an unknown team or tool, a
-  stale revision, a peer of another UID); a revision derived by withdrawals checked by its
-  base; the rate limit; revocation at the end of the lifetime; a revocation GitHub fails tried
-  again until it is accepted, and given up at GitHub's expiry; a widened token revoked and
-  counted; the record holding no token; nothing a client receives, nor the record or the
-  metrics, holding the key; and each start refusal. The peer check is tested the same way on
-  Linux and macOS: the socket is served to another UID than the test's. The registry's
-  `[[connectors]]` states each built-in entry's permission set and tools. Not built: any
-  deployment of the custodian. Left as they are: a token whose revocation GitHub keeps refusing,
-  and any token not yet revoked when the custodian stops, works until GitHub's expiry, an hour
-  at most after it was issued; and a registry file under a new revision that the loader accepts
-  but the gateway's reload refuses makes the custodian refuse every request as stale until the
-  two agree.
+- Built, as the crate `key-custodian`: the key custodian and its client (section 9). Its tests
+  run it against a fake GitHub App API that checks the App JWT and issues dummy tokens scoped
+  as asked, with keys generated per run: a token within policy, narrowed exactly; each refusal
+  (a repository outside the team's limit or on another account, a permission outside the tool's
+  set or above its level, more than 500 repositories, an unknown team or tool, a stale
+  revision, a peer of another UID); a revision derived by withdrawals checked by its base; the
+  rate limit; revocation at the end of the lifetime; a revocation GitHub fails tried again
+  until it is accepted, and given up at GitHub's expiry; a widened token revoked and counted;
+  the record holding no token; nothing a client receives, nor the record or the metrics,
+  holding the key; and each start refusal. The peer check is tested the same way on Linux and
+  macOS: the socket is served to another UID than the test's. The registry's `[[connectors]]`
+  states each built-in entry's permission set and tools. Not built: any deployment of the
+  custodian. Left as they are: a token whose revocation GitHub keeps refusing, or does not
+  accept within the stop's deadline, a token GitHub issues after that deadline to a request
+  still in flight, and any token when the custodian is killed rather than stopped, works until
+  GitHub's expiry, an hour at most after it was issued; and a registry file under a new
+  revision that the loader accepts but the gateway's reload refuses makes the custodian refuse
+  every request as stale until the two agree.
 
 - Built, as the crate `connector-github`: the GitHub connector and its first three read
   tools, `github__get_file`, `github__get_pr` and `github__get_issue` (section 13), with
@@ -2541,20 +2592,27 @@ before and after the network policy; the kind claim holds only while the evidenc
   the group order, no small-order point) before the claims are decoded, then canonical
   encoding, then the claims: `aud`, `iat` and `exp` with 30 seconds of leeway, the 15-minute
   ceiling, and `pod` and `egress` once the issuer requires them. A failure is one of section
-  11's kinds and, only once the signature verified, the grant's digest, and nothing from the
-  claims. The clock is passed in. The grant-key configuration refuses private key material, a
-  small-order or non-canonical key, a key twice or under two issuers, and a previous key with
-  no end instant; a previous key retires at its absolute end instant without a restart. The
-  tool mapping is one-to-one, read from a mapping file or from `conformance/baseline.json`, and
-  a name it lacks is dropped. A test minter is behind `test-support`.
+  11's kinds and, only for a binding's failure (the audience, the lifetime or the pod), the
+  grant's digest, and nothing from the claims: a signed grant refused for its encoding or its
+  claims' shape carries no digest. An integer claim is digits only, so `-0`, a fraction and an
+  exponent are refused as malformed. The clock is passed in. Strict verification is pinned by
+  a grant whose R is of small order, which only a lax verifier accepts. The grant-key
+  configuration refuses an empty or repeated issuer name, private key material, a key file that
+  is not one public key, a small-order or non-canonical key, a key twice or under two issuers,
+  and a previous key with no end instant; a previous key retires at its absolute end instant
+  without a restart. The tool mapping is one-to-one, read from a mapping file, from
+  `conformance/baseline.json` or as a member of the JSON configuration, where a name given
+  twice is refused rather than the last kept, and a name it lacks is dropped. A test minter is
+  behind `test-support`.
 - Built in the gateway (#22): grant keys read at boot from the deployment file's `[grants]`
   table, and the verifier run on every `tools/call` and `tools/list` that carries a grant,
   whatever the profile requires (section 7). A verified grant fills the row's delegation
   columns, and the pod UID is the caller's; a failure is recorded on the row denied at check 3,
   logged and counted as section 11 says (`switchboard_grant_failures_total{kind}`, and
   `switchboard_grants_accepted_total{key_id}`); an audience or pod failure is logged at
-  `ERROR` with its digest, a lifetime failure only counted, and nothing from a refused grant's
-  claims reaches the row, the answer or the log. The gates at boot and at snapshot load, and
+  `ERROR` with its digest, a lifetime failure only counted, any other failure logged at `WARN`
+  with no digest, and nothing from a refused grant's claims reaches the row, the answer or the
+  log. Each key-configuration refusal is reached through the gateway's boot. The gates at boot and at snapshot load, and
   CI's check that the release artifact refuses grant checking off: built (section 12). The
   tests run every group of decision 0012's except currency through the HTTP endpoint, with the
   test minter: replay, another deployment and pod, format and forgery, clock skew at the leeway
@@ -2801,8 +2859,8 @@ Otto promises. These findings inform Q9–Q13; they are not silent changes to th
     0013](decisions/0013-registry-freshness-drift-and-withdrawal.md) sets.
   - Failures. A grant that fails verification denied at check 3 as an unverified delegation,
     under one reason kind, with a deny row that records which check failed and no claims. An
-    audience or pod failure also recorded with the grant's digest; a bad signature recorded
-    with no digest. A lifetime failure counted by kind. A verifier that denies on its own, and
+    audience or pod failure also recorded with the grant's digest; a bad signature, and a
+    signed grant refused for its encoding or its claims, recorded with no digest. A lifetime failure counted by kind. A verifier that denies on its own, and
     a failure kind used as a reason kind, are mutations that must be caught.
   - Composition. A grant that lists a `write` tool no exception names, denied at check 5. Once
     decision 0011's exception exists, a grant that lists an excepted comment tool, allowed only

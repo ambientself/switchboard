@@ -8,8 +8,11 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use curve25519_dalek::traits::Identity;
+use curve25519_dalek::{EdwardsPoint, Scalar};
 use ed25519_dalek::{Signer, SigningKey};
 use rand_core::{OsRng, RngCore};
+use sha2::{Digest, Sha512};
 
 use crate::format::{CANONICAL, GROUP_ORDER, KeyId, VERSION, signed_bytes};
 use crate::keys::SPKI_PREFIX;
@@ -91,6 +94,71 @@ impl TestMinter {
                 encoded_claims.as_bytes(),
             ))
             .to_bytes()
+    }
+}
+
+/// Signs grants whose signature only a lax verifier accepts: R is the identity point, which is
+/// of small order, and S is chosen so that `[S]B = R + [k]A` holds anyway. RFC 8032's
+/// verification equation is met, S is below the group order and the key is an ordinary one, so
+/// only the strict rule that R not be of small order refuses it.
+///
+/// It needs the private scalar itself, not a seed, so it keeps one of its own rather than a
+/// signing key.
+pub struct SmallOrderRMinter {
+    scalar: Scalar,
+    public_key: [u8; 32],
+}
+
+impl SmallOrderRMinter {
+    /// A minter with a scalar from the operating system's randomness.
+    pub fn generate() -> Self {
+        let mut wide = [0; 64];
+        OsRng.fill_bytes(&mut wide);
+        let scalar = Scalar::from_bytes_mod_order_wide(&wide);
+        Self {
+            scalar,
+            public_key: EdwardsPoint::mul_base(&scalar).compress().to_bytes(),
+        }
+    }
+
+    /// The public key's 32 bytes.
+    pub fn public_key(&self) -> [u8; 32] {
+        self.public_key
+    }
+
+    /// The public key's ID.
+    pub fn key_id(&self) -> KeyId {
+        KeyId::of(&self.public_key)
+    }
+
+    /// The public key as a key file holds it: PEM, `PUBLIC KEY`.
+    pub fn public_key_pem(&self) -> String {
+        public_key_pem(&self.public_key)
+    }
+
+    /// A canonically encoded grant with these claims, whose R is the identity point.
+    pub fn mint(&self, claims: &serde_json::Value) -> String {
+        let key_id = self.key_id();
+        let encoded_claims = CANONICAL.encode(claims.to_string());
+        let r = EdwardsPoint::identity().compress().to_bytes();
+        let mut hash = Sha512::new();
+        hash.update(r);
+        hash.update(self.public_key);
+        hash.update(signed_bytes(
+            VERSION.as_bytes(),
+            key_id.as_str().as_bytes(),
+            encoded_claims.as_bytes(),
+        ));
+        let k = Scalar::from_bytes_mod_order_wide(&hash.finalize().into());
+        // [S]B = [k·a]B = [k]A, so [S]B − [k]A is the identity, which is R.
+        let s = k * self.scalar;
+        let mut signature = [0; 64];
+        signature[..32].copy_from_slice(&r);
+        signature[32..].copy_from_slice(s.as_bytes());
+        format!(
+            "{VERSION}.{key_id}.{encoded_claims}.{}",
+            CANONICAL.encode(signature)
+        )
     }
 }
 

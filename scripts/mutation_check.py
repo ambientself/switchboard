@@ -615,33 +615,38 @@ DECIDE_CHECKED = (
     "        Some(call.currency),\n"
     "        Some(&call.resources),\n"
     "    )\n"
-    "    .and_then(|(tool, exception)| {\n"
-    "        key_is_carried(tool, call.key.as_ref()).map(|()| (tool, exception))\n"
-    "    });\n"
+    "    .and_then(|(tool, exception)| key_is_carried(tool, &call.key).map(|()| (tool, exception)));\n"
 )
 mutate("key-check-on-list", "tools/list runs the key check, so a proposal is never listed", SRC + "decision.rs",
        "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None, None).ok())",
-       "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None, None).and_then(|passed| key_is_carried(passed.0, None).map(|()| passed)).ok())")
+       "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None, None).and_then(|passed| key_is_carried(passed.0, &CallKey::Absent).map(|()| passed)).ok())")
 mutate("key-check-before-resources", "the key check runs before check 6, so a call outside its limit is asked for a key", SRC + "decision.rs",
        DECIDE_CHECKED,
        "    let checked = check(snapshot, &call.caller, &call.tool, Some(call.currency), None)\n"
-       "        .and_then(|(tool, _)| key_is_carried(tool, call.key.as_ref()))\n"
+       "        .and_then(|(tool, _)| key_is_carried(tool, &call.key))\n"
        "        .and_then(|()| check(snapshot, &call.caller, &call.tool, Some(call.currency), Some(&call.resources)));\n")
 mutate("key-check-before-currency", "the key check runs before the currency check, so a turn that is not current is asked for a key",
        SRC + "decision.rs", DECIDE_CHECKED,
        "    let checked = check(snapshot, &call.caller, &call.tool, None, None)\n"
-       "        .and_then(|(tool, _)| key_is_carried(tool, call.key.as_ref()))\n"
+       "        .and_then(|(tool, _)| key_is_carried(tool, &call.key))\n"
        "        .and_then(|()| check(snapshot, &call.caller, &call.tool, Some(call.currency), Some(&call.resources)));\n")
 mutate("key-check-first", "the key check runs before every other check, so a denied write is asked for a key", SRC + "decision.rs",
        DECIDE_CHECKED,
        "    let checked = call.tool.name().ok().and_then(|name| snapshot.tool(&name))\n"
-       "        .map_or(Ok(()), |tool| key_is_carried(tool, call.key.as_ref()))\n"
+       "        .map_or(Ok(()), |tool| key_is_carried(tool, &call.key))\n"
        "        .and_then(|()| check(snapshot, &call.caller, &call.tool, Some(call.currency), Some(&call.resources)));\n")
 KEY_CARRIED = "    if tool.classification == Classification::Read || key.is_some() {"
 mutate("key-check-removed", "a side effect with no key is allowed", SRC + "decision.rs",
        KEY_CARRIED, "    if true || tool.classification == Classification::Read || key.is_some() {")
 mutate("key-check-on-reads", "a read needs a key too", SRC + "decision.rs",
        KEY_CARRIED, "    if key.is_some() {")
+# A call that sent a key that is not valid carries none, and its denial says that is why, not
+# that it carried none (#204). The decision table, tests/properties.rs and the gateway's
+# tests/keys.rs catch these.
+mutate("key-invalid-reads-as-missing", "a call whose explicit key is not valid is denied as one that sent none", SRC + "decision.rs",
+       "            invalid: *carried == CallKey::Invalid,\n", "            invalid: false,\n")
+mutate("sentence-key-invalid-as-missing", "the sentence for a key that is not valid is the one for no key", SRC + "sentences.rs",
+       "            if *invalid { KEY_INVALID } else { KEY_MISSING },\n", "            KEY_MISSING,\n")
 mutate("key-bound-short", "a key of 128 characters is refused", SRC + "receipt.rs",
        "            && value.len() <= MAX_IDEMPOTENCY_KEY\n", "            && value.len() < MAX_IDEMPOTENCY_KEY\n")
 mutate("key-with-space-accepted", "a key may hold a space", SRC + "receipt.rs",
@@ -649,28 +654,33 @@ mutate("key-with-space-accepted", "a key may hold a space", SRC + "receipt.rs",
        "            && value.bytes().all(|byte| byte.is_ascii_graphic() || byte == b' ');")
 # The gateway fills the key from the caller's tool-use identifier, its first carrier.
 mutate("gw-key-not-from-tool-use-id", "the tool-use identifier never keys a call, so a proposal that sends only one is denied", "crates/gateway/src/path.rs",
-       "        Explicit::Absent => tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok()),\n",
-       "        Explicit::Absent => tool_use_id.and(None),\n")
+       "        Explicit::Absent => tool_use_id\n            .and_then(|id| IdempotencyKey::parse(id.as_str()).ok())\n",
+       "        Explicit::Absent => tool_use_id\n            .and(None)\n")
 # The other carriers (#55): a key sent on purpose comes first, in the _meta field, or else in
 # the Idempotency-Key header from a profile that declares its callers set it per request; the
 # tool-use identifier is recorded beside it. crates/gateway/tests/keys.rs catches these.
 mutate("gw-key-meta-ignored", "the gateway never reads a key from the switchboard/idempotencyKey _meta field", "crates/gateway/src/path.rs",
        "            meta_key(idempotency_key),", "            meta_key(None),")
 mutate("gw-key-header-from-any-profile", "the Idempotency-Key header keys a call under a profile that does not declare it", "crates/gateway/src/path.rs",
-       "            key_header.honoured(declares_header),", "            key_header.honoured(true || declares_header),")
+       "            || key_header.honoured(declares_header),", "            || key_header.honoured(true || declares_header),")
 mutate("gw-key-tool-use-id-first", "the tool-use identifier is preferred over an explicit key", "crates/gateway/src/path.rs",
-       "    match meta.or(header) {\n        Explicit::Valid(key) => Some(key),\n",
+       "    match meta.or_else(header) {\n        Explicit::Valid(key) => CallKey::Valid(key),\n",
        "    if let Some(key) = tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok()) {\n"
-       "        return Some(key);\n    }\n"
-       "    match meta.or(header) {\n        Explicit::Valid(key) => Some(key),\n")
+       "        return CallKey::Valid(key);\n    }\n"
+       "    match meta.or_else(header) {\n        Explicit::Valid(key) => CallKey::Valid(key),\n")
 # An explicit key that is not valid leaves the call with no key, so a side effect is denied; it
 # is not passed over for the tool-use identifier, which would lose the chosen key's cover of a
 # replayed turn. keys.rs catches this.
 mutate("gw-key-invalid-falls-back", "an explicit key that is not valid is passed over, and the call keyed by its tool-use identifier", "crates/gateway/src/path.rs",
-       "        Explicit::Invalid => None,\n",
-       "        Explicit::Invalid => tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok()),\n")
+       "        Explicit::Invalid => CallKey::Invalid,\n",
+       "        Explicit::Invalid => tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok()).into(),\n")
 mutate("gw-key-invalid-meta-passed-over", "a _meta key that is not valid is passed over for the header", "crates/gateway/src/path.rs",
-       "            Self::Absent => next,\n", "            Self::Absent | Self::Invalid => next,\n")
+       "            Self::Absent => next(),\n", "            Self::Absent | Self::Invalid => next(),\n")
+# The header is read only when the _meta field holds nothing, so a header passed over for a
+# _meta key never logs that the call carries no key (#204). path.rs's own tests catch this.
+mutate("gw-key-header-read-beside-meta", "the Idempotency-Key header is read even when the _meta field holds a key", "crates/gateway/src/path.rs",
+       "    match meta.or_else(header) {\n",
+       "    let header = header();\n    match meta.or_else(|| header) {\n")
 # A _meta key that is not a string is a key that is not valid, not an absent one, so it too
 # leaves the call with no key. keys.rs catches the first, the parse table the second.
 mutate("gw-key-non-string-meta-absent", "a _meta key that is not a string is read as no key sent, and the call keyed by its next carrier", "crates/gateway/src/path.rs",
@@ -918,8 +928,20 @@ mutate("ran-fields-public", "a run can be made up", SRC + "audit.rs",
 mutate("row-completion-fields-public", "a store's finish can be called for any row", SRC + "audit.rs",
        "pub struct RowCompletion {\n    row: AuditRowId,\n    completion: Completion,\n    reference: Option<VendorReference>,",
        "pub struct RowCompletion {\n    pub row: AuditRowId,\n    pub completion: Completion,\n    pub reference: Option<VendorReference>,")
-mutate("tool-call-constructor-public", "a connector can be called around the audited path", SRC + "connector.rs",
-       "    pub(crate) fn new(\n        call: CallContext,", "    pub fn new(\n        call: CallContext,")
+# ToolCall::new takes what the decision granted, a crate-private type, so making new public alone
+# would still leave nothing outside the core able to call it: the grant is made public and
+# exported with it.
+mutate_all(
+    "tool-call-constructor-public",
+    "a connector can be called around the audited path",
+    (SRC + "connector.rs", "    pub(crate) fn new(\n        call: CallContext,", "    pub fn new(\n        call: CallContext,"),
+    (SRC + "connector.rs",
+     "pub(crate) struct Granted {\n    pub(crate) policy_revision: PolicyRevision,\n    pub(crate) caller_limit: Option<Vec<Resource>>,\n}",
+     "pub struct Granted {\n    pub policy_revision: PolicyRevision,\n    pub caller_limit: Option<Vec<Resource>>,\n}"),
+    (SRC + "lib.rs",
+     "pub use connector::{BoxFuture, Connector, ErrorKind, ToolCall, ToolOutcome};",
+     "pub use connector::{BoxFuture, Connector, ErrorKind, Granted, ToolCall, ToolOutcome};"),
+)
 mutate("connector-run-without-call", "a connector runs without being handed the call", SRC + "connector.rs",
        "    fn run(&self, call: ToolCall) -> BoxFuture<'_, ToolOutcome>;", "    fn run(&self) -> BoxFuture<'_, ToolOutcome>;", breaks_build=True)
 mutate("run-drops-arguments", "the connector is not given the call's arguments", SRC + "audit.rs",
@@ -990,6 +1012,29 @@ mutate("record-delegation-failure-on-earlier-denial",
        "a delegation's failure is recorded on a row denied before check 3", SRC + "audit.rs",
        "        delegation_failure.filter(|_| reason == Some(ReasonKind::DelegationUnverified));",
        "        delegation_failure.filter(|_| reason.is_some());")
+# The core's own test store refuses the delegation shapes the testkit's store and Postgres refuse
+# (migration 0010, #211), so the core's tests fail if it ever writes one. audit_flow.rs's
+# the_test_store_refuses_the_delegation_shapes_the_other_stores_refuse catches these.
+CORE_STORE = CRATE + "tests/common/mod.rs"
+mutate("core-store-failure-beside-claims", "the core's test store records a delegation's failure beside its claims", CORE_STORE,
+       "    if record.delegation.is_some()\n        || record.proved_delegation_team.is_some()\n        || record.claimed_acting_person.is_some()\n    {",
+       "    if false {")
+mutate("core-store-digest-without-binding", "the core's test store records a digest with a failure that is not a binding's", CORE_STORE,
+       "    if failure.digest.is_some() && !failure.failure.follows_signature() {", "    if false {")
+mutate("core-store-failure-on-any-row", "the core's test store records a delegation's failure on a row check 3 did not deny for it", CORE_STORE,
+       "    if !at_check_3 || record.decision != DecisionKind::Deny {", "    if false {")
+mutate("core-store-check-3-without-failure", "the core's test store writes a denial at check 3 that records no failure", CORE_STORE,
+       "        return if at_check_3 {\n            Err(violates(\"delegation_failure_shape\"))\n        } else {\n            Ok(())\n        };",
+       "        return Ok(());")
+mutate("core-store-delegation-without-team", "the core's test store records a verified delegation without its team or person", CORE_STORE,
+       "    if !(team && person) {", "    if false {")
+mutate("core-store-epoch-past-bigint", "the core's test store records a delegation's epoch past a Postgres bigint", CORE_STORE,
+       "    if i64::try_from(delegation.epoch).is_err() {", "    if false {")
+mutate("core-store-receipt-begin-unchecked", "the core's test store's begin with a receipt writes any delegation shape", CORE_STORE,
+       "        refused_shape(record)?;\n", "")
+mutate("core-store-list-unchecked", "the core's test store writes a list row with a verified delegation without its team or person", CORE_STORE,
+       "        } else if let Err(refused) = refused_delegation(\n            record.delegation.as_ref(),",
+       "        } else if let Err(refused) = refused_delegation(\n            None,")
 mutate("outcome-ok-renamed", "the Ok outcome is written as `success`", SRC + "audit.rs",
        "    Ok,\n    /// The ", "    #[serde(rename = \"success\")]\n    Ok,\n    /// The ")
 mutate("outcome-error-renamed", "the Error outcome is written as `failed`", SRC + "audit.rs",
@@ -1633,6 +1678,11 @@ mutate("otto-grant-s-unchecked", "a non-canonical S is left to the signature lib
        "        if !s_is_canonical(&signature_bytes) {", "        if false {")
 mutate("otto-grant-signature-unchecked", "a signature that does not verify is accepted", OV,
        "            .map_err(|_| refuse(FailureKind::Signature))?;", "            .ok();")
+# Strict verification (#211): tests/forgery.rs's grant whose R is of small order, which only the
+# lax check accepts, catches this.
+mutate_all("otto-grant-signature-lax", "the signature is verified with the lax check, which accepts a small-order R",
+           (OV, "use ed25519_dalek::Signature;\n", "use ed25519_dalek::{Signature, Verifier as _};\n"),
+           (OV, "            .verify_strict(\n", "            .verify(\n"))
 mutate("otto-grant-claims-before-signature", "the claims are decoded before the signature is checked", OV,
        "        // 3. The signature, before the claims are decoded.\n",
        "        LENIENT.decode(claims).ok().and_then(|bytes| Claims::parse(&bytes, false, false)).ok_or(refuse(FailureKind::Malformed))?;\n")
@@ -1652,6 +1702,14 @@ mutate("otto-grant-digest-dropped", "a failure after the signature verified carr
 mutate("otto-grant-digest-of-decoded-claims", "the digest is taken over the decoded claims, not the grant as presented", OV,
        "        let digest = GrantDigest::of(grant);",
        "        let digest = GrantDigest::of(&LENIENT.decode(claims).unwrap_or_default());")
+# Only a binding's failure carries the digest (#213): a signed grant refused for its encoding or
+# its claims' shape carries none. tests/forgery.rs, tests/format_doc.rs and the gateway's
+# tests/grant_logs.rs catch these.
+mutate("otto-grant-digest-on-encoding", "a signed grant refused for its encoding carries its digest", OV,
+       "            || CANONICAL.encode(&claims_bytes).as_bytes() != claims\n        {\n            return Err(refuse(FailureKind::Encoding));",
+       "            || CANONICAL.encode(&claims_bytes).as_bytes() != claims\n        {\n            return Err(bind(FailureKind::Encoding));")
+mutate("otto-grant-digest-on-malformed", "a signed grant whose claims are malformed carries its digest", OV,
+       "            .ok_or(refuse(FailureKind::Malformed))?;", "            .ok_or(bind(FailureKind::Malformed))?;")
 mutate("otto-grant-empty-tools-accepted", "a grant with no tools is accepted", OV,
        ".filter(|tools| !tools.is_empty() && tools.iter().all(|tool| !tool.is_empty()))?;",
        ".filter(|tools| tools.iter().all(|tool| !tool.is_empty()))?;")
@@ -1682,6 +1740,19 @@ mutate("otto-grant-unknown-key-falls-back", "an unknown key ID is verified with 
        "            .and_then(|id| self.keys.keys.get_key_value(id).or_else(|| self.keys.keys.iter().next()))\n")
 mutate("otto-grant-epoch-zero-accepted", "a grant with epoch 0 is accepted", OV,
        ".filter(|epoch| *epoch > 0)", ".filter(|epoch| *epoch >= 0)")
+# An integer is digits only (#211): `-0`, which JSON reads as a float, is not read as zero.
+# tests/forgery.rs catches this.
+mutate_all("otto-grant-negative-zero-read-as-zero", "iat is read through a float, so -0 and 1800000000.0 are read as integers",
+           (OV, '    #[serde(default, deserialize_with = "present")]\n    iat: Option<i64>,',
+            '    #[serde(default, deserialize_with = "through_float")]\n    iat: Option<i64>,'),
+           (OV, "/// A member that is present is its value, never `null`.",
+            "fn through_float<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<i64>, D::Error> {\n"
+            "    Ok(Some(f64::deserialize(deserializer)? as i64))\n}\n\n"
+            "/// A member that is present is its value, never `null`."))
+# One name for the lifetime failure (#213): the counter's label is the row's. tests/binding.rs,
+# tests/format_doc.rs, the gateway's grants.rs and tests/grant_logs.rs catch this.
+mutate("otto-grant-lifetime-label-short", "the lifetime failure is labelled `lifetime`, not the row's `lifetime_over_ceiling`", OV,
+       'FailureKind::LifetimeOverCeiling => "lifetime_over_ceiling",', 'FailureKind::LifetimeOverCeiling => "lifetime",')
 mutate("otto-grant-required-pod-optional", "a grant without pod is accepted when the issuer requires it", OV,
        "        if require_pod && claims.pod.is_none() {", "        if false {")
 mutate("otto-grant-required-egress-optional", "a grant without egress is accepted when the issuer requires it", OV,
@@ -1771,6 +1842,11 @@ mutate("otto-mapping-last-one-wins", "a mapping file's repeated name keeps only 
 mutate("otto-mapping-unmapped-kept", "a name the mapping lacks is kept when it is a valid tool name", OT,
        ".filter_map(|name| self.get(name).cloned())",
        ".filter_map(|name| self.get(name).cloned().or_else(|| ToolName::parse(name).ok()))")
+# The mapping read as a member of the JSON configuration (#213) refuses a name given twice, as a
+# mapping file does. tests/mapping.rs and the gateway's grants.rs and tests/grants.rs catch this.
+mutate("otto-mapping-member-last-one-wins", "a mapping read inside the JSON configuration keeps only the last of a repeated name", OT,
+       "        let entries = Entries::<String>::deserialize(deserializer)?;\n        Self::from_pairs(entries.0)",
+       "        let entries = BTreeMap::<String, String>::deserialize(deserializer)?;\n        Self::from_pairs(entries)")
 
 # The resolver client (decisions 0003 and 0012, #22): the one-second budget enforced by the
 # client, no cache, a bounded answer, the version and the echo checked, and every failure read
@@ -3112,6 +3188,12 @@ mutate("gw-bulkhead-before-argument-check", "the caps are taken before the argum
        "                drop(self.inner.run(call));\n"
        "                Box::pin(std::future::ready(outcome))\n"
        "            }\n")
+# A side effect with no definite answer is counted under outcome="unknown", not "error" (#204).
+# bulkhead.rs's and metrics.rs's own tests, and tests/limits.rs, catch these.
+mutate("gw-bulkhead-unknown-as-error", "a proxied call whose outcome is unknown is counted as an error", GW_BULKHEAD,
+       "            ToolOutcome::Unknown => &self.unknown,\n", "            ToolOutcome::Unknown => &self.error,\n")
+mutate("gw-metrics-unknown-not-written", "the proxied calls whose outcome is unknown are not written", GW + "metrics.rs",
+       "            (\"unknown\", counts.unknown),\n", "")
 mutate("gw-shed-not-counted", "a call a server's or a team's cap refused is not counted as shed", GW_BULKHEAD,
        "        counter.fetch_add(1, Ordering::Relaxed);\n        tracing::warn!(\n            event = \"call_shed\",\n",
        "        let _ = counter;\n        tracing::warn!(\n            event = \"call_shed\",\n")
@@ -3545,17 +3627,17 @@ mutate("proxy-deadline-not-applied", "a call is never abandoned", PC,
 # side effect may have been sent, the server's own refusal or failure included, since no approval
 # can yet say a proxied tool's errors are safe; a failure before anything was sent stays an error.
 mutate("proxy-late-read-kind-other", "an oversized or late answer from a read is recorded as other", PC,
-       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence)",
-       "        self.without_answer(ErrorKind::Other, sentence)")
+       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence, unanswered)",
+       "        self.without_answer(ErrorKind::Other, sentence, unanswered)")
 mutate("proxy-late-non-read-kind-late", "an oversized or late answer from a propose tool is recorded as a late read", PC,
        "        let sent = if tool.classification == Classification::Read {",
        "        let sent = if true || tool.classification == Classification::Read {")
 mutate("proxy-late-side-effect-as-error", "a side effect's answer too large, too late or broken off is reported as an error, settling its receipt not_performed", PC,
-       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence)",
-       "        if self == Sent::SideEffect {\n            return ToolOutcome::error(ErrorKind::Other, sentence);\n        }\n"
-       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence)")
+       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence, unanswered)",
+       "        if matches!(self, Sent::SideEffect { .. }) {\n            return ToolOutcome::error(ErrorKind::Other, sentence);\n        }\n"
+       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence, unanswered)")
 mutate("proxy-side-effect-unanswered-as-error", "every failure without a definite answer from a side effect is reported as an error", PC,
-       "            Sent::SideEffect => ToolOutcome::Unknown,", "            Sent::SideEffect => ToolOutcome::error(kind, sentence),")
+       "                ToolOutcome::Unknown\n", "                ToolOutcome::error(kind, sentence)\n")
 mutate("proxy-unconnected-side-effect-unknown", "a side effect whose connection could not be made is reported unknown, though nothing was sent", PC,
        "            } else if error.is_connect() {", "            } else if false && error.is_connect() {")
 mutate("proxy-side-effect-4xx-error", "a side effect the server answered with a 4xx is reported as an error, settling its receipt not_performed", PC,
@@ -3565,10 +3647,26 @@ mutate("proxy-side-effect-4xx-error", "a side effect the server answered with a 
        "        }\n"
        "        if status != StatusCode::OK {\n")
 mutate("proxy-side-effect-401-error", "a side effect the server answered with a 401 is reported as an error, settling its receipt not_performed", PC,
-       "            return Err(sent.without_answer(ErrorKind::Other, outcome::CREDENTIAL_REJECTED));",
+       "            return Err(sent.without_answer(\n                ErrorKind::Other,\n"
+       "                outcome::CREDENTIAL_REJECTED,\n                unanswered,\n            ));",
        "            return Err(ToolOutcome::error(ErrorKind::Other, outcome::CREDENTIAL_REJECTED));")
-mutate("proxy-side-effect-tool-error-not-performed", "a side effect's JSON-RPC error or isError result is reported as an error, settling its receipt not_performed", PC,
-       "                    Ok(ToolOutcome::Error(kind, sentence)) => sent.without_answer(kind, &sentence),\n", "")
+mutate_all("proxy-side-effect-tool-error-not-performed", "a side effect's JSON-RPC error or isError result is reported as an error, settling its receipt not_performed",
+           (PC, "sent.without_answer(ErrorKind::Other, &sentence, Unanswered::RpcError(code))",
+            "ToolOutcome::error(ErrorKind::Other, &sentence)"),
+           (PC, "sent.without_answer(ErrorKind::Other, &sentence, Unanswered::ToolFailed)",
+            "ToolOutcome::error(ErrorKind::Other, &sentence)"))
+# A side effect that becomes unknown is logged with what came in place of an answer and its HTTP
+# status, and never the server's text (#204). tests/unknown_logs.rs catches these.
+mutate("proxy-unknown-not-logged", "a side effect whose outcome becomes unknown is not logged", PC,
+       "                tracing::warn!(\n                    event = SIDE_EFFECT_UNKNOWN_EVENT,\n",
+       "                tracing::trace!(\n                    event = SIDE_EFFECT_UNKNOWN_EVENT,\n")
+mutate("proxy-unknown-logs-body", "the line logged for a side effect's unknown outcome holds the server's text", PC,
+       "                    rpc_code = unanswered.rpc_code(),\n",
+       "                    rpc_code = unanswered.rpc_code(),\n                    sentence,\n")
+mutate("proxy-unknown-status-dropped", "the line logged for a side effect's unknown outcome does not name the HTTP status", PC,
+       "            Unanswered::Status(status) => Some(status),\n", "            Unanswered::Status(_) => None,\n")
+mutate("proxy-unknown-kind-wrong", "a JSON-RPC error is logged as a failed tool result", PC,
+       "            Unanswered::RpcError(_) => \"rpc_error\",\n", "            Unanswered::RpcError(_) => \"tool_failed\",\n")
 mutate("proxy-default-deadline-longer", "the default deadline is 30 s", PC,
        "Duration = Duration::from_secs(5);", "Duration = Duration::from_secs(30);")
 mutate("proxy-default-cap-larger", "the default cap is 1 MiB", PC, "usize = 64 * 1024;", "usize = 1024 * 1024;")
@@ -3583,7 +3681,7 @@ mutate("proxy-declared-length-off-by-one", "a declared length of exactly the cap
        "            .is_some_and(|length| length > self.max_response_bytes as u64)",
        "            .is_some_and(|length| length >= self.max_response_bytes as u64)")
 mutate("proxy-broken-body-read-as-complete", "a body that breaks off is read as if complete", PC,
-       "            let frame = frame.map_err(|_| sent.late(outcome::BROKEN_OFF))?;",
+       "            let frame = frame.map_err(|_| sent.late(outcome::BROKEN_OFF, Unanswered::BrokenOff))?;",
        "            let Ok(frame) = frame else { break };")
 # What is sent, and to whom.
 mutate("proxy-credential-not-sent", "the request carries no credential", PC,
@@ -3611,13 +3709,14 @@ mutate("proxy-401-not-named", "a rejected credential is reported as a bare statu
        "        if status == StatusCode::UNAUTHORIZED {", "        if false {")
 # A 403 is the vendor's refusal (#61): from a read, an error of the kind vendor_refusal, not a
 # connector's refusal; from a side effect, unknown (#55).
-PROXY_403 = "            return Err(sent.without_answer(ErrorKind::VendorRefusal, outcome::UPSTREAM_REFUSED));"
+PROXY_403 = ("            return Err(sent.without_answer(\n                ErrorKind::VendorRefusal,\n"
+             "                outcome::UPSTREAM_REFUSED,\n                unanswered,\n            ));")
 mutate("proxy-403-is-refused", "the server's 403 is recorded as a connector's refusal, not as an error", PC,
        PROXY_403, "            return Err(ToolOutcome::Refused(outcome::UPSTREAM_REFUSED.to_owned()));")
 mutate("proxy-403-kind-other", "the server's 403 is recorded as another error, not a vendor refusal", PC,
        PROXY_403, PROXY_403.replace("ErrorKind::VendorRefusal", "ErrorKind::Other"))
 mutate("proxy-side-effect-403-error", "a side effect the server answered with a 403 is reported as a vendor refusal, settling its receipt not_performed", PC,
-       PROXY_403, PROXY_403.replace("sent.without_answer(", "ToolOutcome::error("))
+       PROXY_403, PROXY_403.replace("sent.without_answer(", "ToolOutcome::error(").replace("                unanswered,\n", ""))
 mutate("proxy-any-status-read", "a body is read whatever the status", PC,
        "        if status != StatusCode::OK {", "        if false {")
 # Reading the answer.
@@ -3971,8 +4070,10 @@ mutate("registry-adapter-without-sources", "a tool may read its resources from n
        "    if sources.is_empty() {\n        return Err(RegistryError::AdapterWithoutSources(name.clone()));",
        "    if false {\n        return Err(RegistryError::AdapterWithoutSources(name.clone()));")
 mutate("registry-adapter-argument-undeclared", "an adapter may read an argument the schema does not declare", RR,
-       "            .and_then(|p| p.get(argument))\n",
-       '            .and_then(|p| p.get(argument))\n            .or(schema.get("type"))\n')
+       "            None => {\n                return Err(RegistryError::AdapterArgumentUndeclared {\n"
+       "                    tool: name.clone(),\n                    argument: source.from_argument,\n"
+       "                });\n            }\n",
+       "            None => {}\n")
 mutate("registry-adapter-argument-not-string", "an adapter may read an argument not typed as a string", RR,
        "            Some(false) => {\n                return Err(RegistryError::AdapterArgumentNotString {\n"
        "                    tool: name.clone(),\n                    argument: source.from_argument,\n"
@@ -4051,6 +4152,44 @@ mutate("registry-connector-serves-proxied-tool", "a built-in entry may list a pr
 mutate("registry-connector-tool-on-two-entries", "a tool may be served by two built-in entries", RB,
        "            if let Some(first) = served.insert(tool.clone(), entry.name.clone()) {",
        "            if let Some(first) = served.insert(tool.clone(), entry.name.clone()).filter(|_| false) {")
+# An entry declares its credential whole, naming the principal it acts as, or not at all; a tool
+# is approved under its entry's system. tests/built_in.rs watches each.
+mutate("registry-connector-partly-declared-accepted", "an entry that declares part of its credential loads as one that declares none", RB,
+       "            _ => return Err(RegistryError::EntryPartlyDeclared(entry.name)),", "            _ => None,")
+mutate("registry-connector-principal-empty-accepted", "an entry's credential may name no principal", RB,
+       "                if credential.principal.is_empty() {", "                if false {")
+mutate("registry-built-in-name-outside-system", "a built-in tool may be named after another system than its entry's", RR,
+       "    if !under_system(&name, &entry.system) {", "    if false {")
+# A reach-report entry is held to its one job, and an entry's reach report names a tool such an
+# entry lists (decision 0011, section 4; #193). tests/reach_report.rs watches each.
+mutate("registry-reach-report-entry-permits-accepted", "a reach-report entry may permit more than read", RB,
+       "            Some(declaration) if declaration.permits != Classification::Read => {",
+       "            Some(declaration) if false && declaration.permits != Classification::Read => {")
+mutate("registry-reach-report-tool-write-accepted", "a reach report's tool may be approved as a write", RR,
+       "    if entry.reports_reach && tool.classification != gateway_core::Classification::Read {", "    if false {")
+mutate("registry-reach-report-unlisted-accepted", "an entry's reach report may name a tool no reach-report entry lists", RB,
+       "            if !reported {", "            if false {")
+# A reach that is required cannot be left out (decision 0011, sections 1 and 4; #220): a tool
+# declared as its entry's reach needs a reach on the entry, as a proxied entry does, and a GitHub
+# entry with a reach names its reach report. tests/built_in.rs watches each.
+mutate("registry-as-reach-without-reach-accepted", "a built-in tool declared as the reach loads on an entry with no reach, and every call is denied", RR,
+       "                .is_none_or(|declaration| declaration.reach.is_empty()) =>",
+       "                .is_none_or(|declaration| declaration.reach.is_empty() && false) =>")
+mutate("registry-reach-report-optional", "a GitHub entry with a reach loads without a reach report, and its reach is never checked", RB,
+       "        if built.system == REPORTED_SYSTEM && reaches && built.reach_report.is_none() {", "        if false {")
+# What a built-in approval declares, for the gateway to compare with what its connector states
+# (#220). The assurance's own tests, tests/built_in.rs and the gateway's tests/github_reach.rs
+# watch these.
+mutate("registry-no-resources-declared-as-checking-scope", "an approval declaring no resources is read as checking its own scope", RR,
+       "            (ResourceDeclaration::NoResources, _) => StatedResources::NoResources,",
+       "            (ResourceDeclaration::NoResources, _) => StatedResources::ChecksOwnScope,")
+RAS = REGISTRY + "src/assurance.rs"
+mutate("registry-assurance-classification-ignored", "an approval may classify a built-in tool otherwise than its connector does", RAS,
+       "        if approved.classification != self.classification {", "        if false {")
+mutate("registry-assurance-sources-ignored", "an approval may read a built-in tool's resources from other arguments than its connector does", RAS,
+       "            (StatedResources::FromArguments(stated), StatedResources::FromArguments(declared)) => {",
+       "            (StatedResources::FromArguments(_), StatedResources::FromArguments(_)) => true,\n"
+       "            (StatedResources::FromArguments(stated), StatedResources::FromArguments(declared)) => {")
 
 # --- gateway-registry: schema validation ---------------------------------------------------
 #
@@ -6190,6 +6329,13 @@ mutate("gw-reach-report-failure-withdraws", "a report that could not be read is 
 mutate("gw-reach-report-never-scheduled", "no entry is checked against its report on the drift schedule, so a changed installation is never found", DRIFT,
        "        for reporting in self.reporting() {\n            reports.spawn(report_every(\n",
        "        for reporting in self.reporting().into_iter().take(0) {\n            reports.spawn(report_every(\n")
+# A tick while an entry's report is out makes none, and a report's call is given the deadline of
+# the report tool's connector (#220). tests/github_reach.rs watches both.
+mutate("gw-reach-report-overlapping", "every tick starts a report, so two of one entry's reports run at once", DRIFT,
+       "        let idle = checking.is_empty();\n        if idle {\n            checking.spawn(check_report(",
+       "        let idle = true;\n        if idle {\n            checking.spawn(check_report(")
+mutate("gw-reach-report-deadline-of-the-checked-entry", "a report's call is given the checked entry's deadline, not the report tool's connector's", DRIFT,
+       "                    .get(&served_by)\n", "                    .get(&entry)\n")
 
 
 # --- first slice: resources on rows, naming what goes down ------------------------------------
@@ -6581,15 +6727,15 @@ mutate("custodian-lifetime-not-capped", "a token is handed out until GitHub's ex
        "                let expires_at = issued.expires_at.min(now + self.lifetime.as_secs());",
        "                let expires_at = issued.expires_at.min(now + 3600);")
 mutate("custodian-not-revoked-at-lifetime", "a token is not revoked when its lifetime ends", KS,
-       "                    self.clone()\n                        .revoke_at(issued.token.clone(), expires_at, issued.expires_at);",
-       "                    let _ = &issued.token;")
+       "                let revoke_at = (expires_at < issued.expires_at).then_some(expires_at);",
+       "                let revoke_at = None::<u64>;")
 mutate("custodian-unissued-not-revoked", "a token GitHub widened is not revoked", KS,
        "                if let Some(unissued) = error.unissued {",
        "                if let Some(unissued) = error.unissued.filter(|_| false) {")
 mutate("custodian-revocation-not-retried", "a revocation GitHub fails is not tried again", KS,
-       "                if clock::now() + retry.as_secs() >= lapses_at {", "                if true {")
+       "            if clock::now() + retry.as_secs() >= lapses_at {", "            if true {")
 mutate("custodian-revocation-retried-past-expiry", "a failed revocation is tried again after GitHub's expiry", KS,
-       "                if clock::now() + retry.as_secs() >= lapses_at {", "                if false {")
+       "            if clock::now() + retry.as_secs() >= lapses_at {", "            if false {")
 mutate("custodian-key-file-open-accepted", "a key file its group or others can read is accepted", KT,
        "    if mode & 0o077 != 0 {", "    if false {")
 mutate("custodian-socket-mode-open-accepted", "a socket mode giving others access is accepted", KT,
@@ -6610,6 +6756,60 @@ mutate("custodian-reach-report-any-permission", "a reach report's installation-w
        "            && request.permissions.contains_key(REACH_REPORT_PERMISSION)\n")
 mutate("custodian-reach-report-repositories-sent", "an installation-wide request is sent to GitHub with an empty repository list, not none", KG,
        '            fields.remove("repositories");\n', "            let _ = fields;\n")
+# The custodian's own gaps (#219): its checks, the 401 that ends a revocation, the stop that revokes
+# what it keeps, and the client feature the gateway links alone. tests/start.rs, reload.rs,
+# issue.rs, refusals.rs, shutdown.rs and packaging.rs, and github.rs's unit tests, watch each.
+mutate("custodian-tool-outside-system-accepted", "a GitHub entry may list a tool of another system, which is then given GitHub tokens", KP,
+       "                .find(|tool| !under_system(tool, &entry.system))\n",
+       "                .find(|_| false)\n")
+mutate("custodian-tool-system-prefix-only", "a tool whose name only begins with the system's, such as githubber__read, counts as under it", KP,
+       '        .and_then(|rest| rest.strip_prefix("__"))\n', "")
+mutate("custodian-full-name-case-sensitive", "a token whose repositories GitHub names in another case is refused as widened", KG,
+       "            .map(|repository| repository.full_name.to_ascii_lowercase())\n",
+       "            .map(|repository| repository.full_name.clone())\n")
+mutate("custodian-full-name-unicode-folded", "a name GitHub answers is folded by Unicode's rules, so another repository's may match", KG,
+       "            .map(|repository| repository.full_name.to_ascii_lowercase())\n",
+       "            .map(|repository| repository.full_name.to_lowercase())\n")
+mutate("custodian-full-name-count-ignored", "an answer may list one repository twice in two cases", KG,
+       "        if given != asked || listed.len() != repositories.len() {",
+       "        if given != asked {")
+mutate("custodian-own-uid-served", "the custodian starts as a process serving its own UID", KT,
+       "    if config.peer_uid == own {", "    if false {")
+mutate("custodian-binary-skips-own-uid", "the binary starts without the own-UID check", KC + "bin/switchboard-custodian.rs",
+       "        Ok(config) => start_process(config, Box::new(std::io::stdout())).await,",
+       "        Ok(config) => key_custodian::start(config, Box::new(std::io::stdout())).await,")
+mutate("custodian-malformed-attribution-dropped", "a malformed request's record line loses its team and tool", KS,
+       "            return self.refuse(line.attribution(&request), Refusal::Malformed, problem);",
+       "            return self.refuse(line, Refusal::Malformed, problem);")
+mutate("custodian-malformed-team-kept", "a malformed team is written to the record", KC + "record.rs",
+       "        self.team = request.team_well_formed().then_some(request.team.as_str());",
+       "        self.team = Some(request.team.as_str());")
+mutate("custodian-revocation-401-not-done", "GitHub's 401 to a retried revocation is a failure, so the custodian keeps trying", KG,
+       "        if status == StatusCode::NO_CONTENT || status == StatusCode::UNAUTHORIZED {",
+       "        if status == StatusCode::NO_CONTENT {")
+mutate("custodian-not-revoked-at-stop", "a stop revokes nothing", KT,
+       "        let stopped = self.custodian.clone().revoke_outstanding(deadline).await;",
+       "        let stopped = Stopped::default();\n        let _ = deadline;")
+mutate("custodian-stop-revocations-unbounded", "a stop waits for every revocation, however long GitHub takes", KS,
+       "                () = &mut ends => break,",
+       "                () = &mut ends, if revoking.is_empty() => break,")
+mutate("custodian-stop-in-flight-unbounded", "a stop waits for every request in flight, however long GitHub takes", KS,
+       "                () = &mut ends => break,",
+       "                () = &mut ends, if settled => break,")
+mutate("custodian-stop-revokes-after-in-flight", "a stop revokes nothing until every request in flight is answered, so one slow request uses up its deadline", KS,
+       "                received = landed.recv(), if open => match received {",
+       "                received = landed.recv(), if open && settled => match received {")
+mutate("custodian-stop-landed-token-not-revoked", "a token issued for a request in flight when the stop began is not revoked by the stop", KS,
+       "        let token = match &kept.stopping {",
+       "        let token = match &None::<UnboundedSender<ToRevoke>> {")
+mutate("custodian-revoked-token-kept", "a token revoked at the end of its lifetime is revoked again at the stop", KS,
+       "            .tokens\n            .remove(&id);\n", "            .tokens\n            .len();\n")
+mutate("custodian-lapsed-token-revoked-at-stop", "a stop revokes a token already past GitHub's expiry", KS,
+       "        if each.lapses_at <= clock::now() {", "        if false {")
+mutate("custodian-gateway-links-server", "the GitHub connector, and so the gateway, links the custodian's server and key-reading code",
+       "crates/connector-github/Cargo.toml",
+       'key-custodian = { path = "../key-custodian", default-features = false, features = ["client"] }',
+       'key-custodian = { path = "../key-custodian" }')
 
 # --- connector-github ----------------------------------------------------------------------
 # The GitHub connector refuses another organization before any request, asks the key custodian for
@@ -6689,6 +6889,36 @@ mutate("github-tags-on-a-contents-token", "the tags are read on the releases' co
        "token(connector, request, TAGS_PERMISSIONS)", "token(connector, request, RELEASES_PERMISSIONS)")
 mutate("github-reads-entry-unchecked", "an entry that serves a newer read without its permissions is served", GH + "reads.rs",
        "                if entry.permissions.get(*permission) < Some(&Access::Read) {", "                if false {")
+# The connector is built only for an organization that is an account name, and for entries whose
+# tokens are narrowed, a reach report's aside. connector.rs's own tests and tests/github_reach.rs
+# catch these.
+mutate("github-organization-name-unchecked", "the connector is built for an organization that is not a GitHub account name", GHC,
+       "        if !account {", "        if false {")
+mutate("github-entry-not-narrowed-accepted", "a GitHub entry narrowed none, so serving tokens for the whole installation, is served", GHC,
+       "            if declaration.narrowing == Narrowing::None && !entry.reports_reach {", "            if false {")
+mutate("github-reach-report-entry-refused", "a reach-report entry, narrowed none, is refused as if it were any other entry", GHC,
+       "            if declaration.narrowing == Narrowing::None && !entry.reports_reach {",
+       "            if declaration.narrowing == Narrowing::None {")
+# What the connector's code states of each tool, and which tools it serves on each entry (#220):
+# boot refuses an approval that declares otherwise. tools.rs's own tests and tests/github.rs,
+# github_search.rs and github_reach.rs catch these.
+mutate("github-search-stated-as-arguments", "the search is stated as reading its resources from its arguments, though it checks its own scope", GH + "search.rs",
+       "            resources: StatedResources::ChecksOwnScope,", "            resources: StatedResources::FromArguments(Vec::new()),")
+mutate("github-reads-stated-unqualified", "a read is stated as reaching the repository its repo argument names alone, not owner/repo", GHT,
+       "            from_argument: \"repo\".into(),\n            qualified_by: Some(\"owner\".into()),\n            system: crate::SYSTEM.into(),",
+       "            from_argument: \"repo\".into(),\n            qualified_by: None,\n            system: crate::SYSTEM.into(),")
+mutate("github-report-served-on-every-entry", "the reach report's tool is served on every entry, not only a reach-report entry's", GH + "lib.rs",
+       "    } else {\n        definitions()\n    };",
+       "    } else {\n        let mut all = definitions();\n        all.push(report::definition());\n        all\n    };")
+# The reach report reads every page up to 1,000 repositories, and a list that does not come to
+# GitHub's total is an error. report.rs's own tests catch these.
+GHP = GH + "report.rs"
+mutate("github-report-first-page-only", "the report reads its first page alone", GHP,
+       "    for page in 1..=MAX_REPORT_PAGES {", "    for page in 1..=1 {")
+mutate("github-report-uncapped", "the report reads past 1,000 repositories, as many pages as GitHub has", GHP,
+       "    for page in 1..=MAX_REPORT_PAGES {", "    for page in 1.. {")
+mutate("github-report-total-unchecked", "a list that does not come to GitHub's total is served as the installation's", GHP,
+       "            if repositories.len() != total_usize {", "            if false {")
 mutate("gateway-job-log-hosts-dropped", "the deployment file's [github] job_log_hosts do not reach the connector",
        "crates/gateway/src/deployment.rs",
        "            job_log_hosts: self.job_log_hosts,", "            job_log_hosts: Vec::new(),")
@@ -6745,7 +6975,18 @@ mutate("gateway-built-in-connector-unbounded", "a built-in connector runs withou
        "            connector,")
 mutate("gateway-built-in-definition-unchecked", "a built-in approval of another definition than its connector's is served",
        "crates/gateway/src/boot.rs",
-       "        if basis.built_in_definitions.get(tool) != approved {", "        if false {")
+       "        if approved != Some(&served.definition_sha256) {", "        if false {")
+# The connector states each tool's assurance, and boot and every reload refuse an approval that
+# declares otherwise; what a connector serves is keyed by entry and tool (#220). boot.rs's own
+# tests and tests/github.rs watch these.
+mutate("gateway-built-in-assurance-unchecked", "a built-in approval that declares checks_own_scope or no_resources for a tool that does neither is served",
+       "crates/gateway/src/boot.rs",
+       "        if let Some(mismatch) = mismatch {", "        if let Some(mismatch) = mismatch.filter(|_| false) {")
+mutate("gateway-built-in-tools-by-name-only", "a tool its connector serves on one entry is served on any entry that approves it",
+       "crates/gateway/src/boot.rs",
+       "        let Some(served) = basis.built_in_tools.get(&(entry.clone(), tool.clone())) else {",
+       "        let Some(served) = basis\n            .built_in_tools\n            .iter()\n"
+       "            .find(|((_, name), _)| name == tool)\n            .map(|(_, served)| served)\n        else {")
 mutate("gateway-narrowing-gate-refuses-built-in", "a built-in entry narrowed to the limit is refused as if proxied",
        "crates/gateway/src/boot.rs",
        "        .find(|entry| entry.kind == EntryKind::Proxied && entry.narrowing != Narrowing::None)",
@@ -6768,9 +7009,19 @@ mutate("gateway-connectors-outside-the-policy", "an entry changed under the same
        "            connectors: registry.connectors().clone(),", "            connectors: BTreeMap::new(),")
 # The registry holds a reach-report entry to its one job, and an entry's reach report to one that
 # can check it (decision 0011, section 4; #193). The registry's tests/reach_report.rs watches each.
-mutate("registry-reach-report-surface-unchecked", "a reach report's tool may be served to any principal of a team",
+# A reach report's tool is served on registry-reach alone, to one named principal, the registry's
+# own identity (decision 0011, section 4; #220).
+mutate("registry-reach-report-surface-unchecked", "a reach report's tool may be served on any surface, to any principal of a team",
        "crates/gateway-registry/src/registry.rs",
-       "        if !matches!(surface.principals, PrincipalsFile::AnyInTeamsAndGroups) {", "        if true {")
+       "        if registrys_own {\n            continue;", "        if true {\n            continue;")
+mutate("registry-reach-report-surface-any-name", "a reach report's tool may be served on any surface restricted to one named principal",
+       "crates/gateway-registry/src/registry.rs",
+       "        let registrys_own = surface.name.as_str() == REACH_SURFACE\n",
+       "        let registrys_own = (surface.name.as_str() == REACH_SURFACE || true)\n")
+mutate("registry-reach-report-surface-many-principals", "a reach report's tool may be served on registry-reach to several named principals",
+       "crates/gateway-registry/src/registry.rs",
+       "            && matches!(&surface.principals, PrincipalsFile::Only(ids) if ids.len() == 1);",
+       "            && matches!(&surface.principals, PrincipalsFile::Only(_));")
 mutate("registry-reach-report-entry-narrowed-accepted", "a reach-report entry may be narrowed, though its credential reads the whole installation",
        "crates/gateway-registry/src/builtin.rs",
        "            Some(declaration) if declaration.narrowing != Narrowing::None => {",
@@ -6822,6 +7073,9 @@ READERS: list[tuple[str, frozenset[str]]] = [
     ("CONTRIBUTING.md", frozenset({"demo-checks"})),
     (".github/workflows/ci.yml", frozenset({"demo-checks"})),
     ("crates/audit-postgres/src/lib.rs", frozenset({"demo-checks"})),
+    # key-custodian/tests/packaging.rs asks cargo tree which of its features the gateway's build
+    # turns on, which connector-github's manifest decides.
+    ("crates/connector-github/Cargo.toml", frozenset({"key-custodian"})),
 ]
 
 

@@ -17,6 +17,13 @@
 //! - each reach report's tool: a tool served by an entry of system `github` the registry
 //!   declares `reports_reach = true`.
 //!
+//! Every tool an entry of system `github` lists must be under that system, named
+//! `github__<tool>`. The loader holds a proxied tool's name to its server's system but not a
+//! built-in entry's tools, so the custodian checks them: a file with an entry that lists any
+//! other tool gives no copy ([`PolicyError::ToolOutsideSystem`]). The custodian refuses to start
+//! on it, and a reload keeps the copy served now, so no tool of another system is given a GitHub
+//! token.
+//!
 //! # The one request that may name no repository
 //!
 //! A request names at least one repository, because GitHub reads a token request that names
@@ -46,7 +53,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
-use gateway_core::{PolicyRevision, TeamId, ToolName};
+use gateway_core::{ConnectorName, PolicyRevision, TeamId, ToolName};
 use gateway_registry::{Access, Registry, RegistryError};
 use thiserror::Error;
 
@@ -75,8 +82,25 @@ pub const REACH_REPORT_PERMISSION: &str = "metadata";
 pub type Refused = (Refusal, String);
 
 impl CustodianPolicy {
-    /// The copy a loaded registry gives.
-    pub fn from_registry(registry: &Registry) -> Self {
+    /// The copy a loaded registry gives, or why it gives none: an entry of system `github` that
+    /// lists a tool not under that system (see the [module documentation](self)).
+    pub fn from_registry(registry: &Registry) -> Result<Self, PolicyError> {
+        for entry in registry.connectors().values() {
+            if entry.system != GITHUB_SYSTEM {
+                continue;
+            }
+            if let Some(tool) = entry
+                .tools
+                .iter()
+                .find(|tool| !under_system(tool, &entry.system))
+            {
+                return Err(PolicyError::ToolOutsideSystem {
+                    entry: entry.name.clone(),
+                    tool: tool.clone(),
+                    system: entry.system.clone(),
+                });
+            }
+        }
         let snapshot = registry.snapshot();
         let teams = snapshot
             .limits()
@@ -110,12 +134,12 @@ impl CustodianPolicy {
             .filter(|entry| entry.system == GITHUB_SYSTEM && entry.reports_reach)
             .flat_map(|entry| entry.tools.iter().cloned())
             .collect();
-        Self {
+        Ok(Self {
             revision: snapshot.revision().clone(),
             teams,
             tools,
             reach_reports,
-        }
+        })
     }
 
     /// Whether `request` may name no repository: its tool is a reach report's, and it asks for
@@ -230,6 +254,28 @@ pub enum PolicyError {
          change the revision with every edit to the policy"
     )]
     RevisionUnchanged(PolicyRevision),
+    /// An entry of system `github` lists a tool whose name is not under `github`.
+    #[error(
+        "connector `{entry}` of system `{system}` lists tool `{tool}`, which is not under that \
+         system; the custodian gives a GitHub token only to a tool named `{system}__<tool>`"
+    )]
+    ToolOutsideSystem {
+        /// The entry.
+        entry: ConnectorName,
+        /// The tool.
+        tool: ToolName,
+        /// The entry's system.
+        system: String,
+    },
+}
+
+/// Whether `tool` is `{system}__<name>`, with something after the separator: the same rule the
+/// registry loader holds a proxied tool's name to.
+fn under_system(tool: &ToolName, system: &str) -> bool {
+    tool.as_str()
+        .strip_prefix(system)
+        .and_then(|rest| rest.strip_prefix("__"))
+        .is_some_and(|rest| !rest.is_empty())
 }
 
 /// The copy served now. Cheap to clone; clones share it.
@@ -245,7 +291,7 @@ impl PolicyCell {
         })?;
         let registry = Registry::from_toml_str(&String::from_utf8_lossy(&bytes))?;
         let cell = Self(Arc::new(RwLock::new(Arc::new(
-            CustodianPolicy::from_registry(&registry),
+            CustodianPolicy::from_registry(&registry)?,
         ))));
         Ok((cell, bytes))
     }
@@ -261,7 +307,7 @@ impl PolicyCell {
     /// Serves the copy `text` gives, if it loads and keeps one revision to one copy.
     pub fn apply(&self, text: &str) -> Result<bool, PolicyError> {
         let registry = Registry::from_toml_str(text)?;
-        let next = CustodianPolicy::from_registry(&registry);
+        let next = CustodianPolicy::from_registry(&registry)?;
         let mut served = self.0.write().unwrap_or_else(PoisonError::into_inner);
         if next == **served {
             return Ok(false);

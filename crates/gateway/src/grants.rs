@@ -23,8 +23,9 @@
 //! `ERROR`, to be investigated, since an honest sandbox under a correct configuration never
 //! makes one. A lifetime failure (expired, not yet valid, or over the ceiling) is counted and
 //! never logged one by one, since honest sandboxes make them. Every other failure is logged at
-//! `WARN`. A failure's log line holds its kind and, only when its signature verified, the
-//! grant's digest: nothing from the grant's claims, which a [`GrantFailure`] does not carry.
+//! `WARN`. A failure's log line holds its kind and, only for a binding's failure (the audience
+//! or the pod, since a lifetime failure is not logged), the grant's digest: nothing from the
+//! grant's claims, which a [`GrantFailure`] does not carry.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -44,7 +45,7 @@ use gateway_otto::{
     MappingError, PreviousKeyConfig, ToolMapping, VerifiedGrant,
 };
 use http::HeaderMap;
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use thiserror::Error;
 
 use crate::boot::GateState;
@@ -76,8 +77,8 @@ pub struct GrantsSection {
 pub struct GrantsConfig {
     /// Each issuer, with its keys.
     pub issuers: Vec<GrantIssuerEntry>,
-    /// Otto's bare tool names to this gateway's, one to one. In JSON, an object of names.
-    #[serde(deserialize_with = "tool_mapping")]
+    /// Otto's bare tool names to this gateway's, one to one. In JSON, an object of names, in
+    /// which a name given twice is refused rather than the last one kept.
     pub tool_mapping: ToolMapping,
 }
 
@@ -128,11 +129,6 @@ impl GrantIssuerEntry {
             require_egress: self.require_egress,
         }
     }
-}
-
-fn tool_mapping<'de, D: Deserializer<'de>>(deserializer: D) -> Result<ToolMapping, D::Error> {
-    let value = serde_json::Value::deserialize(deserializer)?;
-    ToolMapping::from_json(&value.to_string()).map_err(serde::de::Error::custom)
 }
 
 /// The deployment file's `[grants]` table as written.
@@ -357,9 +353,9 @@ pub(crate) fn delegation_failure(kind: FailureKind) -> DelegationFailure {
 }
 
 /// The unverified delegation a failure of `kind` becomes: the core's failure, and `digest`,
-/// which the verifier gives only once the signature verified. The core records a digest only
-/// with a binding's failure (the audience, the lifetime or the pod), so a digest given with any
-/// other failure, such as claims that are malformed though signed, is not recorded.
+/// which the verifier gives only with a binding's failure (the audience, the lifetime or the
+/// pod), the only failure the core records one with. Should a digest come with any other
+/// failure, it is not recorded.
 pub(crate) fn unverified(kind: FailureKind, digest: Option<GrantDigest>) -> UnverifiedDelegation {
     let failure = delegation_failure(kind);
     digest
@@ -810,6 +806,8 @@ fn requires_delegation(snapshot: &PolicySnapshot, profile: &ProfileName) -> bool
 mod tests {
     use super::*;
 
+    /// Each kind maps to the core's failure of the same name, so the counter's label, the log
+    /// line and the row name a failure alike.
     #[test]
     fn every_failure_kind_maps_to_the_core_failure_of_its_name() {
         let mapped: BTreeSet<DelegationFailure> = FailureKind::ALL
@@ -818,13 +816,31 @@ mod tests {
             .collect();
         assert_eq!(mapped.len(), FailureKind::ALL.len(), "two kinds map to one");
         for kind in FailureKind::ALL {
-            let core = delegation_failure(kind);
-            let expected = match kind {
-                FailureKind::LifetimeOverCeiling => "lifetime_over_ceiling",
-                other => other.as_str(),
-            };
-            assert_eq!(core.as_str(), expected, "{kind:?}");
+            assert_eq!(delegation_failure(kind).as_str(), kind.as_str(), "{kind:?}");
         }
+    }
+
+    /// The JSON configuration's tool mapping refuses a name given twice, as the mapping file
+    /// does, rather than keeping the last.
+    #[test]
+    fn a_repeated_name_in_the_json_tool_mapping_is_refused() {
+        let section = |mapping: &str| {
+            serde_json::from_str::<GrantsSection>(&format!(
+                r#"{{"enforce": {{"issuers": [], "tool_mapping": {mapping}}}}}"#
+            ))
+        };
+        let one = section(r#"{"otto_read": "fixture__read"}"#).unwrap();
+        assert_eq!(
+            one.enforce.map(|config| config.tool_mapping),
+            Some(ToolMapping::from_pairs([("otto_read", "fixture__read")]).unwrap())
+        );
+        let repeated = section(r#"{"otto_read": "fixture__read", "otto_read": "fixture__draft"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            repeated.contains("Otto tool `otto_read` is mapped more than once"),
+            "{repeated}"
+        );
     }
 
     #[test]

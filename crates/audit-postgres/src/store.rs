@@ -2166,7 +2166,7 @@ mod unit {
             resources: FixtureConnector::resources_of(READ_TOOL, &arguments),
             caller: fixture.caller_context(Caller::TeamA, SURFACE_ALL).unwrap(),
             tool: RequestedTool::new(READ_TOOL),
-            key: None,
+            key: gateway_core::CallKey::Absent,
             currency: gateway_core::Currency::NotAsked,
         };
         let decision = decide(&fixture.policy, &context);

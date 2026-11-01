@@ -15,7 +15,8 @@ use thiserror::Error;
 use toml::value::Datetime;
 
 use crate::adapter::{self, ArgumentAdapter, JsonPointer, ResourceSource, SchemaProblem};
-use crate::builtin::{BuiltInEntry, built_in};
+use crate::assurance::{Assurance, StatedResources};
+use crate::builtin::{BuiltInEntry, REACH_SURFACE, built_in};
 use crate::definition::{
     Approval, Route, ToolDefinition, binding_sha256, built_in_binding_sha256, definition_sha256,
 };
@@ -569,17 +570,36 @@ pub enum RegistryError {
         /// What is wrong with it.
         problem: String,
     },
-    /// A surface serves a reach report's tool to any principal of its teams and groups.
+    /// A surface other than `registry-reach` restricted to one named principal, the registry's
+    /// own identity, serves a reach report's tool (decision 0011, section 4).
     #[error(
-        "surface `{surface}` serves `{tool}`, a reach report's tool, to any principal of its \
-         teams and groups; serve it only on a surface restricted to named principals, the \
-         registry's own"
+        "surface `{surface}` serves `{tool}`, a reach report's tool; serve it only on \
+         `registry-reach`, restricted to one named principal, the registry's own identity"
     )]
     ReachReportSurface {
         /// The surface.
         surface: SurfaceName,
         /// The tool.
         tool: ToolName,
+    },
+    /// A built-in entry of a system whose vendor report is built declares a reach and names no
+    /// reach report, so its reach would never be checked (decision 0011, section 4).
+    #[error(
+        "connector `{0}` declares a reach and names no `reach_report`; name the reach report its \
+         reach is checked against, as a proxied entry with a reach names its `reach_check`"
+    )]
+    ReachReportMissing(ConnectorName),
+    /// A built-in tool is declared as its entry's reach, and the entry declares no reach
+    /// (decision 0011, section 1).
+    #[error(
+        "built-in tool `{tool}` is declared as the reach of connector `{connector}`, which \
+         declares no reach; record the entry's reach, as a proxied entry records its own"
+    )]
+    ReachMissing {
+        /// The tool.
+        tool: ToolName,
+        /// The entry it is approved on.
+        connector: ConnectorName,
     },
     /// An entry's reach report cannot check its reach.
     #[error("connector `{connector}`'s reach report {problem}")]
@@ -625,6 +645,7 @@ pub struct Registry {
     servers: BTreeMap<ConnectorName, Server>,
     connectors: BTreeMap<ConnectorName, BuiltInEntry>,
     built_in_tools: BTreeMap<ToolName, ConnectorName>,
+    built_in_assurances: BTreeMap<ToolName, Assurance>,
     profile_rules: ProfileRules,
 }
 
@@ -716,6 +737,13 @@ impl Registry {
         &self.built_in_tools
     }
 
+    /// What each approved built-in tool's approval declares it is, by exposed name: its
+    /// classification and how its resources are known. The gateway compares each with what its
+    /// connector's code states ([`ServedTool`](crate::ServedTool)).
+    pub fn built_in_assurances(&self) -> &BTreeMap<ToolName, Assurance> {
+        &self.built_in_assurances
+    }
+
     /// The profile-selection rules.
     pub fn profile_rules(&self) -> &ProfileRules {
         &self.profile_rules
@@ -803,8 +831,9 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
     let proxied: BTreeSet<ToolName> = routes.keys().cloned().collect();
     let connectors = built_in(file.connectors, &servers, &proxied)?;
     let mut built_in_tools = BTreeMap::new();
+    let mut built_in_assurances = BTreeMap::new();
     for tool in file.built_in_tools {
-        let checked = check_built_in_tool(tool, &connectors)?;
+        let (checked, assurance) = check_built_in_tool(tool, &connectors)?;
         let name = checked.definition.name.clone();
         if definitions.contains_key(&name) {
             return Err(RegistryError::DuplicateTool(name));
@@ -818,6 +847,7 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
             settlement: checked.settlement,
         });
         built_in_tools.insert(name.clone(), checked.route.server);
+        built_in_assurances.insert(name.clone(), assurance);
         definitions.insert(name.clone(), checked.definition);
         adapters.insert(name.clone(), checked.adapter);
         approvals.insert(name, checked.approval);
@@ -841,10 +871,13 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
         }
     }
 
-    // A reach report's tool reads what a whole installation reaches: it is served only to
-    // named principals, the registry's own (decision 0011, section 4).
+    // A reach report's tool reads what a whole installation reaches: it is served only on
+    // `registry-reach`, restricted to one named principal, the registry's own identity
+    // (decision 0011, section 4).
     for surface in &file.surfaces {
-        if !matches!(surface.principals, PrincipalsFile::AnyInTeamsAndGroups) {
+        let registrys_own = surface.name.as_str() == REACH_SURFACE
+            && matches!(&surface.principals, PrincipalsFile::Only(ids) if ids.len() == 1);
+        if registrys_own {
             continue;
         }
         let reporting = surface.tools.iter().find(|tool| {
@@ -942,6 +975,7 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
         servers,
         connectors,
         built_in_tools,
+        built_in_assurances,
         profile_rules: ProfileRules::new(rules),
     })
 }
@@ -1355,11 +1389,12 @@ fn sources_from(
 /// tool's against its server. Its definition is hashed under its exposed name, since it has no
 /// upstream name, and its binding by [`built_in_binding_sha256`]. Its route names its entry and
 /// its own name; it carries the entry to the loader and is not kept, since nothing is
-/// forwarded.
+/// forwarded. Beside it comes what the approval declares the tool is, which the gateway compares
+/// with what its connector states.
 fn check_built_in_tool(
     tool: BuiltInToolFile,
     connectors: &BTreeMap<ConnectorName, BuiltInEntry>,
-) -> Result<CheckedTool, RegistryError> {
+) -> Result<(CheckedTool, Assurance), RegistryError> {
     let name = tool.name;
     let place = || format!("built-in tool `{name}`");
     let Some(entry) = connectors.get(&tool.connector) else {
@@ -1425,6 +1460,20 @@ fn check_built_in_tool(
     }
     let (sources, declared_from, resources) = match tool.resources {
         BuiltInResourcesFile::NoResources => (Vec::new(), None, ResourceDeclaration::NoResources),
+        // Every call names the entry's whole reach, so the entry must record one (decision
+        // 0011, section 1), as a proxied entry must (rule 3). Without it the tool is listed and
+        // every call denied.
+        BuiltInResourcesFile::AsReach
+            if entry
+                .declaration
+                .as_ref()
+                .is_none_or(|declaration| declaration.reach.is_empty()) =>
+        {
+            return Err(RegistryError::ReachMissing {
+                tool: name,
+                connector: tool.connector,
+            });
+        }
         BuiltInResourcesFile::AsReach => (
             Vec::new(),
             Some(DeclaredFrom::Reach),
@@ -1439,8 +1488,17 @@ fn check_built_in_tool(
             (Vec::new(), None, ResourceDeclaration::ChecksOwnScope)
         }
     };
+    let assurance = Assurance {
+        classification: tool.classification,
+        resources: match (resources, declared_from) {
+            (ResourceDeclaration::NoResources, _) => StatedResources::NoResources,
+            (ResourceDeclaration::ChecksOwnScope, _) => StatedResources::ChecksOwnScope,
+            (_, Some(DeclaredFrom::Reach)) => StatedResources::AsReach,
+            _ => StatedResources::FromArguments(sources.clone()),
+        },
+    };
     let adapter = ArgumentAdapter::new(name.clone(), sources, tool.input_schema.clone());
-    Ok(CheckedTool {
+    let checked = CheckedTool {
         resources,
         declared_from,
         adapter,
@@ -1463,7 +1521,8 @@ fn check_built_in_tool(
         },
         classification: tool.classification,
         settlement: tool.settlement,
-    })
+    };
+    Ok((checked, assurance))
 }
 
 fn limit_sets<K: Ord + std::fmt::Display>(

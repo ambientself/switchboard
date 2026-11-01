@@ -267,7 +267,7 @@ fn proposal(
         caller: fixture.caller_context(Caller::TeamA, SURFACE_ALL).unwrap(),
         tool: RequestedTool::new(DRAFT_TOOL),
         resources: FixtureConnector::resources_of(DRAFT_TOOL, &arguments),
-        key: Some(key.clone()),
+        key: gateway_core::CallKey::Valid(key.clone()),
         currency: gateway_core::Currency::NotAsked,
     };
     let decision = decide(&fixture.policy, &context);

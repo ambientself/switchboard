@@ -39,13 +39,18 @@
 //!
 //! A built-in connector, gateway code in the gateway's own process such as the GitHub
 //! connector, is registered there with [`Wiring::built_in`], under the name of a built-in
-//! connector entry of the registry, `[[connectors]]`, with the definition of each tool it
-//! serves. Its calls are read as a proxied server's are, by the registry's argument adapters
-//! and behind its argument check, and it is wrapped in its [`Bounded`], as every connector in
-//! the gateway's own process is: the deadline and result bound
-//! [`Wiring::in_process_limits`] gives it, and the rate quotas [`Wiring::quotas`] gives. Every
-//! approved built-in tool's entry must have its connector registered, and its approved
-//! definition must be the one the connector serves, at boot and on every reload.
+//! connector entry of the registry, `[[connectors]]`, with each tool it serves on that entry, as
+//! its own code states it ([`ServedTool`]): the definition's SHA-256, and its assurance, its
+//! classification and how the resources it reaches are known (decision 0011, section 1). Its
+//! calls are read as a proxied server's are, by the registry's argument adapters and behind its
+//! argument check, and it is wrapped in its [`Bounded`], as every connector in the gateway's own
+//! process is: the deadline and result bound [`Wiring::in_process_limits`] gives it, and the
+//! rate quotas [`Wiring::quotas`] gives. Every approved built-in tool's entry must have its
+//! connector registered and serve the tool, and, at boot and on every reload, the approval must
+//! record the definition the connector serves on that entry and declare the assurance it
+//! states: an approval that declares `checks_own_scope` or `no_resources` for a tool whose code
+//! does neither is refused, with a sentence naming the entry, the tool and the difference. The
+//! tools are keyed by entry and tool, so what one entry serves says nothing of another.
 //!
 //! A disabled gate starts, in a development build, with a warning logged here; the HTTP layer
 //! repeats it while the gateway runs. The release build refuses both opt-outs.
@@ -67,7 +72,7 @@ use gateway_core::{
 };
 use gateway_identity::{Clock, ConfigError, Identity, IdentityConfig};
 use gateway_otto::{HttpResolver, KeyConfigError};
-use gateway_registry::{Registry, RulePrincipal};
+use gateway_registry::{Registry, RulePrincipal, ServedTool};
 use thiserror::Error;
 
 use crate::audit::DisabledAuditStore;
@@ -259,20 +264,53 @@ pub enum BootError {
     /// A built-in connector was registered in a deployment whose policy is not the registry's,
     /// where no built-in entry or approval exists for it.
     #[error(
-        "connector `{0}` is registered as a built-in connector, which needs the policy to come          from the registry"
+        "connector `{0}` is registered as a built-in connector, which needs the policy to come \
+         from the registry"
     )]
     BuiltInWithoutRegistry(ConnectorName),
     /// A built-in connector was registered under a name the registry has no built-in entry for.
     #[error(
-        "connector `{0}` is registered as a built-in connector, but the registry has no          `[[connectors]]` entry of that name"
+        "connector `{0}` is registered as a built-in connector, but the registry has no \
+         `[[connectors]]` entry of that name"
     )]
     NotABuiltInEntry(ConnectorName),
-    /// A built-in tool's approved definition is not the one its connector serves: the
-    /// connector's code changed after the approval, or the approval was edited.
+    /// A built-in tool is approved on an entry whose connector does not serve it there.
     #[error(
-        "built-in tool `{0}`'s approved definition is not the one its connector serves; approve          the connector's definition again"
+        "built-in tool `{tool}` is approved on connector `{connector}`, and the connector \
+         registered for that entry does not serve it there"
     )]
-    BuiltInDefinitionDiffers(ToolName),
+    BuiltInToolNotServed {
+        /// The tool.
+        tool: ToolName,
+        /// The entry it is approved on.
+        connector: ConnectorName,
+    },
+    /// A built-in tool's approved definition is not the one its connector serves on its entry:
+    /// the connector's code changed after the approval, or the approval was edited.
+    #[error(
+        "built-in tool `{tool}`'s approved definition is not the one served on connector \
+         `{connector}`; approve the connector's definition again"
+    )]
+    BuiltInDefinitionDiffers {
+        /// The tool.
+        tool: ToolName,
+        /// The entry it is approved on.
+        connector: ConnectorName,
+    },
+    /// A built-in tool's approval declares a classification, or a way its resources are known,
+    /// that its connector's code does not give (decision 0011, section 1).
+    #[error(
+        "built-in tool `{tool}` on connector `{connector}` {mismatch}; approve it as its \
+         connector states it"
+    )]
+    BuiltInAssuranceDiffers {
+        /// The tool.
+        tool: ToolName,
+        /// The entry it is approved on.
+        connector: ConnectorName,
+        /// How the approval differs, naming both.
+        mismatch: String,
+    },
     /// A proxied server's credential is to be narrowed per call or to the caller's limit. The
     /// gateway sends one credential for every call to a server, so such an entry would skip
     /// rule 5 with a credential that is not narrowed.
@@ -406,20 +444,21 @@ impl Wiring {
     }
 
     /// Registers `connector`, a built-in connector in the gateway's own process, for the
-    /// registry's built-in entry `name`, serving the tools in `definitions`, each with the
-    /// SHA-256 of its definition as its approval must record it. [`check_registry`] reads its
-    /// calls with the registry's adapters and wraps it in its [`Bounded`]; [`check`] refuses
-    /// it. One connector may be registered under several entries' names.
+    /// registry's built-in entry `name`, serving `tools` on it, each as the connector's own code
+    /// states it: the SHA-256 of its definition, which its approval must record, and its
+    /// assurance, which its approval must declare. [`check_registry`] reads its calls with the
+    /// registry's adapters and wraps it in its [`Bounded`]; [`check`] refuses it. One connector
+    /// may be registered under several entries' names, with the tools it serves on each.
     pub fn built_in(
         mut self,
         name: impl Into<ConnectorName>,
         connector: Arc<dyn Connector>,
-        definitions: impl IntoIterator<Item = (ToolName, String)>,
+        tools: impl IntoIterator<Item = ServedTool>,
     ) -> Self {
         self.built_in.push(BuiltIn {
             name: name.into(),
             connector,
-            definitions: definitions.into_iter().collect(),
+            tools: tools.into_iter().collect(),
         });
         self
     }
@@ -488,7 +527,7 @@ impl fmt::Debug for Wiring {
 struct BuiltIn {
     name: ConnectorName,
     connector: Arc<dyn Connector>,
-    definitions: BTreeMap<ToolName, String>,
+    tools: Vec<ServedTool>,
 }
 
 pub(crate) struct Registered {
@@ -558,8 +597,9 @@ pub(crate) struct Basis {
     pub(crate) grant_issuers: Vec<(String, bool)>,
     /// Whether Otto's resolver is configured, for the currency gate.
     pub(crate) resolver: bool,
-    /// The SHA-256 of each tool's definition as the built-in connectors serve it, by tool.
-    pub(crate) built_in_definitions: BTreeMap<ToolName, String>,
+    /// Each tool the built-in connectors serve, as their code states it, by the entry it is
+    /// served on and its name.
+    pub(crate) built_in_tools: BTreeMap<(ConnectorName, ToolName), ServedTool>,
 }
 
 impl fmt::Debug for Gates {
@@ -929,11 +969,11 @@ pub(crate) fn check_registry_with(
         }
     }
     let in_process = Arc::new(InProcessSignals::default());
-    let mut built_in_definitions = BTreeMap::new();
+    let mut built_in_tools = BTreeMap::new();
     for BuiltIn {
         name,
         connector,
-        definitions,
+        tools,
     } in built_in
     {
         if !registry.connectors().contains_key(&name) {
@@ -956,7 +996,11 @@ pub(crate) fn check_registry_with(
         if connectors.insert(name.clone(), registered).is_some() {
             return Err(BootError::DuplicateConnector(name));
         }
-        built_in_definitions.extend(definitions);
+        built_in_tools.extend(
+            tools
+                .into_iter()
+                .map(|tool| ((name.clone(), tool.name.clone()), tool)),
+        );
     }
     let basis = Basis {
         issuers,
@@ -966,7 +1010,7 @@ pub(crate) fn check_registry_with(
         receipt_store,
         grant_issuers: grants.issuers().to_vec(),
         resolver: resolver.is_some(),
-        built_in_definitions,
+        built_in_tools,
     };
     check_registry_policy(&basis.registry, &live.current(), &basis)?;
     let served = live.current();
@@ -1021,8 +1065,8 @@ fn in_process_bound(
 
 /// The gates a registry's policy must pass, at boot and on every reload: the
 /// [receipt-store gate](receipt_gate); the [narrowing gate](narrowing_gate); every approved
-/// tool's server has a connector; every approved built-in tool's entry has its connector, and
-/// its approved definition is the one that connector serves; with identity enforced, every rule
+/// tool's server has a connector; the [built-in gate](built_in_gate); with identity enforced,
+/// every rule
 /// names a configured issuer
 /// of its kind; the snapshot does not define [`NO_PROFILE`]; every profile a rule names exists;
 /// the [pod gate](pod_gate), with the rules beside the snapshot and the grant issuers the
@@ -1043,21 +1087,7 @@ pub(crate) fn check_registry_policy(
             });
         }
     }
-    for (tool, entry) in registry.built_in_tools() {
-        if !basis.connectors.contains(entry) {
-            return Err(BootError::UnregisteredConnector {
-                tool: tool.clone(),
-                connector: entry.clone(),
-            });
-        }
-        let approved = registry
-            .approvals()
-            .get(tool)
-            .map(|approval| &approval.definition_sha256);
-        if basis.built_in_definitions.get(tool) != approved {
-            return Err(BootError::BuiltInDefinitionDiffers(tool.clone()));
-        }
-    }
+    built_in_gate(registry, basis)?;
     if let Some(issuers) = &basis.issuers {
         for rule in registry.profile_rules().rules() {
             let (kind, configured) = match rule.principal {
@@ -1089,6 +1119,51 @@ pub(crate) fn check_registry_policy(
     let selections = covered_teams(policy.workload_selections(), basis.issuers.as_ref());
     pod_gate(policy.snapshot(), &selections, &basis.grant_issuers)?;
     currency_gate(policy, basis.resolver)?;
+    Ok(())
+}
+
+/// The built-in gate (decision 0011, section 1), at boot and on every reload: every approved
+/// built-in tool's entry has its connector registered, and that connector serves the tool on
+/// that entry, keyed by entry and tool, so what it serves on one entry says nothing of another;
+/// the approval records the definition the connector serves there; and the approval declares
+/// what the connector's code states of the tool, its classification and how its resources are
+/// known.
+fn built_in_gate(registry: &Registry, basis: &Basis) -> Result<(), BootError> {
+    for (tool, entry) in registry.built_in_tools() {
+        if !basis.connectors.contains(entry) {
+            return Err(BootError::UnregisteredConnector {
+                tool: tool.clone(),
+                connector: entry.clone(),
+            });
+        }
+        let Some(served) = basis.built_in_tools.get(&(entry.clone(), tool.clone())) else {
+            return Err(BootError::BuiltInToolNotServed {
+                tool: tool.clone(),
+                connector: entry.clone(),
+            });
+        };
+        let approved = registry
+            .approvals()
+            .get(tool)
+            .map(|approval| &approval.definition_sha256);
+        if approved != Some(&served.definition_sha256) {
+            return Err(BootError::BuiltInDefinitionDiffers {
+                tool: tool.clone(),
+                connector: entry.clone(),
+            });
+        }
+        let mismatch = match registry.built_in_assurances().get(tool) {
+            Some(declared) => served.assurance.mismatch(declared),
+            None => Some("has no declarations to compare".to_owned()),
+        };
+        if let Some(mismatch) = mismatch {
+            return Err(BootError::BuiltInAssuranceDiffers {
+                tool: tool.clone(),
+                connector: entry.clone(),
+                mismatch,
+            });
+        }
+    }
     Ok(())
 }
 
@@ -1562,7 +1637,7 @@ principals = "any_in_teams_and_groups"
             receipt_store: false,
             grant_issuers: Vec::new(),
             resolver: false,
-            built_in_definitions: BTreeMap::new(),
+            built_in_tools: BTreeMap::new(),
         }
     }
 
@@ -2160,5 +2235,287 @@ principals = "any_in_teams_and_groups"
             "{refused:?}"
         );
         assert_eq!(live.current().revision().as_str(), "r1");
+    }
+
+    /// The input schema of every built-in tool in [`built_in_registry`].
+    fn repo_schema() -> serde_json::Value {
+        json!({"type": "object", "properties": {"repo": {"type": "string"}}})
+    }
+
+    /// A registry with two built-in entries of the system `acme`, `acme-a` serving `acme__one`
+    /// and `acme-b` serving `acme__two`, each tool approved on its entry as `classification`,
+    /// with its resources `resources`, and on no surface.
+    fn built_in_registry(classification: &str, resources: &str) -> Registry {
+        Registry::from_toml_str(&built_in_registry_text(classification, resources, "r1")).unwrap()
+    }
+
+    /// [`built_in_registry`]'s text, at `revision`.
+    fn built_in_registry_text(classification: &str, resources: &str, revision: &str) -> String {
+        let head = format!(
+            r#"revision = "{revision}"
+servers = []
+tools = []
+surfaces = []
+profiles = []
+profile_rules = []
+
+[[connectors]]
+name = "acme-a"
+system = "acme"
+permissions = {{ contents = "read" }}
+tools = ["acme__one"]
+credential = {{ mode = "team_service_identity", principal = "acme-app" }}
+narrowing = "limit"
+permits = "propose"
+
+[[connectors]]
+name = "acme-b"
+system = "acme"
+permissions = {{ contents = "read" }}
+tools = ["acme__two"]
+credential = {{ mode = "team_service_identity", principal = "acme-app" }}
+narrowing = "limit"
+permits = "propose"
+
+[limits]
+"#
+        );
+        let entries = Registry::from_toml_str(&head).unwrap();
+        let settlement = if classification == "read" {
+            ""
+        } else {
+            "settlement = \"person\"\n"
+        };
+        let mut text = head;
+        for (tool, entry) in [("acme__one", "acme-a"), ("acme__two", "acme-b")] {
+            let definition =
+                gateway_registry::definition_sha256(tool, None, "Reads.", &repo_schema());
+            let binding = gateway_registry::built_in_binding_sha256(
+                &entries.connectors()[&ConnectorName::new(entry)],
+            )
+            .unwrap();
+            text.push_str(&format!(
+                r#"
+[[built_in_tools]]
+name = "{tool}"
+connector = "{entry}"
+classification = "{classification}"
+description = "Reads."
+input_schema = {{ type = "object", properties = {{ repo = {{ type = "string" }} }} }}
+approved_by = "reviewer"
+approved_at = 2026-10-31T00:00:00Z
+definition_sha256 = "{definition}"
+binding_sha256 = "{binding}"
+resources = {resources}
+{settlement}"#
+            ));
+        }
+        text
+    }
+
+    /// Reads one acme repository from the `repo` argument, as each tool's approval declares by
+    /// default.
+    const FROM_REPO: &str = r#"{ from_arguments = [{ from_argument = "repo", system = "acme", kind = "repository" }] }"#;
+
+    /// `tool` as its connector's code states it: a `read` of the repository its `repo`
+    /// argument names, with its definition.
+    fn served(tool: &str) -> gateway_registry::ServedTool {
+        gateway_registry::ServedTool {
+            name: ToolName::parse(tool).unwrap(),
+            definition_sha256: gateway_registry::definition_sha256(
+                tool,
+                None,
+                "Reads.",
+                &repo_schema(),
+            ),
+            assurance: gateway_registry::Assurance {
+                classification: Classification::Read,
+                resources: gateway_registry::StatedResources::FromArguments(vec![
+                    gateway_registry::ResourceSource {
+                        from_argument: "repo".into(),
+                        qualified_by: None,
+                        system: "acme".into(),
+                        kind: "repository".into(),
+                    },
+                ]),
+            },
+        }
+    }
+
+    /// What a release build of `registry` starts with, both acme entries' connectors
+    /// registered and serving `tools`, each on the entry it is paired with.
+    fn built_in_basis(
+        registry: &Registry,
+        tools: Vec<(&str, gateway_registry::ServedTool)>,
+    ) -> Basis {
+        Basis {
+            connectors: ["acme-a".into(), "acme-b".into()].into(),
+            built_in_tools: tools
+                .into_iter()
+                .map(|(entry, tool)| ((ConnectorName::new(entry), tool.name.clone()), tool))
+                .collect(),
+            ..release_basis(registry.clone())
+        }
+    }
+
+    fn built_in_checked(registry: &Registry, basis: &Basis) -> Result<(), BootError> {
+        let policy = ServedPolicy::from_registry(registry).unwrap();
+        check_registry_policy(registry, &policy, basis)
+    }
+
+    /// Each entry's connector serves its own tool as its approval declares it.
+    fn agreeing() -> Vec<(&'static str, gateway_registry::ServedTool)> {
+        vec![
+            ("acme-a", served("acme__one")),
+            ("acme-b", served("acme__two")),
+        ]
+    }
+
+    #[test]
+    fn a_built_in_approval_that_agrees_with_its_connector_passes() {
+        let registry = built_in_registry("read", FROM_REPO);
+        built_in_checked(&registry, &built_in_basis(&registry, agreeing())).unwrap();
+    }
+
+    /// What a connector serves is keyed by entry and tool: a tool served on another entry is not
+    /// served on the one its approval names.
+    #[test]
+    fn a_tool_served_on_another_entry_is_not_served_on_its_own() {
+        let registry = built_in_registry("read", FROM_REPO);
+        let swapped = vec![
+            ("acme-a", served("acme__two")),
+            ("acme-b", served("acme__one")),
+        ];
+        let refused = built_in_checked(&registry, &built_in_basis(&registry, swapped)).unwrap_err();
+        match &refused {
+            BootError::BuiltInToolNotServed { tool, connector } => {
+                assert_eq!(tool.as_str(), "acme__one");
+                assert_eq!(connector.as_str(), "acme-a");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            refused.to_string(),
+            "built-in tool `acme__one` is approved on connector `acme-a`, and the connector \
+             registered for that entry does not serve it there"
+        );
+        // An entry with no connector registered is refused before anything is compared.
+        let basis = Basis {
+            connectors: ["acme-b".into()].into(),
+            ..built_in_basis(&registry, agreeing())
+        };
+        assert!(matches!(
+            built_in_checked(&registry, &basis),
+            Err(BootError::UnregisteredConnector { tool, connector })
+                if tool.as_str() == "acme__one" && connector.as_str() == "acme-a"
+        ));
+    }
+
+    #[test]
+    fn an_approval_of_another_definition_than_its_connectors_is_refused() {
+        let registry = built_in_registry("read", FROM_REPO);
+        let mut changed = served("acme__two");
+        changed.definition_sha256 =
+            gateway_registry::definition_sha256("acme__two", None, "Writes.", &repo_schema());
+        let tools = vec![("acme-a", served("acme__one")), ("acme-b", changed)];
+        let refused = built_in_checked(&registry, &built_in_basis(&registry, tools)).unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                BootError::BuiltInDefinitionDiffers { tool, connector }
+                    if tool.as_str() == "acme__two" && connector.as_str() == "acme-b"
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            "built-in tool `acme__two`'s approved definition is not the one served on connector \
+             `acme-b`; approve the connector's definition again"
+        );
+    }
+
+    /// An approval that declares what its connector's code does not give is refused, naming the
+    /// entry, the tool and both sides, whatever it declares instead.
+    #[test]
+    fn an_approval_declaring_an_assurance_its_connector_does_not_give_is_refused() {
+        for (classification, resources, mismatch) in [
+            (
+                "read",
+                r#""checks_own_scope""#,
+                "is approved as `checks_own_scope`, and its connector states `from_arguments`, \
+                 reading acme repository from `repo`",
+            ),
+            (
+                "read",
+                r#""no_resources""#,
+                "is approved as `no_resources`, and its connector states `from_arguments`, \
+                 reading acme repository from `repo`",
+            ),
+            (
+                "read",
+                r#"{ from_arguments = [{ from_argument = "repo", system = "acme", kind = "project" }] }"#,
+                "is approved as `from_arguments`, reading acme project from `repo`, and its \
+                 connector states `from_arguments`, reading acme repository from `repo`",
+            ),
+            (
+                "propose",
+                FROM_REPO,
+                "is approved as `propose`, and its connector classifies it `read`",
+            ),
+        ] {
+            let registry = built_in_registry(classification, resources);
+            let refused =
+                built_in_checked(&registry, &built_in_basis(&registry, agreeing())).unwrap_err();
+            match &refused {
+                BootError::BuiltInAssuranceDiffers {
+                    tool,
+                    connector,
+                    mismatch: found,
+                } => {
+                    assert_eq!(tool.as_str(), "acme__one");
+                    assert_eq!(connector.as_str(), "acme-a");
+                    assert_eq!(found, mismatch);
+                }
+                other => panic!("{resources}: {other:?}"),
+            }
+            assert_eq!(
+                refused.to_string(),
+                format!(
+                    "built-in tool `acme__one` on connector `acme-a` {mismatch}; approve it as \
+                     its connector states it"
+                )
+            );
+        }
+    }
+
+    /// Every reload runs the built-in gate: a version whose approval declares what the
+    /// connector does not give is refused, and the running policy is kept.
+    #[test]
+    fn a_reload_declaring_an_assurance_its_connector_does_not_give_keeps_the_running_policy() {
+        let started = built_in_registry("read", FROM_REPO);
+        let live = Arc::new(LivePolicy::new(
+            ServedPolicy::from_registry(&started).unwrap(),
+        ));
+        let reloader = Reloader::new(
+            live.clone(),
+            built_in_basis(&started, agreeing()),
+            Freshness::new(None, Instant::now()),
+        );
+        let text = built_in_registry_text("read", r#""checks_own_scope""#, "r2");
+        let refused = reloader.apply(&Registry::from_toml_str(&text).unwrap());
+        assert!(
+            matches!(
+                &refused,
+                Err(crate::reload::ReloadError::Boot(
+                    BootError::BuiltInAssuranceDiffers { tool, .. }
+                )) if tool.as_str() == "acme__one"
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(live.current().revision().as_str(), "r1");
+        // The same version declaring what the connector states is served.
+        let text = built_in_registry_text("read", FROM_REPO, "r2");
+        let served = reloader.apply(&Registry::from_toml_str(&text).unwrap());
+        assert_eq!(served.unwrap().as_str(), "r2");
     }
 }

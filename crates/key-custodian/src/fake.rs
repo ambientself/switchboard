@@ -12,9 +12,12 @@
 //! - `DELETE /installation/token`: it revokes the token in the `Authorization` header, and
 //!   answers 401 to one it did not issue or has revoked.
 //!
-//! It can be told to refuse, fail, hang, widen what it issues, or issue tokens that expire
-//! sooner than GitHub's hour (see [`Behaviour`]), and to fail the next revocations with 500
-//! (see [`FakeGitHub::fail_revocations`]). An administrator can add a repository to the
+//! It can be told to refuse, fail, hang, widen what it issues, write the names of the
+//! repositories it issues for in capitals, or issue tokens that expire sooner than GitHub's hour
+//! (see [`Behaviour`]), and to fail the next revocations with 500
+//! (see [`FakeGitHub::fail_revocations`]), to revoke and still answer 500
+//! ([`FakeGitHub::apply_and_fail_revocations`]), or to leave them unanswered
+//! ([`FakeGitHub::hang_revocations`]). An administrator can add a repository to the
 //! installation or drop one from it ([`FakeGitHub::add_repository`],
 //! [`FakeGitHub::drop_repository`]), which changes what a token asked for with no repositories
 //! reaches, and what the fake GitHub REST API reports as the installation's repositories. It keeps every token it issued and revoked, when
@@ -55,8 +58,13 @@ pub enum Behaviour {
     Fail,
     /// Never answers.
     Hang,
+    /// Issues tokens as GitHub does, answering this many milliseconds after it is asked.
+    Delay(u64),
     /// Issues a token for every repository of the installation, whatever was asked.
     Widen,
+    /// Issues tokens as asked, and writes each repository's `full_name` in capitals, as GitHub
+    /// writes a name the way its owner cased it, whatever case it was asked for in.
+    Recase,
 }
 
 /// A token the fake issued, and what it is scoped to.
@@ -103,6 +111,8 @@ struct FakeState {
     issued: Vec<IssuedToken>,
     revoked: Vec<String>,
     revocations_to_fail: usize,
+    revocations_to_apply_and_fail: usize,
+    revocations_hang: bool,
     revocation_attempts: Vec<u64>,
     /// The repositories the installation is on now.
     installed: BTreeSet<String>,
@@ -144,6 +154,8 @@ impl FakeGitHub {
                 issued: Vec::new(),
                 revoked: Vec::new(),
                 revocations_to_fail: 0,
+                revocations_to_apply_and_fail: 0,
+                revocations_hang: false,
                 revocation_attempts: Vec::new(),
                 installed,
             }),
@@ -197,6 +209,18 @@ impl FakeGitHub {
     /// Answers the next `count` revocations with 500, revoking nothing.
     pub fn fail_revocations(&self, count: usize) {
         self.shared.lock().revocations_to_fail = count;
+    }
+
+    /// Revokes the token of each of the next `count` revocations and answers it 500, as GitHub
+    /// may when it applies a revocation and fails before it answers. Asked again, it answers
+    /// 401: the token no longer authenticates.
+    pub fn apply_and_fail_revocations(&self, count: usize) {
+        self.shared.lock().revocations_to_apply_and_fail = count;
+    }
+
+    /// Whether the fake leaves every revocation from now on unanswered.
+    pub fn hang_revocations(&self, hang: bool) {
+        self.shared.lock().revocations_hang = hang;
     }
 
     /// When each revocation arrived, failed or not, in seconds since the epoch.
@@ -307,6 +331,9 @@ async fn create(
     if behaviour == Behaviour::Hang {
         std::future::pending::<()>().await;
     }
+    if let Behaviour::Delay(millis) = behaviour {
+        tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+    }
     let headers_ok = headers
         .get("accept")
         .is_some_and(|accept| accept == "application/vnd.github+json")
@@ -391,9 +418,15 @@ async fn create(
     let listed: Vec<Value> = repositories
         .iter()
         .map(|name| {
+            let full_name = format!("{}/{name}", shared.app.account);
+            let full_name = if behaviour == Behaviour::Recase {
+                full_name.to_ascii_uppercase()
+            } else {
+                full_name
+            };
             json!({
                 "name": name,
-                "full_name": format!("{}/{name}", shared.app.account),
+                "full_name": full_name,
             })
         })
         .collect();
@@ -411,8 +444,15 @@ async fn revoke(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respon
     let Some(token) = bearer(&headers) else {
         return error(StatusCode::UNAUTHORIZED, "Bad credentials");
     };
+    let hang = {
+        let mut state = shared.lock();
+        state.revocation_attempts.push(clock::now());
+        state.revocations_hang
+    };
+    if hang {
+        std::future::pending::<()>().await;
+    }
     let mut state = shared.lock();
-    state.revocation_attempts.push(clock::now());
     if state.revocations_to_fail > 0 {
         state.revocations_to_fail -= 1;
         return error(StatusCode::INTERNAL_SERVER_ERROR, "failed");
@@ -422,5 +462,9 @@ async fn revoke(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respon
         return error(StatusCode::UNAUTHORIZED, "Bad credentials");
     }
     state.revoked.push(token.to_owned());
+    if state.revocations_to_apply_and_fail > 0 {
+        state.revocations_to_apply_and_fail -= 1;
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "failed after revoking");
+    }
     StatusCode::NO_CONTENT.into_response()
 }

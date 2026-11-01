@@ -12,6 +12,9 @@ publish.workspace = true
 [dependencies]
 gateway-core = { path = "../gateway-core" }
 base64 = "0.22"
+# Already in the build through `ed25519-dalek`. Only for the test minter's grant whose
+# signature only a lax verifier accepts, which needs the curve's arithmetic.
+curve25519-dalek = { version = "4", optional = true }
 # Already in the build through `jsonwebtoken`. Verification is `verify_strict`.
 ed25519-dalek = "2"
 # The resolver client's HTTP: HTTP/1.1 only, as issuer-keys and connector-proxy have it.
@@ -41,7 +44,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 # `test-support` adds the test minter, which signs grants with keys it generates, and the fake
 # resolver, a local HTTP server. The gateway's own build never turns it on.
 [features]
-test-support = ["dep:tokio-rustls", "tokio/io-util", "tokio/net"]
+test-support = ["dep:curve25519-dalek", "dep:tokio-rustls", "tokio/io-util", "tokio/net"]
 
 [dev-dependencies]
 gateway-otto = { path = ".", features = ["test-support"] }
