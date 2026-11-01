@@ -20,7 +20,7 @@ use gateway_testkit::{
 use serde_json::{Value, json};
 use tokio_postgres::{Client, NoTls};
 
-use super::{DELEGATION_COLUMNS, DelegationRead, GATEWAY_ROLE, TestDatabase};
+use super::{DELEGATION_COLUMNS, DelegationRead, EXCEPTION_COLUMN, GATEWAY_ROLE, TestDatabase};
 use crate::columns::{BeginRow, FinishRow, ListRow, allowance_ms};
 use crate::{
     Budgets, FinishCounts, MAX_BEGUN_ROW_BYTES, MAX_OUTCOME_SENTENCE_BYTES, MAX_REACHED_BYTES,
@@ -118,7 +118,7 @@ pub(super) async fn read_back(admin: &Client, row: &AuditRowId) -> AuditRecord {
                     outcome, outcome_sentence, error_kind, latency_ms, resources,
                     resources_omitted, instance, kind, allowance_ms,
                     deadline = begun_at + allowance_ms * interval '1 millisecond' AS on_time,
-                    {DELEGATION_COLUMNS}
+                    {DELEGATION_COLUMNS}, {EXCEPTION_COLUMN}
              FROM switchboard_audit.call_rows WHERE id = ($1::text)::uuid"
             ),
             &[&row.as_str()],
@@ -182,6 +182,7 @@ pub(super) async fn read_back(admin: &Client, row: &AuditRowId) -> AuditRecord {
         "delegation": read.delegation,
         "delegation_failure": read.failure,
         "currency": read.currency,
+        "allowed_by_exception": text(EXCEPTION_COLUMN),
         "completion": completion,
     }))
     .unwrap()
