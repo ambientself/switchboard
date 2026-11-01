@@ -73,6 +73,12 @@ async fn main() -> ExitCode {
     };
     terminated().await;
     tracing::info!("shutting down");
-    running.stop().await;
+    let stopped = running.stop().await;
+    tracing::info!(
+        revoked = stopped.revoked,
+        not_revoked = stopped.not_revoked,
+        in_flight = stopped.in_flight,
+        "stopped"
+    );
     ExitCode::SUCCESS
 }

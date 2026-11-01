@@ -49,13 +49,13 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::net::{TcpListener, UnixListener, UnixStream};
-use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::github::{ApiConfigError, AppKey, GitHubApp, GitHubConfig};
@@ -63,7 +63,7 @@ use crate::metrics::{Counters, serve_metrics};
 use crate::policy::{PolicyCell, PolicyError};
 use crate::rate::{DEFAULT_BURST, DEFAULT_PER_MINUTE, RateLimiter};
 use crate::record::Recorder;
-use crate::server::Custodian;
+use crate::server::{Custodian, MAX_CONNECTIONS, SHUTDOWN_DEADLINE, Stopped};
 
 /// The default lifetime of a token handed out: five minutes. A token is asked for per call,
 /// and the gateway's longest call deadline is a minute.
@@ -330,6 +330,7 @@ pub struct Running {
     socket: PathBuf,
     metrics: Option<SocketAddr>,
     counters: Arc<Counters>,
+    custodian: Arc<Custodian>,
 }
 
 impl Running {
@@ -348,17 +349,26 @@ impl Running {
         &self.counters
     }
 
-    /// Stops accepting, stops the policy watch and the metrics listener, and removes the
-    /// socket. Connections already accepted finish on their own.
-    pub async fn stop(mut self) {
+    /// Stops gracefully within [`SHUTDOWN_DEADLINE`]: see [`Running::stop_within`].
+    pub async fn stop(self) -> Stopped {
+        self.stop_within(SHUTDOWN_DEADLINE).await
+    }
+
+    /// Stops accepting and removes the socket; waits for the requests in flight and revokes
+    /// every token handed out, or issued and not handed out, that is not yet revoked or past
+    /// GitHub's expiry, all within `deadline`, logging each token not revoked by then (see
+    /// [`crate::server`]); then stops the policy watch and the metrics listener.
+    pub async fn stop_within(mut self, deadline: Duration) -> Stopped {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
         let _ = (&mut self.server).await;
+        let _ = std::fs::remove_file(&self.socket);
+        let stopped = self.custodian.clone().revoke_outstanding(deadline).await;
         for task in &self.tasks {
             task.abort();
         }
-        let _ = std::fs::remove_file(&self.socket);
+        stopped
     }
 }
 
@@ -436,6 +446,8 @@ pub async fn start(config: Config, record: Box<dyn Write + Send>) -> Result<Runn
         account: config.github.account.clone(),
         record: Recorder::new(record),
         counters: counters.clone(),
+        slots: Arc::new(Semaphore::new(MAX_CONNECTIONS as usize)),
+        outstanding: Mutex::default(),
     });
     let mut tasks = vec![tokio::spawn(policy.watch(
         config.registry.clone(),
@@ -456,7 +468,7 @@ pub async fn start(config: Config, record: Box<dyn Write + Send>) -> Result<Runn
         }));
     }
     let (stop, stopped) = oneshot::channel::<()>();
-    let server = tokio::spawn(custodian.serve(listener, async {
+    let server = tokio::spawn(custodian.clone().serve(listener, async {
         let _ = stopped.await;
     }));
     tracing::info!(socket = %config.socket.display(), "serving token requests");
@@ -467,5 +479,6 @@ pub async fn start(config: Config, record: Box<dyn Write + Send>) -> Result<Runn
         socket: config.socket,
         metrics: metrics_address,
         counters,
+        custodian,
     })
 }

@@ -15,8 +15,9 @@
 //! It can be told to refuse, fail, hang, widen what it issues, write the names of the
 //! repositories it issues for in capitals, or issue tokens that expire sooner than GitHub's hour
 //! (see [`Behaviour`]), and to fail the next revocations with 500
-//! (see [`FakeGitHub::fail_revocations`]), or to revoke and still answer 500
-//! ([`FakeGitHub::apply_and_fail_revocations`]). An administrator can add a repository to the
+//! (see [`FakeGitHub::fail_revocations`]), to revoke and still answer 500
+//! ([`FakeGitHub::apply_and_fail_revocations`]), or to leave them unanswered
+//! ([`FakeGitHub::hang_revocations`]). An administrator can add a repository to the
 //! installation or drop one from it ([`FakeGitHub::add_repository`],
 //! [`FakeGitHub::drop_repository`]), which changes what a token asked for with no repositories
 //! reaches, and what the fake GitHub REST API reports as the installation's repositories. It keeps every token it issued and revoked, when
@@ -109,6 +110,7 @@ struct FakeState {
     revoked: Vec<String>,
     revocations_to_fail: usize,
     revocations_to_apply_and_fail: usize,
+    revocations_hang: bool,
     revocation_attempts: Vec<u64>,
     /// The repositories the installation is on now.
     installed: BTreeSet<String>,
@@ -151,6 +153,7 @@ impl FakeGitHub {
                 revoked: Vec::new(),
                 revocations_to_fail: 0,
                 revocations_to_apply_and_fail: 0,
+                revocations_hang: false,
                 revocation_attempts: Vec::new(),
                 installed,
             }),
@@ -211,6 +214,11 @@ impl FakeGitHub {
     /// 401: the token no longer authenticates.
     pub fn apply_and_fail_revocations(&self, count: usize) {
         self.shared.lock().revocations_to_apply_and_fail = count;
+    }
+
+    /// Whether the fake leaves every revocation from now on unanswered.
+    pub fn hang_revocations(&self, hang: bool) {
+        self.shared.lock().revocations_hang = hang;
     }
 
     /// When each revocation arrived, failed or not, in seconds since the epoch.
@@ -431,8 +439,15 @@ async fn revoke(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respon
     let Some(token) = bearer(&headers) else {
         return error(StatusCode::UNAUTHORIZED, "Bad credentials");
     };
+    let hang = {
+        let mut state = shared.lock();
+        state.revocation_attempts.push(clock::now());
+        state.revocations_hang
+    };
+    if hang {
+        std::future::pending::<()>().await;
+    }
     let mut state = shared.lock();
-    state.revocation_attempts.push(clock::now());
     if state.revocations_to_fail > 0 {
         state.revocations_to_fail -= 1;
         return error(StatusCode::INTERNAL_SERVER_ERROR, "failed");

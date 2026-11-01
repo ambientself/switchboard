@@ -62,7 +62,10 @@
 //!   one second up to a minute, until GitHub accepts or the token reaches GitHub's expiry. So
 //!   during an outage of GitHub's revoke endpoint the token works until the first attempt
 //!   after the outage ends.
-//! - The custodian stops. A token not yet revoked then is not revoked at all.
+//! - The custodian stops. A graceful stop revokes every token the custodian still keeps, within
+//!   a deadline, ten seconds by default (see [`server`]). A token whose revocation GitHub does
+//!   not accept by then is logged and works on; so does every token when the custodian is
+//!   killed rather than stopped.
 //!
 //! # Which revision a request carries
 //!
@@ -113,5 +116,7 @@ pub use client::{ClientError, CustodianClient, Token};
 #[cfg(feature = "server")]
 pub use policy::{CustodianPolicy, PolicyCell, PolicyError};
 pub use protocol::{Answer, Failure, MAX_REPOSITORIES, Refusal, Secret, TokenRequest};
+#[cfg(feature = "server")]
+pub use server::Stopped;
 #[cfg(feature = "server")]
 pub use start::{Config, Running, StartError, start, start_process};
