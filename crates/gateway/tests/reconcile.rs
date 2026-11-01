@@ -23,8 +23,8 @@ use gateway_identity::{Clock, SystemClock};
 use gateway_mcp::TOOL_USE_ID_META;
 use gateway_testkit::{
     CONNECTOR, Caller, DOCUMENT_ARGUMENT, DRAFT_TOOL, FakeCredentialSource, FakeLookup, Fixture,
-    FixtureConnector, InMemoryAuditStore, SURFACE_ALL, TEAM_A_DOCUMENT, document, fresh_key,
-    policy_data, policy_data_with_draft_lookup,
+    FixtureConnector, InMemoryAuditStore, SURFACE_ALL, StoreBudgets, TEAM_A_DOCUMENT, document,
+    fresh_key, policy_data, policy_data_with_draft_lookup,
 };
 use serde_json::{Value, json};
 use support::{FixtureResources, Server, eventually, legacy};
@@ -55,6 +55,9 @@ struct Setup {
     real_time: bool,
     /// The fixture connector's deadline in the gateway's own process, if not the default.
     deadline: Option<Duration>,
+    /// The store's budgets, which each call row's deadline includes. No receipt is due before
+    /// its row's deadline.
+    budgets: StoreBudgets,
 }
 
 impl Default for Setup {
@@ -63,9 +66,18 @@ impl Default for Setup {
             settings: SETTINGS,
             real_time: false,
             deadline: None,
+            budgets: StoreBudgets::default(),
         }
     }
 }
+
+/// Budgets that put a call row's deadline a little over a second past its call deadline, so a
+/// test in real time sees it pass.
+const SHORT_BUDGETS: StoreBudgets = StoreBudgets {
+    begin: Duration::from_millis(100),
+    answer: Duration::from_millis(100),
+    finish_deadline: Duration::from_secs(1),
+};
 
 async fn start(policy: Value, answer: LookupAnswer) -> World {
     start_with(policy, answer, Setup::default()).await
@@ -80,7 +92,11 @@ async fn start_with(policy: Value, answer: LookupAnswer, setup: Setup) -> World 
     } else {
         Arc::new(fixture.clock.clone())
     };
-    let store = Arc::new(InMemoryAuditStore::new().with_clock(clock));
+    let store = Arc::new(
+        InMemoryAuditStore::new()
+            .with_clock(clock)
+            .with_budgets(setup.budgets),
+    );
     let lookup = Arc::new(FakeLookup::answering(answer));
     let mut config = support::config(&fixture);
     config["policy"] = policy;
@@ -143,7 +159,8 @@ async fn start_with(policy: Value, answer: LookupAnswer, setup: Setup) -> World 
 
 impl World {
     /// Team A proposes on its own document, under `key`, and the connector loses the answer
-    /// after opening the draft. Returns the receipt, which is `unknown`.
+    /// after opening the draft. Returns the receipt, which is `unknown`, with the fixture's
+    /// clock moved past its row's deadline, so it is due.
     async fn lost_proposal(&self, key: &str) -> Receipt {
         self.server.connector.lose_next_answer();
         let answer = self.propose(key).await;
@@ -157,7 +174,27 @@ impl World {
             1,
             "the draft was opened"
         );
+        let deadline = self
+            .server
+            .store
+            .deadline(&receipt.row)
+            .expect("the row has a deadline");
+        let clock = &self.server.fixture.clock;
+        let to_go = deadline.duration_since(clock.now()).unwrap_or_default();
+        clock.advance(to_go + Duration::from_millis(1));
         receipt
+    }
+
+    /// Waits, in real time, until the row of `receipt` is past its deadline.
+    async fn past_deadline(&self, receipt: &Receipt) {
+        let deadline = self
+            .server
+            .store
+            .deadline(&receipt.row)
+            .expect("the row has a deadline");
+        while SystemTime::now() <= deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// Team A's proposal on its own document, under `key`.
@@ -390,6 +427,7 @@ async fn no_instance_looks_up_a_receipt_while_its_late_side_effect_runs() {
             },
             real_time: true,
             deadline: Some(Duration::from_millis(200)),
+            budgets: SHORT_BUDGETS,
         },
     )
     .await;
@@ -412,7 +450,8 @@ async fn no_instance_looks_up_a_receipt_while_its_late_side_effect_runs() {
         .expect("the receipt was answered unheld");
     assert!(holder.as_str().ends_with("late-call"), "{holder}");
 
-    // For two leases, with the draft on its way, neither instance claims it.
+    // For two leases, with the draft on its way, neither instance claims it, before its row's
+    // deadline or after.
     let until = Instant::now() + lease * 2;
     while Instant::now() < until {
         for reconciler in [&world.reconciler, &world.other] {
@@ -424,6 +463,10 @@ async fn no_instance_looks_up_a_receipt_while_its_late_side_effect_runs() {
     assert!(
         world.lookup.looked_up().is_empty(),
         "looked up while it ran"
+    );
+    assert!(
+        SystemTime::now() > store.deadline(&receipt.row).unwrap(),
+        "the row's deadline has not passed, so the hold went untested"
     );
     assert_eq!(world.receipt(&receipt).state, ReceiptState::Unknown);
 
@@ -477,9 +520,9 @@ async fn a_late_side_effects_first_hold_not_written_is_tried_again_within_a_seco
             authoritative: true,
         },
         Setup {
-            settings: SETTINGS,
             real_time: true,
             deadline: Some(Duration::from_millis(200)),
+            ..Setup::default()
         },
     )
     .await;
@@ -522,6 +565,67 @@ async fn a_late_side_effects_first_hold_not_written_is_tried_again_within_a_seco
     .await;
 }
 
+/// No instance claims a late side effect's receipt before its row's deadline, though none of
+/// the side effect's holds of it is written (#217): the call is answered `unknown` with its
+/// receipt's lease free, and another instance's reconciler, which does not know the side effect
+/// runs, finds nothing due. A lookup then would find nothing and settle it `not_performed`
+/// while the draft is on its way. The row's deadline includes the finish deadline, so a hold
+/// not written has that long to be tried again.
+#[tokio::test]
+async fn no_instance_claims_a_late_side_effects_receipt_before_its_rows_deadline() {
+    let world = start_with(
+        policy_data_with_draft_lookup(),
+        LookupAnswer::NotFound {
+            authoritative: true,
+        },
+        Setup {
+            real_time: true,
+            deadline: Some(Duration::from_millis(200)),
+            ..Setup::default()
+        },
+    )
+    .await;
+    let store = &world.server.store;
+    store.fail_all_holds();
+    let draft = world.server.connector.hang_next();
+    let answer = world.propose(fresh_key().as_str()).await;
+    assert_eq!(answer.result()["isError"], json!(true), "{answer:?}");
+    let receipt = store
+        .receipts()
+        .last()
+        .expect("a receipt was reserved")
+        .clone();
+    assert_eq!(receipt.state, ReceiptState::Unknown);
+    assert_eq!(store.lease_holder(&receipt.row), None, "a hold was written");
+
+    for _ in 0..3 {
+        for reconciler in [&world.other, &world.reconciler] {
+            let report = reconciler.pass().await;
+            assert_eq!(
+                (report.due, report.claimed, report.looked_up),
+                (0, 0, 0),
+                "{report:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        SystemTime::now() < store.deadline(&receipt.row).unwrap(),
+        "the row's deadline passed during the test"
+    );
+    assert!(
+        world.lookup.looked_up().is_empty(),
+        "looked up while it ran"
+    );
+    let left = world.receipt(&receipt);
+    assert_eq!((left.state, left.claims), (ReceiptState::Unknown, 0));
+    draft.open();
+    eventually("the late side effect ran to its end", || {
+        world.server.connector.writes().len() == 1
+    })
+    .await;
+}
+
 /// This instance's reconciler never claims a receipt whose late side effect still runs in its
 /// own process, even when that side effect's holds of it are not written and its lease is free
 /// (#217): a lookup then would find nothing and settle it `not_performed` while the draft is
@@ -534,9 +638,10 @@ async fn this_instance_never_claims_a_receipt_whose_late_side_effect_runs_here()
             authoritative: true,
         },
         Setup {
-            settings: SETTINGS,
             real_time: true,
             deadline: Some(Duration::from_millis(200)),
+            budgets: SHORT_BUDGETS,
+            ..Setup::default()
         },
     )
     .await;
@@ -552,6 +657,9 @@ async fn this_instance_never_claims_a_receipt_whose_late_side_effect_runs_here()
         .clone();
     assert_eq!(store.lease_holder(&receipt.row), None, "a hold was written");
 
+    // Past its row's deadline, with no hold written, the receipt is due, and this instance
+    // still passes it over.
+    world.past_deadline(&receipt).await;
     for _ in 0..3 {
         let report = world.reconciler.pass().await;
         assert_eq!(

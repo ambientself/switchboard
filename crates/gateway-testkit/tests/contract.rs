@@ -146,4 +146,5 @@ contract!(
     a_receipt_settled_by_reconciliation_is_not_moved_by_a_late_finish,
     each_claim_is_counted_as_an_attempt,
     a_receipt_held_for_its_call_is_not_due_and_no_one_else_claims_it,
+    an_unknown_receipt_is_not_due_before_its_rows_deadline,
 );

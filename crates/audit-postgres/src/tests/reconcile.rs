@@ -531,7 +531,7 @@ async fn two_claims_sent_at_once_never_both_win() {
     let lease: i64 = 60_000_000;
 
     for round in 0..3 {
-        let id = receipt(&admin, "unknown", false).await;
+        let id = receipt(&admin, "unknown", true).await;
         first.batch_execute("BEGIN").await.unwrap();
         let won = first
             .query(CLAIM, &[&id, &"instance-first", &lease])

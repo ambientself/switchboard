@@ -40,8 +40,9 @@
 //! nothing settles `not_performed`, and one that is not never does; a found effect settles
 //! `completed` with its reference; a lookup record is appended and never changed; a receipt
 //! settled by reconciliation is not moved by a late finish, and a late finish that disagrees
-//! with it is counted, once; each claim is counted as an attempt; and a receipt held for its
-//! call, `pending` or `unknown`, is not due and no one else can claim it until the hold ends.
+//! with it is counted, once; each claim is counted as an attempt; a receipt held for its
+//! call, `pending` or `unknown`, is not due and no one else can claim it until the hold ends;
+//! and a receipt answered `unknown` is not due, nor claimed, before its row's deadline.
 //!
 //! Some of what the in-memory store copies from Postgres cannot be tried here, and its own
 //! tests try it. A deadline whose interval is past what Postgres holds is refused, but from
@@ -2775,8 +2776,16 @@ fn holder(name: &str) -> LeaseHolder {
 }
 
 /// A receipt in `unknown`: team A's proposal, whose connector reported `unknown`, finished
-/// within its deadline.
+/// within its deadline, with the deadline then passed, so it is due.
 async fn unknown_receipt(contract: &impl ContractStore) -> AuditRowId {
+    let row = unknown_within_deadline(contract).await;
+    contract.pass_deadline(&row).await;
+    row
+}
+
+/// A receipt in `unknown`: team A's proposal, whose connector reported `unknown`, finished
+/// within its deadline, which has not passed.
+async fn unknown_within_deadline(contract: &impl ContractStore) -> AuditRowId {
     let store = contract.store();
     let start = row_start();
     let guard = proposal_guard(store, &fixture(), &start, &proposal("p"), &fresh_key()).await;
@@ -2788,6 +2797,32 @@ async fn unknown_receipt(contract: &impl ContractStore) -> AuditRowId {
         ReceiptState::Unknown
     );
     start.row
+}
+
+/// A receipt the call answered `unknown` is not due before its row's deadline, on any
+/// instance (#217): its call may be a side effect still running whose hold of the lease is not
+/// written yet. No one claims it, and it is not listed. Once the deadline has passed it is due
+/// and claimed as any other.
+pub async fn an_unknown_receipt_is_not_due_before_its_rows_deadline(contract: &impl ContractStore) {
+    let row = unknown_within_deadline(contract).await;
+    let holder = holder("other");
+    assert!(
+        !is_due(contract, &row).await,
+        "an unknown receipt was due before its row's deadline"
+    );
+    assert_eq!(
+        contract
+            .queue()
+            .claim(&row, &holder, LEASE)
+            .await
+            .expect("a claim failed"),
+        None,
+        "an unknown receipt was claimed before its row's deadline"
+    );
+    assert_eq!(receipt_under(contract, &row).await.claims, 0);
+    contract.pass_deadline(&row).await;
+    assert!(is_due(contract, &row).await);
+    assert_eq!(claimed(contract, &row, &holder).await.claims, 1);
 }
 
 /// Whether the queue lists the receipt `row` as due.
@@ -2844,6 +2879,7 @@ pub async fn a_receipt_records_the_vendor_target_its_settlement_takes(
     );
     let ran = audit::run(&Answering::with(ToolOutcome::Unknown), guard).await;
     assert!(audit::finish(store, ran, 1).await.failure().is_none());
+    contract.pass_deadline(&start.row).await;
     let claimed = claimed(contract, &start.row, &holder("a")).await;
     assert_eq!(claimed.target, Some(document(TEAM_A_DOCUMENT)));
 
