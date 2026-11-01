@@ -481,9 +481,11 @@ async fn a_write_github_definitely_refused_is_an_error_and_never_carries_a_crede
 }
 
 /// Each answer that leaves the write's effect unknown is `unknown`, whether or not GitHub
-/// applied it. One reconciliation pass settles the two GitHub applied, finding each by its
-/// marker, and leaves the third `unknown`: not found, which is never authoritative, and, with
-/// one attempt, handed to a person. The lookups read with tokens of their own, for the
+/// applied it: a 502 after applying, a connection closed with no answer, a 201 broken off
+/// before its body ends, a 201 whose body is not JSON, and a 502 with nothing applied. One
+/// reconciliation pass settles the four GitHub applied, finding each by its marker, and leaves
+/// the fifth `unknown`: not found, which is never authoritative, and, with one attempt, handed
+/// to a person. The lookups read with tokens of their own, for the
 /// receipt's team, its repository and `pull_requests: read`, and only read.
 #[tokio::test]
 async fn a_write_that_may_have_been_sent_is_unknown_and_reconciliation_settles_what_was_made() {
@@ -499,7 +501,9 @@ async fn a_write_that_may_have_been_sent_is_unknown_and_reconciliation_settles_w
     let mut receipts = Vec::new();
     for (at, fault) in [
         Fault::AppliedThen(502),
+        Fault::AppliedThenClosed,
         Fault::AppliedThenBrokenOff,
+        Fault::AppliedThenNotJson,
         Fault::Status(502),
     ]
     .into_iter()
@@ -517,7 +521,7 @@ async fn a_write_that_may_have_been_sent_is_unknown_and_reconciliation_settles_w
         assert_eq!(receipt.state, ReceiptState::Unknown, "{fault:?}");
         receipts.push(receipt);
     }
-    assert_eq!(world.rest.opened("atlas").len(), 2, "two were applied");
+    assert_eq!(world.rest.opened("atlas").len(), 4, "four were applied");
 
     let requests_before = world.rest.requests().len();
     let tokens_before = world.app.issued().len();
@@ -530,10 +534,10 @@ async fn a_write_that_may_have_been_sent_is_unknown_and_reconciliation_settles_w
             report.settled,
             report.handed_to_person
         ),
-        (3, 3, 2, 1),
+        (5, 5, 4, 1),
         "{report:?}"
     );
-    for (receipt, number) in receipts.iter().take(2).zip([1, 2]) {
+    for (receipt, number) in receipts.iter().take(4).zip([1, 2, 3, 4]) {
         let settled = world.store.receipt(&receipt.row).unwrap();
         assert_eq!(
             (
@@ -551,7 +555,7 @@ async fn a_write_that_may_have_been_sent_is_unknown_and_reconciliation_settles_w
             )
         );
     }
-    let left = world.store.receipt(&receipts[2].row).unwrap();
+    let left = world.store.receipt(&receipts[4].row).unwrap();
     assert_eq!(left.state, ReceiptState::Unknown);
     assert!(left.handed_to_person.is_some());
     assert_eq!(
@@ -563,7 +567,7 @@ async fn a_write_that_may_have_been_sent_is_unknown_and_reconciliation_settles_w
 
     // The lookups only read, each with a token of its own.
     let looked = &world.rest.requests()[requests_before..];
-    assert_eq!(looked.len(), 3, "{looked:?}");
+    assert_eq!(looked.len(), 5, "{looked:?}");
     for request in looked {
         assert_eq!(request.method, "GET");
         assert_eq!(request.path, "/repos/example-org/atlas/pulls");
@@ -573,7 +577,7 @@ async fn a_write_that_may_have_been_sent_is_unknown_and_reconciliation_settles_w
         );
     }
     let issued = &world.app.issued()[tokens_before..];
-    assert_eq!(issued.len(), 3);
+    assert_eq!(issued.len(), 5);
     for token in issued {
         assert_eq!(token.asked_repositories, Some(vec!["atlas".to_owned()]));
         assert_eq!(
@@ -591,7 +595,7 @@ async fn a_write_that_may_have_been_sent_is_unknown_and_reconciliation_settles_w
         assert_eq!(line["permissions"], json!({"pull_requests": "read"}));
         assert_eq!(line["revision"], "r1");
     }
-    assert_eq!(posts(&world).len(), 3, "nothing was sent again");
+    assert_eq!(posts(&world).len(), 5, "nothing was sent again");
 }
 
 /// A write still on its way at the in-process deadline is answered `unknown`, and runs on: the

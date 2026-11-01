@@ -14,8 +14,8 @@
 //!   and a 404 when it set nothing. A token needs `contents` at `read` or above.
 //!
 //! The next write can be given a fault ([`FakeRest::fault_next_write`], see [`Fault`]): an
-//! answer that applies nothing, an answer after applying, a broken-off answer after applying,
-//! or applying late. And the fake can be told to stop taking connections once it has answered
+//! answer that applies nothing, an answer after applying, a connection closed with no answer
+//! after applying, a 201 broken off or not JSON after applying, or applying late. And the fake can be told to stop taking connections once it has answered
 //! the next comparison ([`FakeRest::close_after_next_compare`]), so the write after it cannot
 //! connect.
 
@@ -41,9 +41,14 @@ pub enum Fault {
     Status(u16),
     /// Applies the write, then answers this status.
     AppliedThen(u16),
-    /// Applies the write, begins a 201 answer and breaks the connection off before its body
-    /// ends.
+    /// Applies the write, then closes the connection before any of an answer is sent: the
+    /// client's request fails with no answer.
+    AppliedThenClosed,
+    /// Applies the write, sends a 201's head and the start of the pull request's JSON, then
+    /// breaks the connection off: the client has the 201 and cannot read its body.
     AppliedThenBrokenOff,
+    /// Applies the write, then answers 201 with a whole body that is not JSON.
+    AppliedThenNotJson,
     /// Waits this long, then applies the write and answers as GitHub does.
     Late(Duration),
 }
@@ -270,18 +275,44 @@ async fn create(shared: &Shared, repo: &str, body: &[u8], token: Option<&str>) -
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             error(status, "failed", token)
         }
+        Some(Fault::AppliedThenClosed) => Response::builder()
+            .status(StatusCode::CREATED)
+            .body(Body::new(Closed))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         Some(Fault::AppliedThenBrokenOff) => Response::builder()
             .status(StatusCode::CREATED)
-            .body(Body::new(BrokenOff { sent: false }))
+            .body(Body::new(BrokenOff::default()))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        Some(Fault::AppliedThenNotJson) => {
+            (StatusCode::CREATED, "<html>created</html>").into_response()
+        }
         _ => (StatusCode::CREATED, made.to_string()).into_response(),
     }
 }
 
-/// A body that sends the start of a pull request's JSON and then fails, which breaks the
-/// connection off before the answer ends.
+/// A body that fails when first asked for a frame. hyper's server writes an answer's head into
+/// its buffer and sends it only when it flushes, which it does not do before a body's error ends
+/// the connection: so nothing of the answer is sent, and the client sees the connection close.
+struct Closed;
+
+impl hyper::body::Body for Closed {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        Poll::Ready(Some(Err(std::io::Error::other("closed"))))
+    }
+}
+
+/// A body that sends the start of a pull request's JSON, then waits once, so that hyper flushes
+/// the head and that start to the client, and then fails, which breaks the connection off
+/// before the answer ends.
+#[derive(Default)]
 struct BrokenOff {
-    sent: bool,
+    polls: u8,
 }
 
 impl hyper::body::Body for BrokenOff {
@@ -290,13 +321,17 @@ impl hyper::body::Body for BrokenOff {
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
-        _context: &mut Context<'_>,
+        context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
-        if self.sent {
-            return Poll::Ready(Some(Err(std::io::Error::other("broken off"))));
+        self.polls += 1;
+        match self.polls {
+            1 => Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"{\"number\":"))))),
+            2 => {
+                context.waker().wake_by_ref();
+                Poll::Pending
+            }
+            _ => Poll::Ready(Some(Err(std::io::Error::other("broken off")))),
         }
-        self.sent = true;
-        Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"{\"number\":")))))
     }
 }
 
