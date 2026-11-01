@@ -64,12 +64,12 @@ use crate::classification::Classification;
 pub use crate::connector::ErrorKind;
 use crate::connector::{BoxFuture, Connector, Granted, ToolCall, ToolOutcome};
 use crate::decision::{
-    CallContext, CallerContext, CurrencyAnswer, Decision, Reason, ReasonKind, ResourceProblem,
-    Verdict,
+    CallContext, CallerContext, CurrencyAnswer, Decision, DecisionParts, Reason, ReasonKind,
+    ResourceProblem, Verdict,
 };
 use crate::names::{
-    ConnectorName, DelegationIssuer, DeploymentName, ExecutionId, InstanceName, KeyId, Person,
-    PolicyRevision, ProfileName, SessionId, SurfaceName, TeamId, ToolUseId, TurnId,
+    ConnectorName, DelegationIssuer, DeploymentName, ExceptionName, ExecutionId, InstanceName,
+    KeyId, Person, PolicyRevision, ProfileName, SessionId, SurfaceName, TeamId, ToolUseId, TurnId,
 };
 use crate::policy::{
     ApprovedTool, ConnectorEntry, CredentialMode, PolicySnapshot, Resource, ResourceDeclaration,
@@ -409,6 +409,13 @@ pub struct AuditRecord {
     /// 0012). `None` when it was not asked.
     #[serde(default)]
     pub currency: Option<CurrencyAnswer>,
+    /// The exception in the caller's profile that let the call's `write` tool past check 5
+    /// (decision 0011, section 9), as [`Decision::exception`](crate::Decision::exception) names
+    /// it. Set only on an allowed call's row, the answer to a reused key included; `None` on
+    /// every denial, a call that passed check 5 by an exception and was then denied included.
+    /// It is not a reason, which belongs to a denial. A list row has none.
+    #[serde(default)]
+    pub allowed_by_exception: Option<ExceptionName>,
     /// The configured identity of the connector entry of the tool the call names, recorded at
     /// begin, as [`RowStart::credential`] gives it: see [`CredentialIdentity`]. Recorded for a
     /// denial too, as the connector is. `None` when the call names no tool the surface serves,
@@ -820,7 +827,13 @@ pub async fn begin(
     arguments: serde_json::Value,
     metadata: RequestMetadata,
 ) -> Result<Begun, AuditFailure> {
-    let (call, verdict, policy_revision, caller_limit) = decision.into_parts();
+    let DecisionParts {
+        call,
+        verdict,
+        policy_revision,
+        caller_limit,
+        exception,
+    } = decision.into_parts();
     let granted = Granted {
         policy_revision: policy_revision.clone(),
         caller_limit,
@@ -896,6 +909,7 @@ pub async fn begin(
         delegation,
         delegation_failure,
         currency: call.currency.answer(),
+        allowed_by_exception: exception,
         credential: tool.and(credential),
         completion: None,
     };
