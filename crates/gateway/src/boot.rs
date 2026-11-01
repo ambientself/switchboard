@@ -715,6 +715,7 @@ impl Gates {
             self.lookups.clone(),
             &self.instance,
             settings,
+            self.late.clone(),
         );
         self.late.hold_in(
             queue,

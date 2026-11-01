@@ -9,7 +9,9 @@
 //!    committed before anything else happens, so no lookup is made without it, and no lock or
 //!    connection is held across a lookup. The store counts the claim in the same write. A
 //!    receipt another instance holds is passed over, and so is one whose own call still runs
-//!    past its deadline, which holds it ([`crate::bound`]).
+//!    past its deadline, which holds it ([`crate::bound`]). A receipt whose call still runs past
+//!    its deadline in this instance's own process is passed over before it is claimed, whether
+//!    or not that call's hold was written ([`LateCalls::runs`]).
 //! 2. Hands it to a person at once when there is nothing to look in: its tool is settled by a
 //!    person, so its receipt recorded no vendor target, or the call named no single resource of
 //!    the declared kind; or its tool's connector registered no [`Lookup`] (no connector does
@@ -51,6 +53,7 @@ use gateway_core::{
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::bound::LateCalls;
 use crate::policy::LivePolicy;
 
 /// How often a pass is made, unless the deployment file says otherwise: a minute. A receipt
@@ -311,6 +314,7 @@ pub struct Reconciler {
     holder: LeaseHolder,
     settings: ReconcileSettings,
     signals: ReconcileSignals,
+    late: Arc<LateCalls>,
 }
 
 impl fmt::Debug for Reconciler {
@@ -330,6 +334,7 @@ impl Reconciler {
         lookups: BTreeMap<ConnectorName, Arc<dyn Lookup>>,
         instance: &InstanceName,
         settings: ReconcileSettings,
+        late: Arc<LateCalls>,
     ) -> Self {
         Self {
             queue,
@@ -338,6 +343,7 @@ impl Reconciler {
             holder: LeaseHolder::new(format!("{instance} {}", uuid::Uuid::now_v7())),
             settings,
             signals: ReconcileSignals::default(),
+            late,
         }
     }
 
@@ -388,6 +394,11 @@ impl Reconciler {
 
     /// Claims `due`, then hands it to a person or looks it up and records what was found.
     async fn work(&self, due: &Receipt, report: &mut PassReport) {
+        // Its own call still runs here: a lookup now could find nothing though the call may yet
+        // act, so it is not claimed, even if that call's hold of it was not written.
+        if self.late.runs(&due.row) {
+            return;
+        }
         // The lease is committed before anything else: no lookup is made without it.
         let claimed = match self
             .queue
