@@ -27,10 +27,10 @@
 //! or [`team_over_quota`](crate::team_over_quota), and is not sent; the slots it took are given
 //! back. A call a cap sheds takes no token.
 //!
-//! Each bulkhead counts, in [`ServerSignals`]: the calls its server's connector ran, by
-//! outcome, `unknown` apart from `error`; how long each took; those that were late or too large, by their error kind; the
-//! calls each cap refused; and the calls each quota refused. A call dropped before its
-//! connector returned is counted in none of the first three. [`crate::metrics`] exports them,
+//! Each bulkhead counts, in [`ServerSignals`]: the calls its server's connector ran, by outcome,
+//! `unknown` apart from `error`; how long each took; those that were late or too large, by their
+//! error kind; the calls each cap refused; and the calls each quota refused. A call dropped before
+//! its connector returned is counted in none of the first three. [`crate::metrics`] exports them,
 //! labelled by the server's name in the registry and nothing a caller chooses.
 
 use std::collections::BTreeMap;
