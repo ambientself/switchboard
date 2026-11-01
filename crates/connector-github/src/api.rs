@@ -12,13 +12,20 @@
 //! The same client, built for a job log host the deployment pins, downloads a log: with no
 //! token and none of the API's headers, keeping only the end of what it reads. A redirect's
 //! target is handed back to the caller, which decides whether a pinned host serves it.
+//!
+//! A write, a `POST` or a `PATCH` ([`Api::write`]), carries a JSON body the connector builds
+//! from its own types, never the caller's bytes, with the same headers, the same pinned TLS, no
+//! redirect followed and no proxy, and its answer read up to [`MAX_ANSWER_BYTES`]. It goes on a
+//! client of its own that keeps no idle connection and never sends a request twice: each write
+//! opens a connection of its own, so a failure to connect is the one failure that shows the
+//! request was not sent (see [`Wrote`]).
 
 use std::path::Path;
 use std::sync::Arc;
 
-use http_body_util::{BodyExt, Empty, Limited};
+use http_body_util::{BodyExt, Empty, Full, Limited};
 use hyper::body::{Bytes, Incoming};
-use hyper::header::{ACCEPT, AUTHORIZATION, HeaderValue, LOCATION, USER_AGENT};
+use hyper::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, LOCATION, USER_AGENT};
 use hyper::{Method, Request, StatusCode, Uri};
 use hyper_rustls::{DefaultServerNameResolver, HttpsConnector};
 use hyper_util::client::legacy::Client;
@@ -81,16 +88,52 @@ pub(crate) enum Answered {
     Unreachable,
 }
 
-enum Transport {
+/// What came of one write ([`Api::write`]). Holds nothing GitHub sent back but the status,
+/// whether it said its rate limit was used up, and, on success, the JSON it answered.
+///
+/// The kinds are kept apart, and apart from the reads' [`Answered`], because a side effect's
+/// outcome turns on them (`crate::writes`): only a request that was never sent, or one GitHub
+/// definitely refused, is known to have done nothing.
+#[derive(Debug)]
+pub(crate) enum Wrote {
+    /// Not sent: no connection could be made, or the request could not be built.
+    NotSent,
+    /// A 2xx answer whose body is JSON: the write was done.
+    Json(Value),
+    /// A definite answer that did nothing: any 3xx or 4xx, GitHub's rate-limit 403 and 429
+    /// included.
+    Refused {
+        status: StatusCode,
+        rate_limited: bool,
+    },
+    /// No definite answer: a 5xx; an exchange that broke after its connection was made, before
+    /// the whole answer was read; or a 2xx whose body could not be read, or is not JSON. The
+    /// write may have been done.
+    NoDefiniteAnswer,
+}
+
+/// A write's method: one that changes something.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteMethod {
+    Post,
+    // Not sent yet: the proposal tools amend a pull request with it (#12).
+    #[allow(dead_code)]
+    Patch,
+}
+
+/// A client of one kind of connection, sending bodies of type `B`.
+enum Transport<B> {
     #[cfg(feature = "loopback")]
-    Plain(Client<HttpConnector, Empty<Bytes>>),
-    Tls(Client<HttpsConnector<HttpConnector>, Empty<Bytes>>),
+    Plain(Client<HttpConnector, B>),
+    Tls(Client<HttpsConnector<HttpConnector>, B>),
 }
 
 /// The client for GitHub's REST API.
 pub(crate) struct Api {
     base: String,
-    transport: Transport,
+    transport: Transport<Empty<Bytes>>,
+    /// The writes' own client: no idle connection kept, and no request sent twice.
+    writes: Transport<Full<Bytes>>,
 }
 
 impl std::fmt::Debug for Api {
@@ -121,14 +164,23 @@ impl Api {
         if !(uri.path() == "/" || uri.path().is_empty()) || uri.query().is_some() {
             return Err(bad());
         }
-        let transport = match uri.scheme_str() {
-            Some("https") => Transport::Tls(tls_client(ca_file.ok_or(ApiError::NoCaFile)?)?),
+        let (transport, writes) = match uri.scheme_str() {
+            Some("https") => {
+                let connector = tls_connector(ca_file.ok_or(ApiError::NoCaFile)?)?;
+                (
+                    Transport::Tls(client(connector.clone())),
+                    Transport::Tls(write_client(connector)),
+                )
+            }
             #[cfg(feature = "loopback")]
             Some("http") if loopback(host) => {
                 if ca_file.is_some() {
                     return Err(ApiError::CaFileForHttp);
                 }
-                Transport::Plain(client(HttpConnector::new()))
+                (
+                    Transport::Plain(client(HttpConnector::new())),
+                    Transport::Plain(write_client(HttpConnector::new())),
+                )
             }
             _ => {
                 let _ = host;
@@ -138,6 +190,7 @@ impl Api {
         Ok(Self {
             base: base.to_owned(),
             transport,
+            writes,
         })
     }
 
@@ -159,12 +212,7 @@ impl Api {
             .uri(format!("{}{path_and_query}", self.base))
             .header(USER_AGENT, PRODUCT);
         if let Some(token) = token {
-            let mut authorization = HeaderValue::from_str(&format!("Bearer {token}")).ok()?;
-            authorization.set_sensitive(true);
-            request = request
-                .header(ACCEPT, "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", API_VERSION)
-                .header(AUTHORIZATION, authorization);
+            request = api_headers(request, token)?;
         }
         let request = request.body(Empty::new()).ok()?;
         let response = match &self.transport {
@@ -276,6 +324,98 @@ impl Api {
             Err(_) => Answered::Unreadable,
         }
     }
+
+    /// `method {base}{path}` with `token` and `body`, the JSON of a value the connector built
+    /// from its own types, on the writes' own client. What came of it, told apart as [`Wrote`]
+    /// says.
+    ///
+    /// Never sent twice. hyper-util's legacy client sends a request again on its own in one
+    /// case only: it was given a pooled connection that turned out to be closed before any of
+    /// the request was written (`retry_canceled_requests`, on by default, and only for a
+    /// connection reused from the pool). The writes' client turns that off and keeps no idle
+    /// connection, so every write opens a connection of its own and nothing is resent, not even
+    /// a request that never began to be written. So a failure to connect is
+    /// [`Wrote::NotSent`], and every other failure, once a connection was made, is
+    /// [`Wrote::NoDefiniteAnswer`].
+    pub(crate) async fn write(
+        &self,
+        method: WriteMethod,
+        path: &str,
+        body: &impl serde::Serialize,
+        token: &str,
+    ) -> Wrote {
+        let Ok(body) = serde_json::to_vec(body) else {
+            return Wrote::NotSent;
+        };
+        let method = match method {
+            WriteMethod::Post => Method::POST,
+            WriteMethod::Patch => Method::PATCH,
+        };
+        let request = Request::builder()
+            .method(method)
+            .uri(format!("{}{path}", self.base))
+            .header(USER_AGENT, PRODUCT)
+            .header(CONTENT_TYPE, "application/json");
+        let Some(request) = api_headers(request, token) else {
+            return Wrote::NotSent;
+        };
+        let Ok(request) = request.body(Full::new(Bytes::from(body))) else {
+            return Wrote::NotSent;
+        };
+        let response = match &self.writes {
+            #[cfg(feature = "loopback")]
+            Transport::Plain(client) => client.request(request).await,
+            Transport::Tls(client) => client.request(request).await,
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(error) if error.is_connect() => {
+                // hyper's error names the connection's failure, never a header.
+                tracing::warn!(%error, "GitHub's API could not be reached; the write was not sent");
+                return Wrote::NotSent;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "a write to GitHub's API got no answer");
+                return Wrote::NoDefiniteAnswer;
+            }
+        };
+        let status = response.status();
+        if status.is_redirection() || status.is_client_error() {
+            return Wrote::Refused {
+                status,
+                rate_limited: rate_limited(&response),
+            };
+        }
+        if !status.is_success() {
+            return Wrote::NoDefiniteAnswer;
+        }
+        let Ok(body) = Limited::new(response.into_body(), MAX_ANSWER_BYTES)
+            .collect()
+            .await
+        else {
+            return Wrote::NoDefiniteAnswer;
+        };
+        match serde_json::from_slice(&body.to_bytes()) {
+            Ok(value) => Wrote::Json(value),
+            Err(_) => Wrote::NoDefiniteAnswer,
+        }
+    }
+}
+
+/// `request` with the API's headers and `token`, in an `Authorization` header marked
+/// sensitive; `None` when the token cannot be a header's value.
+fn api_headers(
+    request: hyper::http::request::Builder,
+    token: &str,
+) -> Option<hyper::http::request::Builder> {
+    let mut authorization = HeaderValue::from_str(&format!("Bearer {token}")).ok()?;
+    authorization.set_sensitive(true);
+    Some(
+        request
+            .header(ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .header(AUTHORIZATION, authorization),
+    )
 }
 
 /// Whether GitHub's answer says its rate limit is used up.
@@ -330,12 +470,22 @@ where
         .build(connector)
 }
 
-/// A client that speaks only TLS, offering only HTTP/1.1, and trusts only the CAs in
+/// The writes' client: the legacy client, as [`client`] builds it, keeping no idle connection
+/// and never sending a request again on its own (see [`Api::write`]).
+fn write_client<C>(connector: C) -> Client<C, Full<Bytes>>
+where
+    C: hyper_util::client::legacy::connect::Connect + Clone,
+{
+    Client::builder(TokioExecutor::new())
+        .pool_max_idle_per_host(0)
+        .retry_canceled_requests(false)
+        .build(connector)
+}
+
+/// A connector that speaks only TLS, offering only HTTP/1.1, and trusts only the CAs in
 /// `ca_file`. Its crypto provider is ring, passed here; the process-wide default is neither
 /// read nor set.
-fn tls_client(
-    ca_file: &Path,
-) -> Result<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>, ApiError> {
+fn tls_connector(ca_file: &Path) -> Result<HttpsConnector<HttpConnector>, ApiError> {
     let unreadable = || ApiError::CaFile(ca_file.display().to_string());
     let bytes = std::fs::read(ca_file).map_err(|_| unreadable())?;
     let mut roots = RootCertStore::empty();
@@ -359,11 +509,10 @@ fn tls_client(
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     let mut tcp = HttpConnector::new();
     tcp.enforce_http(false);
-    let connector = HttpsConnector::new(
+    Ok(HttpsConnector::new(
         tcp,
         config,
         true,
         Arc::new(DefaultServerNameResolver::default()),
-    );
-    Ok(client(connector))
+    ))
 }
