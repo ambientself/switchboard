@@ -1983,6 +1983,11 @@ mutate("testkit-late-finish-disagreement-not-counted", "a late finish that disag
        "            self.late_finish_disagreements += 1;\n", "")
 mutate("testkit-late-finish-agreement-counted", "a late finish that agrees with reconciliation is counted as a disagreement", A,
        "        && receipt.state != settled\n", "")
+# No receipt is due before its row's deadline, so a late side effect whose first hold is not
+# written has until then to hold it (#217). tests/reconcile.rs and the contract suite catch it.
+mutate("testkit-due-before-deadline", "a receipt answered unknown is due before its row's deadline", A,
+       "        self.past_deadline(&receipt.row, now)\n            && self.reads_as_unknown(receipt, now)\n",
+       "        self.reads_as_unknown(receipt, now)\n")
 
 C = TESTKIT_SRC + "credentials.rs"
 NEXT_FAILURE = "            Refusing::Next(failure) => {\n                state.refusing = Refusing::Never;\n                Some(failure)\n            }"
@@ -4932,6 +4937,10 @@ mutate("pg-claim-ignores-lease", "a claim is granted whatever lease another hold
 mutate("pg-hold-ignores-other-holder", "a call holds its receipt whatever lease another holder has", PG + "src/reconcile.rs",
        "        AND (r.lease_until IS NULL OR r.lease_until <= clock_timestamp() OR r.lease_holder = $2)\";",
        "        AND true\";")
+mutate("pg-due-before-deadline", "the queue lists a receipt answered unknown before its row's deadline", PG + "src/reconcile.rs",
+       "     WHERE \",\n    past_deadline!(),\n", "     WHERE \",\n    \"true\",\n")
+mutate("pg-claim-before-deadline", "a receipt answered unknown is claimed before its row's deadline", PG + "src/reconcile.rs",
+       "c.id = r.row_id AND \",\n    past_deadline!(),\n", "c.id = r.row_id AND \",\n    \"true\",\n")
 mutate("pg-claim-not-counted", "a claim is not counted on its receipt, so a lookup whose save fails uses up no attempt", PG + "src/reconcile.rs",
        "             lease_until = clock_timestamp() + $3::bigint * interval '1 microsecond',\n             claims = r.claims + 1\n",
        "             lease_until = clock_timestamp() + $3::bigint * interval '1 microsecond'\n")
