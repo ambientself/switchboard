@@ -2612,9 +2612,10 @@ that removes the exception-list check.
   refused, a repository outside the limit denied and each malformed argument
   `invalid_arguments`, each with no request; the comparison refusals with no write; a
   custodian that refuses or is not there; a write refused without being applied `error`, and
-  one applied then answered 502, applied then broken off, or answered 502 unapplied
-  `unknown`, with one reconciliation pass settling the two applied by the marker and handing
-  the third to a person; a write past the in-process deadline settled only after it ends; a
+  one applied then answered 502, applied then closed with no answer, applied then answered
+  201 with a body broken off or not JSON, or answered 502 unapplied `unknown`, with one
+  reconciliation pass settling the four applied by the marker and handing the fifth to a
+  person; a write past the in-process deadline settled only after it ends; a
   repeated call a `duplicate`; a write that cannot connect `error`; an approval declaring
   otherwise refused at the start and on a reload; and the receipt-store gate and the pod gate,
   each reached from a registry with this tool. Not built: the proposal tools that write files
