@@ -540,33 +540,91 @@ async fn a_proposal_that_changes_nothing_is_an_error_and_makes_no_branch() {
 #[tokio::test]
 async fn a_path_that_is_not_a_regular_file_is_refused_before_any_write() {
     let world = world().await;
+    // GitHub's contents API answers these two with a.txt's contents, type "file": only the
+    // tree says they are links.
     world
         .rest
         .git_special("atlas", "link", Special::Symlink("a.txt".into()));
     world
         .rest
+        .git_special("atlas", "docs/up", Special::Symlink("../a.txt".into()));
+    world
+        .rest
+        .git_special("atlas", "away", Special::Symlink("../elsewhere".into()));
+    world
+        .rest
         .git_special("atlas", "vendor/lib", Special::Submodule);
-    for (at, (path, is)) in [
-        ("docs", "a directory"),
-        ("link", "a symbolic link"),
-        ("vendor/lib", "a submodule"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    let cases = [
+        ("docs", "x", "is a directory"),
+        ("link", "x", "is a symbolic link"),
+        // The same text as the file it links to: still not a regular file, not "no change".
+        ("link", "old", "is a symbolic link"),
+        ("docs/up", "x", "is a symbolic link"),
+        ("away", "x", "is a symbolic link"),
+        ("vendor/lib", "x", "is a submodule"),
+        (
+            "a.txt/inner",
+            "x",
+            "is under \"a.txt\", which is a regular file and not a directory",
+        ),
+        (
+            "link/inner",
+            "x",
+            "is under \"link\", which is a symbolic link and not a directory",
+        ),
+        (
+            "vendor/lib/inner",
+            "x",
+            "is under \"vendor/lib\", which is a submodule and not a directory",
+        ),
+    ];
+    for (at, (path, content, is)) in cases.into_iter().enumerate() {
         let refusal = propose(
             &world,
-            proposal(&format!("special-{at}"), file(path)),
+            proposal(
+                &format!("special-{at}"),
+                json!({"files": [{"path": path, "content": content}]}),
+            ),
             &format!("toolu_special_{at}"),
         )
         .await
         .refusal();
-        assert!(refusal.contains(is), "{refusal}");
+        assert!(refusal.contains(is), "{path}: {refusal}");
         assert_eq!(
             outcome(&world, PROPOSE_CHANGE).await,
             Outcome::Refused { sentence: refusal }
         );
     }
+    assert!(writes_from(&world, 0).is_empty());
+    // A new file under a directory that does not exist yet is a change.
+    propose(
+        &world,
+        proposal("new-directory", file("fresh/dir/new.md")),
+        "toolu_new_directory",
+    )
+    .await
+    .ok();
+}
+
+#[tokio::test]
+async fn a_tree_listing_cut_short_is_an_error_before_any_write() {
+    let world = world().await;
+    world.rest.git_truncated("atlas");
+    let message = propose(&world, proposal("cut-short", json!({})), "toolu_cut_short")
+        .await
+        .tool_error();
+    assert!(message.contains("cut short"), "{message}");
+    assert!(message.contains("nothing was written"), "{message}");
+    assert_eq!(
+        outcome(&world, PROPOSE_CHANGE).await,
+        Outcome::Error {
+            error_kind: ErrorKind::Other
+        }
+    );
+    assert_eq!(
+        world.store.receipts().last().unwrap().state,
+        ReceiptState::NotPerformed
+    );
     assert!(writes_from(&world, 0).is_empty());
 }
 

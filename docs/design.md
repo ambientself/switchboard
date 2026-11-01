@@ -1702,24 +1702,30 @@ after it every failure is `unknown`:
 
 - `github__propose_change` reads the default branch, `GET /repos/{owner}/{repo}`; the pull
   requests of every state whose head is `<org>:otto/<key>`; with none, the ref
-  `heads/otto/<key>`; the default branch's head and tree, `GET .../branches/{branch}`; and each
-  file at that commit, `GET .../contents/{path}?ref={sha}`. A pull request from the branch is
+  `heads/otto/<key>`; the default branch's head and tree, `GET .../branches/{branch}`; what
+  each path is in that tree, from the git trees' modes, `GET .../git/trees/{sha}` from the root
+  down each directory of the path; and each regular file at that commit,
+  `GET .../contents/{path}?ref={sha}`. A pull request from the branch is
   the caller's only when the gateway's receipts hold a `completed` `github__propose_change`
   receipt for the caller, the repository and `pull/<n>` (section 11); one that is not is
   `refused`. The caller's, closed and not merged, is `ok` `proposal_declined`, saying it will
   never be reopened; merged, `ok` `already_proposed` with `merged: true`; open, `ok`
   `already_proposed` when the call's arguments have that receipt's digest, and `ok`
   `key_conflict`, naming the recorded copy, when they do not. A branch with no pull request is
-  `refused`. A path that is a directory, a symbolic link or a submodule at the base is
-  `refused`; files all the same as at the base are an `error`, "no change".
+  `refused`. A path that is a directory (`040000`), a symbolic link (`120000`) or a submodule
+  (`160000`) at the base, or that is under one of them or under a file, is `refused`; what a
+  path is comes from the tree, never from the contents API, which answers a symbolic link to a
+  file of the repository with that file's contents. A tree listing GitHub says it cut short
+  is an `error`. Files all the same as at the base are an `error`, "no change".
 - `github__amend_change` reads the pull request. Closed is an `error`, "is closed, not open".
   Each of these is `refused`: an author other than the bot login; a head in another repository;
   a head branch not under `otto/` (`not under the reserved "otto/" prefix`); no `completed`
   `github__propose_change` receipt for the caller, the repository and `pull/<n>` ("is not one
   github__propose_change opened"); not a draft ("marked ready for review"); and a description
   without the line marking that receipt, which a person removed. Then it reads the head
-  branch's commit and tree, and each file there: an `expected_head` other than the head is an
-  `error`; a path that is not a regular file is `refused`; files all the same are an `error`
+  branch's commit and tree, and each path in that tree and each regular file there, the same
+  way: an `expected_head` other than the head is an `error`; a path that is not a regular file,
+  or is under something that is not a directory, is `refused`; files all the same are an `error`
   ("expected_head is required") without `expected_head`, and `ok` `no_change` with it.
 
 Then they write. `github__propose_change`, in Otto's order: a blob for each file, base64; a
@@ -2747,17 +2753,18 @@ that removes the exception-list check.
   amendment cases and its proposal refusals, with a key on every call and a new tool-use
   identifier on every repeat: the branch, commit and draft on the two tokens; each repeat
   answered from reads with nothing written; the no-change error; a path that is not a regular
-  file, a branch with no pull request, and a pull request another principal's call or
-  `github__create_pr` opened, refused; each refusal and argument error before any request; a
+  file or is under one that is not a directory, a symbolic link to a file of the repository,
+  which GitHub's contents API answers as that file, included, a branch with no pull request, and a pull request another principal's call or
+  `github__create_pr` opened, refused; a tree listing cut short an `error` before any write;
+  each refusal and argument error before any request, a key ending in `.` included; a
   definite refusal of the first blob `error`, and a failure of a later write, a 422 on the ref
   and a broken pull request write `unknown`, with reconciliation finding the one opened; the
   amendment's commit, forward move without force and rewritten body; its repeat with and without
   `expected_head` and with a stale one; its refusals and its closed `error`; its need of the bot
   login; reconciliation finding an amendment by its line; and a lookup passing over a copy
   someone else opened. No test sends a `DELETE`, writes a ref outside `otto/` or forces one.
-  Left as they are: a path under a file that exists at the base is not read before writing, so
-  the tree write fails and the call is `unknown`; a branch `otto` itself, or one under
-  `otto/<key>/`, makes the ref write fail the same way; a push to the branch between the reads
+  Left as they are: a branch `otto` itself, or one under `otto/<key>/`, is not read before
+  writing, so the ref write fails and the call is `unknown`; a push to the branch between the reads
   and the ref's move fails the move, `unknown`; a file of the same text but another mode at the
   base counts as unchanged; and the amendment's commit `commit_landed_body_failed` state, a
   commit that lands while the body write fails, is `unknown` here, and a lookup does not find it,

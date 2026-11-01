@@ -44,8 +44,11 @@
 //! Once a write may have been sent, every failure is `unknown` ([`crate::writes`]). So both
 //! tools read everything an answer that writes nothing turns on before their first write: the
 //! pull request, its state and its attribution, the branch's head, and each file's contents at
-//! the commit the change would sit on. A path that is a directory, a symbolic link or a
-//! submodule there is `refused`: a proposal writes regular files only, as mode `100644`.
+//! the commit the change would sit on. What each path is there comes from the git trees' modes,
+//! never from the contents API, which answers a symbolic link to a file of the repository with
+//! that file's contents. A path that is a directory, a symbolic link or a submodule there, or
+//! that is under something that is not a directory, is `refused`: a proposal writes regular
+//! files only, as mode `100644`.
 //!
 //! # The body
 //!
@@ -354,6 +357,45 @@ pub(crate) struct Ready {
     pub(crate) receipts: Arc<dyn ReceiptAttribution>,
 }
 
+/// One entry of a tree's listing: its mode and object name.
+struct Listed {
+    mode: String,
+    sha: String,
+}
+
+/// What a tree entry is, by its mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    File,
+    Directory,
+    Symlink,
+    Submodule,
+    Other,
+}
+
+impl Kind {
+    fn described(self) -> &'static str {
+        match self {
+            Kind::File => "a regular file",
+            Kind::Directory => "a directory",
+            Kind::Symlink => "a symbolic link",
+            Kind::Submodule => "a submodule",
+            Kind::Other => "not a regular file",
+        }
+    }
+}
+
+/// What the tree entry of `mode` is.
+fn kind(mode: &str) -> Kind {
+    match mode {
+        "100644" | "100755" => Kind::File,
+        "040000" => Kind::Directory,
+        "120000" => Kind::Symlink,
+        "160000" => Kind::Submodule,
+        _ => Kind::Other,
+    }
+}
+
 /// What a read found.
 pub(crate) enum Read {
     Found(Value),
@@ -616,53 +658,137 @@ impl GitHubConnector {
         }
     }
 
-    /// Whether writing `files` at the commit `at` of the repository at `repository_path` would
-    /// change anything, from each file's contents there; or the call's outcome, `refused` for a
-    /// path that is a directory, a symbolic link, a submodule or anything but a regular file
-    /// there. Reads only.
+    /// Whether writing `files` at the commit `at`, whose tree is `tree`, of the repository at
+    /// `repository_path` would change anything; or the call's outcome. Reads only.
+    ///
+    /// What each path is there comes from the git trees, `GET .../git/trees/{sha}`, from `tree`
+    /// down each directory of the path, by each entry's mode: never from the contents API, which
+    /// answers a symbolic link to a file of the repository with that file's contents. A path
+    /// that is a directory (`040000`), a symbolic link (`120000`), a submodule (`160000`) or
+    /// anything but a regular file (`100644` or `100755`), or that is under one that is not a
+    /// directory, is `refused`; a listing GitHub says it cut short is an `error`. Then each
+    /// regular file's contents there, `GET .../contents/{path}?ref={at}`, tell whether it would
+    /// change.
     #[allow(clippy::result_large_err)]
     pub(crate) async fn changes(
         &self,
         repository_path: &str,
         at: &str,
+        tree: &str,
         files: &[File],
         token: &Token,
     ) -> Result<bool, ToolOutcome> {
+        let mut listings: BTreeMap<String, BTreeMap<String, Listed>> = BTreeMap::new();
         let mut changes = false;
         for (index, file) in files.iter().enumerate() {
-            let segments: Vec<String> = file.path.split('/').map(tools::encoded).collect();
-            let path = format!("{repository_path}/contents/{}?ref={at}", segments.join("/"));
             let shown = gateway_core::escape(&file.path, gateway_core::MAX_RENDERED);
-            let what = format!("files[{index}].path \"{shown}\" at {at}");
-            let found = match self.read_json(&path, token, &what, true).await? {
-                Read::Missing => {
-                    changes = true;
-                    continue;
+            let segments: Vec<&str> = file.path.split('/').collect();
+            let mut directory = tree.to_owned();
+            let mut regular = false;
+            for (depth, segment) in segments.iter().enumerate() {
+                if !listings.contains_key(&directory) {
+                    let listing = self
+                        .tree_listing(repository_path, &directory, token)
+                        .await?;
+                    listings.insert(directory.clone(), listing);
                 }
-                Read::Found(found) => found,
-            };
-            let kind = match &found {
-                Value::Array(_) => "dir",
-                other => other.get("type").and_then(Value::as_str).unwrap_or(""),
-            };
-            let not_a_file = match kind {
-                "file" => None,
-                "dir" => Some("a directory"),
-                "symlink" => Some("a symbolic link"),
-                "submodule" => Some("a submodule"),
-                _ => Some("not a regular file"),
-            };
-            if let Some(is) = not_a_file {
-                return Err(ToolOutcome::Refused(format!(
-                    "files[{index}].path \"{shown}\" is {is} at {at}, and a proposal writes \
-                     regular files only"
-                )));
+                let Some(entry) = listings
+                    .get(&directory)
+                    .and_then(|listing| listing.get(*segment))
+                else {
+                    break;
+                };
+                let last = depth + 1 == segments.len();
+                match (kind(&entry.mode), last) {
+                    (Kind::File, true) => regular = true,
+                    (Kind::Directory, false) => directory.clone_from(&entry.sha),
+                    (found, true) => {
+                        return Err(ToolOutcome::Refused(format!(
+                            "files[{index}].path \"{shown}\" is {} at {at}, and a proposal \
+                             writes regular files only",
+                            found.described()
+                        )));
+                    }
+                    (found, false) => {
+                        let above = gateway_core::escape(
+                            &segments[..=depth].join("/"),
+                            gateway_core::MAX_RENDERED,
+                        );
+                        return Err(ToolOutcome::Refused(format!(
+                            "files[{index}].path \"{shown}\" is under \"{above}\", which is {} \
+                             and not a directory at {at}, and a proposal writes regular files \
+                             only",
+                            found.described()
+                        )));
+                    }
+                }
             }
+            if !regular {
+                changes = true;
+                continue;
+            }
+            let encoded: Vec<String> = segments.iter().map(|s| tools::encoded(s)).collect();
+            let path = format!("{repository_path}/contents/{}?ref={at}", encoded.join("/"));
+            let what = format!("files[{index}].path \"{shown}\" at {at}");
+            let found = self.read_found(&path, token, &what).await?;
             if !same_file(&found, &file.content) {
                 changes = true;
             }
         }
         Ok(changes)
+    }
+
+    /// The entries of the tree `sha`, `GET .../git/trees/{sha}`, by name; or the call's `error`,
+    /// with nothing written, for a listing that cannot be read or that GitHub cut short.
+    #[allow(clippy::result_large_err)]
+    async fn tree_listing(
+        &self,
+        repository_path: &str,
+        sha: &str,
+        token: &Token,
+    ) -> Result<BTreeMap<String, Listed>, ToolOutcome> {
+        let what = format!("the tree {sha}");
+        let found = self
+            .read_found(&format!("{repository_path}/git/trees/{sha}"), token, &what)
+            .await?;
+        if found.get("truncated").and_then(Value::as_bool) != Some(false) {
+            return Err(ToolOutcome::error(
+                ErrorKind::Other,
+                format!(
+                    "GitHub's listing of {what} is cut short or says nothing of it, so nothing \
+                     was written"
+                ),
+            ));
+        }
+        let unreadable = || {
+            ToolOutcome::error(
+                ErrorKind::Other,
+                format!("GitHub's listing of {what} could not be read, so nothing was written"),
+            )
+        };
+        let mut listing = BTreeMap::new();
+        for entry in found
+            .get("tree")
+            .and_then(Value::as_array)
+            .ok_or_else(unreadable)?
+        {
+            let field = |name: &str| entry.get(name).and_then(Value::as_str);
+            let (Some(name), Some(mode)) = (field("path"), field("mode")) else {
+                return Err(unreadable());
+            };
+            let sha = field("sha").filter(|sha| object_name(sha)).unwrap_or("");
+            if kind(mode) == Kind::Directory && sha.is_empty() {
+                return Err(unreadable());
+            }
+            listing.insert(
+                name.to_owned(),
+                Listed {
+                    mode: mode.to_owned(),
+                    sha: sha.to_owned(),
+                },
+            );
+        }
+        Ok(listing)
     }
 
     /// Writes `files` as one commit on top of `parent`, whose tree is `base_tree`, with

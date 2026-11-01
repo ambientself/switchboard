@@ -24,9 +24,10 @@
 //!    did not open for the caller is `refused`;
 //! 3. with none, the branch `heads/otto/<key>`: one that exists is `refused`;
 //! 4. the default branch's head commit and its tree;
-//! 5. each file's contents at that commit (`GitHubConnector::changes`): a path that is not a
-//!    regular file there is `refused`, and files that are all the same as there are an `error`,
-//!    "no change", with nothing written.
+//! 5. each file's entry in that commit's tree, by the git trees' modes, and each regular file's
+//!    contents there (`GitHubConnector::changes`): a path that is not a regular file there, or
+//!    that is under something that is not a directory, is `refused`, and files that are all the
+//!    same as there are an `error`, "no change", with nothing written.
 //!
 //! Then it writes, in Otto's order: with the token for git writes, a blob for each file, a tree
 //! on the head's tree, a commit whose message is the title and whose one parent is the head,
@@ -348,7 +349,10 @@ impl GitHubConnector {
             Ok(head) => head,
             Err(outcome) => return outcome,
         };
-        match self.changes(&base, &base_sha, &parsed.files, &reads).await {
+        match self
+            .changes(&base, &base_sha, &base_tree, &parsed.files, &reads)
+            .await
+        {
             Ok(true) => {}
             Ok(false) => {
                 return ToolOutcome::error(

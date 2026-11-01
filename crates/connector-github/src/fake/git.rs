@@ -7,16 +7,21 @@
 //! - `GET /repos/{owner}/{repo}`: its name and default branch. No permission is needed.
 //! - `GET .../branches/{branch}`: the branch's head commit and that commit's tree.
 //! - `GET .../git/ref/heads/{branch}`: the branch's ref, or a 404.
+//! - `GET .../git/trees/{sha}`: the tree's entries, one level, each with its mode: `100644` for
+//!   a file, `040000` for a directory, `120000` for a symbolic link and `160000` for a
+//!   submodule; `truncated` is false unless a test says otherwise
+//!   ([`FakeRest::git_truncated`]).
 //! - `GET .../contents/{path}?ref={branch or commit}`: at that commit, the default branch's head
 //!   if none is given, a file with its content base64-encoded, a directory's listing, a
-//!   symbolic link or a submodule; a 404 for a path that is none of them.
+//!   symbolic link or a submodule; a 404 for a path that is none of them. As GitHub does, a
+//!   symbolic link whose target is a file of the repository is answered with that file.
 //! - `POST .../git/blobs`, base64 or UTF-8: a blob.
 //! - `POST .../git/trees`: a tree on `base_tree`, each entry a blob of a known object name at
 //!   mode `100644`. A path under a file, or one naming a directory, is refused with a 422, as
 //!   git refuses it.
 //! - `POST .../git/commits`: a commit of a known tree and known parents.
 //! - `POST .../git/refs`: a new branch, `refs/heads/...`, at a known commit; a 422 for one that
-//!   exists.
+//!   exists or whose name git refuses.
 //! - `PATCH .../git/refs/heads/{branch}`: the branch moved to a known commit, and, unless
 //!   `force` is true, only forward: a 422 when its head is not an ancestor of the commit.
 //!
@@ -73,6 +78,11 @@ struct Repo {
     /// Each branch's head.
     refs: BTreeMap<String, String>,
     count: u64,
+    /// The object name given to each directory of a tree when it is listed: by the tree's own
+    /// name and the directory's.
+    directories: BTreeMap<(String, String), String>,
+    /// Whether every tree listing says it is cut short.
+    truncated: bool,
 }
 
 impl Repo {
@@ -225,6 +235,14 @@ impl FakeRest {
         );
     }
 
+    /// Makes every tree listing of `repo` say it is cut short, as GitHub does past its limits.
+    /// Nothing changes when `repo` has no git data.
+    pub fn git_truncated(&self, repo: &str) {
+        if let Some(found) = lock(&self.shared.git).repos.get_mut(repo) {
+            found.truncated = true;
+        }
+    }
+
     /// The head of `branch` of `repo`, if it exists.
     pub fn git_head(&self, repo: &str, branch: &str) -> Option<String> {
         lock(&self.shared.git)
@@ -273,6 +291,7 @@ enum Endpoint {
     Repository,
     Branch(String),
     Ref(String),
+    Tree(String),
     Contents(String),
     Blobs,
     Trees,
@@ -290,6 +309,9 @@ fn route(method: &Method, tail: &str) -> Option<Endpoint> {
         }
         (&Method::GET, _) if tail.starts_with("git/ref/heads/") => {
             Endpoint::Ref(decoded(tail.strip_prefix("git/ref/heads/")?)?)
+        }
+        (&Method::GET, _) if tail.starts_with("git/trees/") => {
+            Endpoint::Tree(decoded(tail.strip_prefix("git/trees/")?)?)
         }
         (&Method::GET, _) if tail.starts_with("contents/") => {
             Endpoint::Contents(decoded(tail.strip_prefix("contents/")?)?)
@@ -340,8 +362,8 @@ pub(super) async fn answer(
         ));
     }
     if !write {
-        let git = lock(&shared.git);
-        let found = git.repos.get(&repo)?;
+        let mut git = lock(&shared.git);
+        let found = git.repos.get_mut(&repo)?;
         let reference = query_value(uri.query().unwrap_or(""), "ref");
         return Some(read(
             found,
@@ -374,7 +396,7 @@ pub(super) async fn answer(
 
 /// A read's answer.
 fn read(
-    found: &Repo,
+    found: &mut Repo,
     owner: &str,
     repo: &str,
     endpoint: Endpoint,
@@ -395,6 +417,7 @@ fn read(
         Endpoint::Ref(branch) => found.refs.get(&branch).map(|head| {
             json!({"ref": format!("refs/heads/{branch}"), "object": {"type": "commit", "sha": head}})
         }),
+        Endpoint::Tree(sha) => listing(found, &sha),
         Endpoint::Contents(path) => found
             .resolve(reference)
             .and_then(|commit| found.tree_of(&commit))
@@ -407,32 +430,96 @@ fn read(
     }
 }
 
+/// The listing of the tree `sha`, one level, as `GET .../git/trees/{sha}` answers it. Each
+/// directory in it is given an object name of its own, the first time it is listed.
+fn listing(found: &mut Repo, sha: &str) -> Option<Value> {
+    let entries = found.trees.get(sha)?.clone();
+    let mut listed = Vec::new();
+    let mut directories: BTreeMap<String, BTreeMap<String, Entry>> = BTreeMap::new();
+    for (path, entry) in entries {
+        if let Some((name, rest)) = path.split_once('/') {
+            directories
+                .entry(name.to_owned())
+                .or_default()
+                .insert(rest.to_owned(), entry);
+            continue;
+        }
+        let placeholder = "0".repeat(40);
+        let (mode, kind, object) = match entry {
+            Entry::File(blob) => ("100644", "blob", blob),
+            Entry::Special(Special::Symlink(_)) => ("120000", "blob", placeholder),
+            Entry::Special(Special::Submodule) => ("160000", "commit", placeholder),
+        };
+        listed.push(json!({"path": path, "mode": mode, "type": kind, "sha": object}));
+    }
+    for (name, inside) in directories {
+        let key = (sha.to_owned(), name.clone());
+        let object = match found.directories.get(&key) {
+            Some(object) => object.clone(),
+            None => {
+                let object = format!("7d{:038x}", found.directories.len() + 1);
+                found.trees.insert(object.clone(), inside);
+                found.directories.insert(key, object.clone());
+                object
+            }
+        };
+        listed.push(json!({"path": name, "mode": "040000", "type": "tree", "sha": object}));
+    }
+    Some(json!({"sha": sha, "tree": listed, "truncated": found.truncated}))
+}
+
+/// The path a symbolic link at `path` to `target` names, if it stays in the repository.
+fn link_target(path: &str, target: &str) -> Option<String> {
+    if target.starts_with('/') {
+        return None;
+    }
+    let mut segments: Vec<&str> = path.split('/').collect();
+    segments.pop();
+    for segment in target.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            other => segments.push(other),
+        }
+    }
+    Some(segments.join("/"))
+}
+
 /// What the contents API answers for `path` in `tree`.
 fn contents(found: &Repo, tree: &BTreeMap<String, Entry>, path: &str) -> Option<Value> {
+    let file = |path: &str, blob: &str| {
+        let bytes = found.blobs.get(blob)?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let wrapped: Vec<String> = encoded
+            .as_bytes()
+            .chunks(60)
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect();
+        Some(json!({
+            "type": "file",
+            "path": path,
+            "sha": blob,
+            "size": bytes.len(),
+            "encoding": "base64",
+            "content": wrapped.join("\n"),
+        }))
+    };
     if let Some(entry) = tree.get(path) {
-        return Some(match entry {
-            Entry::File(blob) => {
-                let bytes = found.blobs.get(blob)?;
-                let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-                let wrapped: Vec<String> = encoded
-                    .as_bytes()
-                    .chunks(60)
-                    .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
-                    .collect();
-                json!({
-                    "type": "file",
-                    "path": path,
-                    "sha": blob,
-                    "size": bytes.len(),
-                    "encoding": "base64",
-                    "content": wrapped.join("\n"),
-                })
-            }
+        return match entry {
+            Entry::File(blob) => file(path, blob),
             Entry::Special(Special::Symlink(target)) => {
-                json!({"type": "symlink", "path": path, "target": target})
+                // GitHub answers a link to a file of the repository with that file.
+                if let Some(linked) = link_target(path, target)
+                    && let Some(Entry::File(blob)) = tree.get(&linked)
+                {
+                    return file(&linked, blob);
+                }
+                Some(json!({"type": "symlink", "path": path, "target": target}))
             }
-            Entry::Special(Special::Submodule) => json!({"type": "submodule", "path": path}),
-        });
+            Entry::Special(Special::Submodule) => Some(json!({"type": "submodule", "path": path})),
+        };
     }
     let prefix = format!("{path}/");
     let listed: Vec<Value> = tree
@@ -533,6 +620,9 @@ fn written(
             let name = text("/ref").ok_or("Invalid request")?;
             let sha = text("/sha").ok_or("Invalid request")?;
             let branch = name.strip_prefix("refs/heads/").ok_or("Invalid ref")?;
+            if crate::create_pr::branch(branch, "ref").is_err() {
+                return Err("Reference name is invalid");
+            }
             if !found.commits.contains_key(sha) {
                 return Err("Object does not exist");
             }
@@ -561,8 +651,10 @@ fn written(
                 json!({"ref": format!("refs/heads/{branch}"), "object": {"type": "commit", "sha": sha}}),
             ))
         }
-        Endpoint::Repository | Endpoint::Branch(_) | Endpoint::Ref(_) | Endpoint::Contents(_) => {
-            Err("Not a write")
-        }
+        Endpoint::Repository
+        | Endpoint::Branch(_)
+        | Endpoint::Ref(_)
+        | Endpoint::Tree(_)
+        | Endpoint::Contents(_) => Err("Not a write"),
     }
 }

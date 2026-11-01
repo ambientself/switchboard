@@ -21,9 +21,11 @@
 //!    removed;
 //! 2. the head branch's commit and its tree. An `expected_head` other than that commit is an
 //!    `error`;
-//! 3. each file's contents at that commit (`GitHubConnector::changes`): a path that is not a
-//!    regular file there is `refused`; files all the same as there are an `error` saying
-//!    `expected_head` is required, or, with it, `ok` with `state: "no_change"`, nothing written.
+//! 3. each file's entry in that commit's tree, by the git trees' modes, and each regular file's
+//!    contents there (`GitHubConnector::changes`): a path that is not a regular file there, or
+//!    that is under something that is not a directory, is `refused`; files all the same as there
+//!    are an `error` saying `expected_head` is required, or, with it, `ok` with
+//!    `state: "no_change"`, nothing written.
 //!
 //! Then it writes: with the token for git writes, a blob for each file, a tree on the head's
 //! tree, a commit `Amend pull request #<n>` whose one parent is the head, and the branch moved
@@ -319,7 +321,10 @@ impl GitHubConnector {
                 ),
             );
         }
-        match self.changes(&base, &head, &parsed.files, &reads).await {
+        match self
+            .changes(&base, &head, &head_tree, &parsed.files, &reads)
+            .await
+        {
             Ok(true) => {}
             Ok(false) => {
                 return match &parsed.expected_head {
