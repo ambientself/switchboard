@@ -11,7 +11,8 @@ use gateway_otto::FailureKind::{self, *};
 use gateway_otto::GrantDigest;
 use gateway_otto::format::{MAX_GRANT_BYTES, VERSION};
 use gateway_otto::minter::{
-    TestMinter, encode, padded, parts, with_non_canonical_s, with_part, with_trailing_bits,
+    SmallOrderRMinter, TestMinter, encode, padded, parts, with_non_canonical_s, with_part,
+    with_trailing_bits,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha512};
@@ -197,6 +198,43 @@ fn a_signature_that_does_not_verify_is_refused_without_a_digest() {
         Signature,
         false,
     );
+}
+
+/// Verification is strict: a signature whose R is of small order is refused as a bad
+/// signature, with no digest, though it meets RFC 8032's equation under an ordinary key and a
+/// lax verifier accepts it.
+#[test]
+fn a_signature_only_a_lax_verifier_accepts_is_refused() {
+    let minter = SmallOrderRMinter::generate();
+    let mut config = issuer("otto-prod", &TestMinter::generate());
+    config.current_key = minter.public_key_pem();
+    let verifier = verifier_with(vec![config]);
+    let grant = minter.mint(&claims());
+
+    // The grant is what the strict rule alone refuses: the key is configured, S is canonical,
+    // and the lax check passes.
+    let parts = parts(&grant);
+    assert_eq!(parts[1], minter.key_id().as_str());
+    let signature: [u8; 64] = URL_SAFE_NO_PAD
+        .decode(&parts[3])
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&minter.public_key()).unwrap();
+    assert!(!key.is_weak());
+    let signed = gateway_otto::format::signed_bytes(
+        parts[0].as_bytes(),
+        parts[1].as_bytes(),
+        parts[2].as_bytes(),
+    );
+    let signature = ed25519_dalek::Signature::from_bytes(&signature);
+    assert!(
+        ed25519_dalek::Verifier::verify(&key, &signed, &signature).is_ok(),
+        "the lax check refuses the grant, so it tests nothing"
+    );
+    assert!(key.verify_strict(&signed, &signature).is_err());
+
+    refused_as(&verifier, &grant, Signature, false);
 }
 
 #[test]

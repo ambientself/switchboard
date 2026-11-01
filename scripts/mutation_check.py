@@ -1562,6 +1562,11 @@ mutate("otto-grant-s-unchecked", "a non-canonical S is left to the signature lib
        "        if !s_is_canonical(&signature_bytes) {", "        if false {")
 mutate("otto-grant-signature-unchecked", "a signature that does not verify is accepted", OV,
        "            .map_err(|_| refuse(FailureKind::Signature))?;", "            .ok();")
+# Strict verification (#211): tests/forgery.rs's grant whose R is of small order, which only the
+# lax check accepts, catches this.
+mutate_all("otto-grant-signature-lax", "the signature is verified with the lax check, which accepts a small-order R",
+           (OV, "use ed25519_dalek::Signature;\n", "use ed25519_dalek::{Signature, Verifier as _};\n"),
+           (OV, "            .verify_strict(\n", "            .verify(\n"))
 mutate("otto-grant-claims-before-signature", "the claims are decoded before the signature is checked", OV,
        "        // 3. The signature, before the claims are decoded.\n",
        "        LENIENT.decode(claims).ok().and_then(|bytes| Claims::parse(&bytes, false, false)).ok_or(refuse(FailureKind::Malformed))?;\n")
