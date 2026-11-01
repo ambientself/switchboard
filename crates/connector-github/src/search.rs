@@ -31,7 +31,8 @@
 
 use std::collections::BTreeMap;
 
-use gateway_core::Resource;
+use gateway_core::{Classification, Resource};
+use gateway_registry::{Assurance, StatedResources};
 use serde_json::{Map, Value, json};
 
 use crate::tools::{Definition, bounded, encoded, provenance};
@@ -71,6 +72,13 @@ pub(crate) fn definition() -> Definition {
             "required": ["query"],
             "additionalProperties": false
         }),
+        // Which repositories a search reaches is known only once GitHub answers: the connector
+        // withholds every result outside the caller's limit and reports the repositories the
+        // rest came from (`Connector::search`).
+        assurance: Assurance {
+            classification: Classification::Read,
+            resources: StatedResources::ChecksOwnScope,
+        },
     }
 }
 

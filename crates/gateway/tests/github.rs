@@ -5,7 +5,9 @@
 //! check 6 with no request; the token scoped to the team's repositories and the entry's
 //! permissions, with the revision; a custodian refusal; vendor errors; no credential in what
 //! the caller reads or the row holds; the in-process bound and the rate quota; the row's
-//! resources; and a reload that changes an entry.
+//! resources; a reload that changes an entry; and an approval that declares what the connector
+//! does not give, or approves a tool on an entry the connector does not serve it on, refused at
+//! the start and on a reload.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod files;
@@ -24,12 +26,15 @@ use gateway::{BootError, Rate, RateQuotas, team_over_quota};
 use gateway_core::audit::{DecisionKind, Outcome, RecordedResource, RecordedResources};
 use gateway_core::{ConnectorName, ErrorKind, InstanceName, ReasonKind};
 use gateway_identity::SystemClock;
-use gateway_registry::Registry;
+use gateway_registry::{Registry, built_in_binding_sha256};
 use github_world::{
-    ACCOUNT, ENTRY, GET_FILE, GET_ISSUE, GET_PR, OTHER_ORG, Options, PERMISSIONS, TEAM_A, TEAM_B,
-    World, registry_text,
+    ACCOUNT, ENTRY, GET_FILE, GET_ISSUE, GET_PR, OTHER_ORG, Options, PERMISSIONS, SEARCH, TEAM_A,
+    TEAM_B, World, registry_text,
 };
 use serde_json::{Value, json};
+
+/// The reach report's tool, which the connector serves only on a reach-report entry.
+const REPORT: &str = connector_github::report::LIST_INSTALLATION_REPOSITORIES;
 
 fn file(repo: &str, path: &str) -> Value {
     json!({"owner": ACCOUNT, "repo": repo, "path": path})
@@ -634,8 +639,158 @@ async fn an_approval_of_another_definition_than_the_connectors_refuses_the_start
         std::fs::write(dir.join("registry.toml"), text).unwrap();
     });
     match prepared(deployment).await {
-        Err(StartError::Boot(BootError::BuiltInDefinitionDiffers(tool))) => {
+        Err(StartError::Boot(BootError::BuiltInDefinitionDiffers { tool, connector })) => {
             assert_eq!(tool.as_str(), GET_FILE);
+            assert_eq!(connector.as_str(), ENTRY);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// `text`, a registry file, with the approval of `tool` declaring `resources`.
+fn declaring(text: &str, tool: &str, resources: &str) -> String {
+    let mut table: toml::Table = toml::from_str(text).unwrap();
+    let approvals = table
+        .get_mut("built_in_tools")
+        .and_then(toml::Value::as_array_mut)
+        .unwrap();
+    let approval = approvals
+        .iter_mut()
+        .find(|approval| approval.get("name").and_then(toml::Value::as_str) == Some(tool))
+        .and_then(toml::Value::as_table_mut)
+        .unwrap();
+    let resources: toml::Table = toml::from_str(&format!("r = {resources}")).unwrap();
+    approval.insert("resources".into(), resources["r"].clone());
+    toml::to_string(&table).unwrap()
+}
+
+/// The connector states what each tool is (decision 0011, section 1), and an approval that
+/// declares otherwise refuses the start, naming the entry, the tool and both sides: a read of
+/// one repository declared as checking its own scope or naming nothing, and the search, which
+/// checks its own scope, declared as naming nothing.
+#[tokio::test]
+async fn an_approval_declaring_what_the_connector_does_not_give_refuses_the_start() {
+    let from_arguments = "`from_arguments`, reading github repository from `owner`/`repo`";
+    for (tool, resources, approved, stated) in [
+        (
+            GET_FILE,
+            r#""checks_own_scope""#,
+            "`checks_own_scope`",
+            from_arguments,
+        ),
+        (
+            GET_PR,
+            r#""no_resources""#,
+            "`no_resources`",
+            from_arguments,
+        ),
+        (
+            SEARCH,
+            r#""no_resources""#,
+            "`no_resources`",
+            "`checks_own_scope`",
+        ),
+    ] {
+        let world = World::new().await;
+        let deployment = reloaded(&world, |dir| {
+            let text = std::fs::read_to_string(dir.join("registry.toml")).unwrap();
+            std::fs::write(dir.join("registry.toml"), declaring(&text, tool, resources)).unwrap();
+        });
+        match prepared(deployment).await {
+            Err(StartError::Boot(refused @ BootError::BuiltInAssuranceDiffers { .. })) => {
+                assert_eq!(
+                    refused.to_string(),
+                    format!(
+                        "built-in tool `{tool}` on connector `{ENTRY}` is approved as \
+                         {approved}, and its connector states {stated}; approve it as its \
+                         connector states it"
+                    )
+                );
+            }
+            other => panic!("{tool}: {other:?}"),
+        }
+    }
+}
+
+/// A reload is held to the same: a new revision whose approval declares what the connector does
+/// not give is refused, and the policy served keeps serving.
+#[tokio::test]
+async fn a_reload_declaring_what_the_connector_does_not_give_is_refused() {
+    let world = World::new().await;
+    let text = registry_text("r2", "limit", PERMISSIONS);
+    let declared =
+        Registry::from_toml_str(&declaring(&text, GET_FILE, r#""checks_own_scope""#)).unwrap();
+    match world.reloader.apply(&declared) {
+        Err(ReloadError::Boot(BootError::BuiltInAssuranceDiffers {
+            tool, connector, ..
+        })) => {
+            assert_eq!(tool.as_str(), GET_FILE);
+            assert_eq!(connector.as_str(), ENTRY);
+        }
+        other => panic!("{other:?}"),
+    }
+    // The same revision, declaring what the connector states, is served.
+    let agreeing = Registry::from_toml_str(&text).unwrap();
+    assert_eq!(world.reloader.apply(&agreeing).unwrap().as_str(), "r2");
+}
+
+/// The connector serves the reach report's tool only on a reach-report entry: approved on an
+/// ordinary entry, which lists it, it refuses the start, since what a connector serves is
+/// keyed by entry and tool.
+#[tokio::test]
+async fn the_reach_reports_tool_approved_on_an_ordinary_entry_refuses_the_start() {
+    let world = World::new().await;
+    let deployment = reloaded(&world, |dir| {
+        let text = std::fs::read_to_string(dir.join("registry.toml")).unwrap();
+        let mut table: toml::Table = toml::from_str(&text).unwrap();
+        let entries = table
+            .get_mut("connectors")
+            .and_then(toml::Value::as_array_mut)
+            .unwrap();
+        let entry = entries
+            .iter_mut()
+            .find(|entry| entry.get("name").and_then(toml::Value::as_str) == Some(ENTRY))
+            .and_then(toml::Value::as_table_mut)
+            .unwrap();
+        entry
+            .get_mut("tools")
+            .and_then(toml::Value::as_array_mut)
+            .unwrap()
+            .push(REPORT.into());
+        let listed = toml::to_string(&table).unwrap();
+        let binding = built_in_binding_sha256(
+            &Registry::from_toml_str(&listed).unwrap().connectors()[&ConnectorName::new(ENTRY)],
+        )
+        .unwrap();
+        let definition = connector_github::report::definition();
+        let mut approval = toml::Table::new();
+        approval.insert("name".into(), REPORT.into());
+        approval.insert("connector".into(), ENTRY.into());
+        approval.insert("classification".into(), "read".into());
+        approval.insert("description".into(), definition.description.into());
+        approval.insert(
+            "input_schema".into(),
+            toml::Value::try_from(&definition.input_schema).unwrap(),
+        );
+        approval.insert("approved_by".into(), "reviewer@example.test".into());
+        approval.insert(
+            "approved_at".into(),
+            toml::Value::Datetime("2026-10-31T00:00:00Z".parse().unwrap()),
+        );
+        approval.insert("definition_sha256".into(), definition.sha256().into());
+        approval.insert("binding_sha256".into(), binding.into());
+        approval.insert("resources".into(), "no_resources".into());
+        table
+            .get_mut("built_in_tools")
+            .and_then(toml::Value::as_array_mut)
+            .unwrap()
+            .push(toml::Value::Table(approval));
+        std::fs::write(dir.join("registry.toml"), toml::to_string(&table).unwrap()).unwrap();
+    });
+    match prepared(deployment).await {
+        Err(StartError::Boot(BootError::BuiltInToolNotServed { tool, connector })) => {
+            assert_eq!(tool.as_str(), REPORT);
+            assert_eq!(connector.as_str(), ENTRY);
         }
         other => panic!("{other:?}"),
     }
