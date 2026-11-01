@@ -736,12 +736,12 @@ async fn each_refusal_before_any_request_is_made_with_otto_s_sentence() {
         (
             PROPOSE_CHANGE,
             proposal("k", json!({"title": "atlantis apply"})),
-            "the title begins with \"atlantis\"",
+            "the title begins with a word Atlantis would read as a command",
         ),
         (
             PROPOSE_CHANGE,
             proposal("k", json!({"body": "  Atlantis plan -p prod"})),
-            "the body begins with \"atlantis\"",
+            "the body begins with a word Atlantis would read as a command",
         ),
         (
             PROPOSE_CHANGE,
@@ -749,7 +749,7 @@ async fn each_refusal_before_any_request_is_made_with_otto_s_sentence() {
                 "k",
                 json!({"unverifiedClaims": ["fine", "atlantis unlock"]}),
             ),
-            "the unverifiedClaims[1] begins with \"atlantis\"",
+            "the unverifiedClaims[1] begins with a word Atlantis would read as a command",
         ),
         (
             PROPOSE_CHANGE,
@@ -786,7 +786,7 @@ async fn each_refusal_before_any_request_is_made_with_otto_s_sentence() {
         (
             AMEND_CHANGE,
             amendment(1, json!({"unverifiedClaims": ["atlantis apply"]})),
-            "the unverifiedClaims[0] begins with \"atlantis\"",
+            "the unverifiedClaims[0] begins with a word Atlantis would read as a command",
         ),
         (
             AMEND_CHANGE,

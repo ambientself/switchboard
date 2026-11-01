@@ -262,6 +262,9 @@ impl GitHubConnector {
         if tool.as_str() == crate::proposals::AMEND_CHANGE {
             return self.amend_change(&call).await;
         }
+        if tool.as_str() == crate::pr_comment::PR_COMMENT {
+            return self.pr_comment(&call).await;
+        }
         if tool.as_str() == search::SEARCH {
             return self.search(&call).await;
         }

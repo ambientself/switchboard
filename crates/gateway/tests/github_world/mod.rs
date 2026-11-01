@@ -5,7 +5,10 @@
 //! fake App API made up. With [`Options::writes`], the registry also has a write entry serving
 //! `github__create_pr`, and the world a reconciler that passes only when a test asks; with
 //! [`Options::proposals`], the entry serves `github__propose_change` and
-//! `github__amend_change` too, and the connector reads the world's store's receipts.
+//! `github__amend_change` too, and the connector reads the world's store's receipts. With
+//! [`Options::comments`], it also has the comment tool's entry and surface, under a profile that
+//! requires a turn grant and currency, with turn grants from a test minter and Otto's fake
+//! resolver.
 
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
@@ -28,6 +31,10 @@ use gateway::{
 use gateway_core::audit::{AuditRowId, Completion, Outcome};
 use gateway_core::{AuditRecord, Classification, ConnectorName};
 use gateway_identity::SystemClock;
+use gateway_otto::HttpResolver;
+use gateway_otto::fake::{FakeReply, FakeResolver};
+use gateway_otto::minter::TestMinter;
+use gateway_otto::resolver::Answer as Currency;
 use gateway_registry::{Registry, built_in_binding_sha256};
 use gateway_testkit::{InMemoryAuditStore, StoreBudgets};
 use key_custodian::fake::{FakeApp, FakeGitHub};
@@ -170,6 +177,12 @@ pub struct Options {
     /// The store's budgets, which each call row's deadline includes. No receipt is due before
     /// its row's deadline.
     pub budgets: StoreBudgets,
+    /// Whether the registry has the comment entry, serving `github__pr_comment` on its own
+    /// surface, with the workloads' profile requiring a turn grant and currency; and whether the
+    /// world verifies turn grants and asks a fake resolver ([`with_comments`]).
+    pub comments: bool,
+    /// Whether that profile's own list of exceptions names `github__pr_comment`.
+    pub exception: bool,
 }
 
 impl Default for Options {
@@ -187,6 +200,8 @@ impl Default for Options {
             bot_login: None,
             withhold_receipts: false,
             budgets: StoreBudgets::default(),
+            comments: false,
+            exception: false,
         }
     }
 }
@@ -565,6 +580,11 @@ pub struct World {
     pub deployment: Deployment,
     /// The instance's reconciler, which passes only when a test calls it.
     pub reconciler: Reconciler,
+    /// The turn grants' minter, with [`Options::comments`].
+    pub minter: Option<TestMinter>,
+    /// Otto's fake resolver, with [`Options::comments`]: it answers `current` until told
+    /// otherwise.
+    pub resolver: Option<FakeResolver>,
 }
 
 impl Drop for World {
@@ -603,12 +623,15 @@ impl World {
         let rest = FakeRest::start(app.clone(), ACCOUNT).await.unwrap();
         let log_host = FakeLogHost::start().await.unwrap();
         let other_log_host = FakeLogHost::start().await.unwrap();
-        let registry = registry_with(
-            options.revision,
-            options.narrowing,
-            PERMISSIONS,
-            options.writes,
-            options.proposals,
+        let registry = with_comments(
+            registry_with(
+                options.revision,
+                options.narrowing,
+                PERMISSIONS,
+                options.writes,
+                options.proposals,
+            ),
+            &options,
         );
         write(&dir.join("registry.toml"), &registry, 0o644);
         let custodian_registry = match options.custodian_revision {
@@ -616,12 +639,15 @@ impl World {
                 let path = dir.join("custodian-registry.toml");
                 write(
                     &path,
-                    &registry_with(
-                        revision,
-                        options.narrowing,
-                        PERMISSIONS,
-                        options.writes,
-                        options.proposals,
+                    &with_comments(
+                        registry_with(
+                            revision,
+                            options.narrowing,
+                            PERMISSIONS,
+                            options.writes,
+                            options.proposals,
+                        ),
+                        &options,
                     ),
                     0o644,
                 );
@@ -688,7 +714,7 @@ impl World {
         let deployment = Deployment::load(&dir.join("gateway.toml"), |_| None).unwrap();
         let registry = Registry::from_toml_str(&registry).unwrap();
         // A world that writes keeps the time as it passes, so a receipt's lease ends.
-        let store = if options.writes {
+        let store = if options.writes || options.comments {
             Arc::new(
                 InMemoryAuditStore::new()
                     .with_clock(Arc::new(SystemClock))
@@ -697,10 +723,22 @@ impl World {
         } else {
             Arc::new(InMemoryAuditStore::new().with_budgets(options.budgets))
         };
+        let (minter, resolver) = if options.comments {
+            (
+                Some(TestMinter::generate()),
+                Some(
+                    FakeResolver::start(FakeReply::Answer(Currency::Current))
+                        .await
+                        .unwrap(),
+                ),
+            )
+        } else {
+            (None, None)
+        };
         // The connector reads the receipts of the store the world reads rows from, as the
         // gateway gives it the Postgres store's once it connects.
         let wiring = Wiring::new(Arc::new(SystemClock)).audit_store(store.clone());
-        let wiring = if options.withhold_receipts {
+        let mut wiring = if options.withhold_receipts {
             start::wire_github(
                 &registry,
                 deployment.github.as_ref(),
@@ -718,6 +756,22 @@ impl World {
         }
         .unwrap()
         .quotas(options.quotas);
+        if let Some(resolver) = &resolver {
+            wiring = wiring.resolver(Arc::new(HttpResolver::new(&resolver.config()).unwrap()));
+        }
+        let grants = match &minter {
+            Some(minter) => serde_json::from_value(json!({"enforce": {
+                "issuers": [{
+                    "name": GRANT_ISSUER,
+                    "current_key": minter.public_key_pem(),
+                    "require_pod": true,
+                    "require_egress": false,
+                }],
+                "tool_mapping": {OTTO_PR_COMMENT: PR_COMMENT},
+            }}))
+            .unwrap(),
+            None => Default::default(),
+        };
         let settings = Settings {
             deployment: deployment.deployment.clone(),
             identity: deployment.identity.clone(),
@@ -725,7 +779,7 @@ impl World {
                 disabled: false,
                 postgres: false,
             },
-            grants: Default::default(),
+            grants,
             http: deployment.http.clone(),
             max_age: None,
             read_at: Instant::now(),
@@ -757,6 +811,8 @@ impl World {
             reloader,
             deployment,
             reconciler,
+            minter,
+            resolver,
         }
     }
 
@@ -820,14 +876,88 @@ impl World {
             .await
     }
 
+    /// Calls `github__pr_comment` with `arguments` as `subject`, over HTTP, with the tool-use
+    /// identifier `tool_use_id`, which is the call's key, and a turn grant for the subject's team
+    /// naming Otto's `github_pr_comment`.
+    pub async fn comment(&self, subject: &str, arguments: Value, tool_use_id: &str) -> Answered {
+        let params = json!({
+            "name": PR_COMMENT,
+            "arguments": arguments,
+            "_meta": {"claudecode/toolUseId": tool_use_id},
+        });
+        let grant = self.grant(subject);
+        self.send_with(
+            COMMENT_SURFACE,
+            subject,
+            legacy("tools/call", params),
+            Some(&grant),
+        )
+        .await
+    }
+
+    /// A turn grant for `subject`'s team, issued now for ten minutes, naming Otto's
+    /// `github_pr_comment` and the pod every test token proves.
+    pub fn grant(&self, subject: &str) -> String {
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let team = if subject == TEAM_B {
+            "team-b"
+        } else {
+            "team-a"
+        };
+        self.minter
+            .as_ref()
+            .expect("a world with comments")
+            .mint(&json!({
+                "aud": [self.deployment.deployment.as_str()],
+                "iat": now,
+                "exp": now + 600,
+                "team": team,
+                "tools": [OTTO_PR_COMMENT],
+                "epoch": 7,
+                "sid": "session-7f3a",
+                "tid": "turn-4",
+                "eid": "execution-91c2",
+                "actor": "actor@example.test",
+                "pod": files::POD_UID,
+            }))
+    }
+
+    /// How many questions Otto's fake resolver has been asked.
+    pub fn asked(&self) -> usize {
+        self.resolver
+            .as_ref()
+            .expect("a world with comments")
+            .received()
+            .len()
+    }
+
     /// Sends the JSON-RPC request `request` on `surface` as `subject`, over HTTP.
     async fn send(&self, surface: &str, subject: &str, request: Value) -> Answered {
+        self.send_with(surface, subject, request, None).await
+    }
+
+    /// Sends the JSON-RPC request `request` on `surface` as `subject`, over HTTP, with the turn
+    /// grant `grant` if there is one.
+    async fn send_with(
+        &self,
+        surface: &str,
+        subject: &str,
+        request: Value,
+        grant: Option<&str>,
+    ) -> Answered {
         let body = request.to_string().into_bytes();
-        let http = Http::new("POST", &format!("/mcp/{surface}"))
+        let mut http = Http::new("POST", &format!("/mcp/{surface}"))
             .header("host", "127.0.0.1")
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
-            .bearer(&token(subject))
+            .bearer(&token(subject));
+        if let Some(grant) = grant {
+            http = http.header(gateway::GRANT_HEADER, grant);
+        }
+        let http = http
             .header("content-length", &body.len().to_string())
             .body(body);
         let mut bytes = http.head();
@@ -891,3 +1021,76 @@ impl World {
 pub const TEAM_A: &str = TEAM_A_SA;
 /// Team B's ServiceAccount.
 pub const TEAM_B: &str = TEAM_B_SA;
+
+/// The comment entry, narrowed per call, which [`Options::comments`] adds.
+pub const COMMENT_ENTRY: &str = "github-comment";
+/// The surface that serves the comment tool to team A and team B.
+pub const COMMENT_SURFACE: &str = "github-comment";
+/// The permission set the comment entry states: the tool's own.
+pub const COMMENT_PERMISSIONS: &str = r#"{ pull_requests = "write" }"#;
+/// The comment tool.
+pub const PR_COMMENT: &str = connector_github::pr_comment::PR_COMMENT;
+/// Otto's name for it, which a turn grant lists.
+pub const OTTO_PR_COMMENT: &str = "github_pr_comment";
+/// The exception the workloads' profile names it in, as decision 0011, section 9, names it.
+pub const EXCEPTION: &str = "otto-comment-tools";
+/// The turn grants' issuer.
+pub const GRANT_ISSUER: &str = "otto-test";
+
+/// The comment entry and its surface, serving `github__pr_comment` to team A and team B, the
+/// surface's list as `surface_tools` gives it.
+fn comment_entry(surface_tools: &str) -> String {
+    format!(
+        r#"
+[[connectors]]
+name = "{COMMENT_ENTRY}"
+system = "github"
+permissions = {COMMENT_PERMISSIONS}
+tools = ["{PR_COMMENT}"]
+credential = {{ mode = "team_service_identity", principal = "switchboard-test-app" }}
+narrowing = "call"
+permits = "write"
+
+[[surfaces]]
+name = "{COMMENT_SURFACE}"
+tools = {surface_tools}
+teams = ["team-a", "team-b"]
+principals = "any_in_teams_and_groups"
+"#
+    )
+}
+
+/// `text`, a registry file [`registry`] wrote, as [`Options::comments`] has it: with the comment
+/// entry and its surface, the tool approved as its connector states it and settled by a lookup
+/// in repositories; and the workloads' profile requiring a turn grant and currency, as the
+/// profile for Otto's sandboxes does, its own list of exceptions naming the tool when
+/// [`Options::exception`] says so. A test registry only: no shipped registry or example lists
+/// the exception, which is not in force until its register entry is signed.
+pub fn with_comments(text: String, options: &Options) -> String {
+    if !options.comments {
+        return text;
+    }
+    // The surface names the tool before it is approved, and the exception names an approved
+    // tool, so the entry alone is loaded to hash it.
+    let entry_only = Registry::from_toml_str(&format!("{text}{}", comment_entry("[]"))).unwrap();
+    let binding =
+        built_in_binding_sha256(&entry_only.connectors()[&ConnectorName::new(COMMENT_ENTRY)])
+            .unwrap();
+    let exceptions = if options.exception {
+        format!("exceptions = [{{ name = \"{EXCEPTION}\", tools = [\"{PR_COMMENT}\"] }}]\n")
+    } else {
+        String::new()
+    };
+    let mut text = text.replacen(
+        "requires_delegation = false\n",
+        &format!("requires_delegation = true\nrequires_currency = true\n{exceptions}"),
+        1,
+    );
+    text.push_str(&comment_entry(&format!("[\"{PR_COMMENT}\"]")));
+    let definition = connector_github::definitions()
+        .into_iter()
+        .find(|definition| definition.name == PR_COMMENT)
+        .unwrap();
+    text.push_str(&approval(&definition, COMMENT_ENTRY, &binding));
+    text
+}

@@ -72,8 +72,8 @@ pub(super) struct Content {
     author: String,
     /// What a comparison in each repository answers.
     comparisons: BTreeMap<String, Value>,
-    /// The faults the next writes meet, in order.
-    faults: VecDeque<Fault>,
+    /// The faults the next writes meet, in order: a comment's too (`comments`).
+    pub(super) faults: VecDeque<Fault>,
 }
 
 impl Default for Content {
@@ -435,7 +435,7 @@ pub(super) async fn faulted(
 /// A body that fails when first asked for a frame. hyper's server writes an answer's head into
 /// its buffer and sends it only when it flushes, which it does not do before a body's error ends
 /// the connection: so nothing of the answer is sent, and the client sees the connection close.
-struct Closed;
+pub(super) struct Closed;
 
 impl hyper::body::Body for Closed {
     type Data = Bytes;
@@ -453,7 +453,7 @@ impl hyper::body::Body for Closed {
 /// the head and that start to the client, and then fails, which breaks the connection off
 /// before the answer ends.
 #[derive(Default)]
-struct BrokenOff {
+pub(super) struct BrokenOff {
     polls: u8,
 }
 

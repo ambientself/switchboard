@@ -34,7 +34,8 @@
 //! For the write tools it opens, lists and changes pull requests, and answers comparisons, and a
 //! write can be given a fault of its own ([`Fault`]); see `writes`. For the proposal tools it
 //! keeps a repository's git data: its branches, commits, trees and blobs, and each file's
-//! contents at a commit; see `git`. It records each request's body
+//! contents at a commit; see `git`. It posts comments on pull requests and lists a repository's
+//! comments, for the comment tool and its lookup; see `comments`. It records each request's body
 //! beside its token.
 
 use std::collections::BTreeMap;
@@ -54,6 +55,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+mod comments;
 mod git;
 mod reads;
 mod writes;
@@ -109,6 +111,7 @@ struct Shared {
     content: Mutex<Content>,
     reads: Mutex<reads::Content>,
     writes: Mutex<writes::Content>,
+    comments: Mutex<comments::Content>,
     git: Mutex<git::Content>,
     /// Whether to stop taking connections once the next comparison is answered.
     close_after_compare: AtomicBool,
@@ -144,6 +147,7 @@ impl FakeRest {
             content: Mutex::new(Content::default()),
             reads: Mutex::new(reads::Content::default()),
             writes: Mutex::new(writes::Content::default()),
+            comments: Mutex::new(comments::Content::default()),
             git: Mutex::new(git::Content::default()),
             close_after_compare: AtomicBool::new(false),
             close: Notify::new(),
@@ -377,6 +381,12 @@ async fn answer(
     // The git data of a repository given some (`git`).
     if let Some(response) =
         git::answer(&shared, &issued, &method, &uri, token.as_deref(), &body).await
+    {
+        return response;
+    }
+    // The comment tool's endpoints and its lookup's (`comments`).
+    if let Some(response) =
+        comments::answer(&shared, &issued, &method, &uri, token.as_deref(), &body).await
     {
         return response;
     }

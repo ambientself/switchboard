@@ -16,7 +16,7 @@
 //!
 //! - an owner other than the configured organization, with Otto's sentence;
 //! - a path a proposal may not change ([`crate::writes::refused_path`]), with Otto's sentence;
-//! - a title, body or claim whose first word is `atlantis` ([`crate::writes::command_text`]);
+//! - a title, body or claim Atlantis would read as a command ([`crate::writes::command_text`]);
 //! - a title, body or claim that holds the marker's text ([`crate::writes::holds_marker`]).
 //!
 //! The write entry must be narrowed `call` (`writes::check_entry`), the caller must

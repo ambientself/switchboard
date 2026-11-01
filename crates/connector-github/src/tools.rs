@@ -185,6 +185,7 @@ pub fn definitions() -> Vec<Definition> {
         crate::create_pr::definition(),
         crate::propose::definition(),
         crate::amend::definition(),
+        crate::pr_comment::definition(),
     ];
     definitions.extend(crate::reads::definitions());
     definitions.sort_by_key(|definition| definition.name);
@@ -673,7 +674,7 @@ mod tests {
 
     /// Each tool states what its code gives: the search checks its own scope, every other tool
     /// reaches the repository its `owner` and `repo` name, and each is `read` but
-    /// `github__create_pr`, which is `propose`. A reach-report entry serves the report's tool
+    /// `github__create_pr`, which is `propose`, and `github__pr_comment`, which is `write`. A reach-report entry serves the report's tool
     /// alone, and any other entry every tool but that one.
     #[test]
     fn each_entry_serves_its_tools_as_their_code_states_them() {
@@ -698,6 +699,7 @@ mod tests {
                 crate::create_pr::CREATE_PR
                 | crate::proposals::PROPOSE_CHANGE
                 | crate::proposals::AMEND_CHANGE => Classification::Propose,
+                crate::pr_comment::PR_COMMENT => Classification::Write,
                 _ => Classification::Read,
             };
             assert_eq!(tool.assurance.classification, classification);
@@ -739,6 +741,7 @@ mod tests {
                 crate::create_pr::CREATE_PR,
                 crate::proposals::PROPOSE_CHANGE,
                 crate::proposals::AMEND_CHANGE,
+                crate::pr_comment::PR_COMMENT,
             ]
             .contains(&definition.name)
         }) {

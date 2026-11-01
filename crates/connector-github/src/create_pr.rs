@@ -13,7 +13,7 @@
 //!   ([`MAX_BRANCH_BYTES`] bytes at most); or a body that, with the marker line, is over
 //!   [`MAX_BODY_CHARS`] characters, GitHub's own bound;
 //! - an owner other than the configured organization is `refused`, with Otto's sentence; so is
-//!   a title or body whose first word is `atlantis` ([`crate::writes::command_text`]), and one
+//!   a title or body Atlantis could read as a command ([`crate::writes::command_text`]), and one
 //!   that holds the marker's text ([`crate::writes::holds_marker`]).
 //!
 //! Then one token is asked for: narrowed to the call's one repository, with the tool's own set,
