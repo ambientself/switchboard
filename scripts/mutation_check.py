@@ -3124,12 +3124,22 @@ mutate("gw-in-process-size-bound-removed", "a result of any size from a connecto
 # up meanwhile; shutting down waits for it; and each breach is logged once (#217).
 # tests/reconcile.rs, tests/in_process.rs and tests/in_process_logs.rs catch these.
 mutate("gw-late-side-effect-unheld", "a late side effect is answered before its receipt is held, so another instance may look it up while it runs", GW_BOUND,
-       "                if let Some(holding) = &holding {\n                    holding.hold(&row, &connector, &late_tool).await;\n                }\n", "")
+       "                    Some(holding) => holding.hold(&row, &connector, &late_tool, true).await,\n",
+       "                    Some(_) => true,\n")
 mutate("gw-late-side-effect-hold-not-renewed", "a late side effect holds its receipt once, so a lookup comes a lease later while it still runs", GW_BOUND,
-       "                tokio::time::sleep(every).await;\n                self.hold(row, connector, tool).await;\n",
-       "                tokio::time::sleep(every).await;\n")
+       "                held = self.hold(row, connector, tool, held).await;\n",
+       "                let _ = self.hold(row, connector, tool, held);\n")
 mutate("gw-late-side-effect-not-held-at-its-end", "a late side effect's receipt is not held again as it ends, so a lookup may come at once", GW_BOUND,
-       "        self.hold(row, connector, tool).await;\n        outcome\n", "        outcome\n")
+       "        self.hold(row, connector, tool, held).await;\n        outcome\n", "        outcome\n")
+mutate("gw-late-side-effect-hold-retried-a-quarter-lease-later", "a late side effect's hold that was not written is tried again only at the next renewal, leaving its receipt claimable meanwhile", GW_BOUND,
+       "                tokio::time::sleep(if held { every } else { HOLD_RETRY }).await;\n",
+       "                tokio::time::sleep(every).await;\n")
+mutate("gw-late-side-effect-unheld-logged-each-time", "every hold of a late side effect's receipt not written is logged, not once for each run of them", GW_BOUND,
+       "        if !held_before {\n            return false;\n        }\n", "")
+mutate("gw-late-call-row-kept", "a late side effect's receipt is still counted as running here after it ends, so this instance never looks it up", GW_BOUND,
+       "                    rows.remove(&self.1);\n", "")
+mutate("gw-reconciler-claims-its-own-late-call", "this instance's reconciler claims a receipt whose late side effect still runs here, though its hold was not written", GW_RECONCILE,
+       "        if self.late.runs(&due.row) {\n            return;\n        }\n", "")
 mutate("gw-reconciler-holds-nothing", "making the reconciler does not tell late side effects where to hold their receipts", BOOT,
        "        self.late.hold_in(\n", "        let _ = (\n")
 mutate("gw-late-call-wait-returns-at-once", "shutting down does not wait for a late side effect", GW_BOUND,
