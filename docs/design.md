@@ -1157,7 +1157,13 @@ receipt.
   with a warning too.
 - **A key is scoped** to the proved principal and, when a delegation is present, to its
   identifying fields. For Otto those are agreed with Otto's owners; the session and the turn
-  are recommended, and whether the execution is needed too is asked.
+  are recommended, and whether the execution is needed too is asked. The Postgres store keeps
+  the scope and the key in a unique index, whose entry Postgres holds to 2,704 bytes, so it
+  holds the principal's issuer and subject and the delegation's scope to 768 bytes each
+  (`MAX_KEY_SCOPE_BYTES`): with a key of 128 bytes, an entry that cannot be compressed still
+  fits. A longer one is refused at begin, naming its column, and nothing is written; it is
+  never cut, since two values cut alike would share a key's scope. The in-memory store refuses
+  the same (#203).
 - **The digest** is SHA-256 over the arguments as canonical JSON (RFC 8785), with integers
   written exactly.
 - **A reused key does not run.** The check is made at begin, ignoring a receipt reserved under
@@ -1170,6 +1176,13 @@ receipt.
   | Same tool and digest, `completed` | `duplicate` | A success: it was already done, with the reference and the receipt identifier. |
   | Same tool and digest, `pending` or `unknown` | `refused` | It may already have happened and must not be repeated. |
   | Same tool and digest, `not_performed` | `refused` | Nothing was done. A new attempt needs a new key. |
+
+  A retried begin of a row written as a `duplicate` is answered with the earlier receipt's
+  reference, as the first was. The Postgres store is the reference here: it keeps no reference
+  on the duplicate's row, and reads the earlier receipt's as it is now, where the in-memory
+  store keeps the answer it wrote. The two cannot differ, since a `duplicate` answers only a
+  `completed` receipt, which is final, so its reference never changes; the contract suite
+  checks both (#203).
 
 - **Reconciliation only looks.** A side-effecting tool's approval declares how an `unknown`
   receipt is settled: by a lookup in a kind of resource, or by a person (section 13). The
@@ -1386,7 +1399,16 @@ partitioned table's key is judged by the partitioned table's owner, not by the o
 partitions' copies. A foreign key that references the audit table passes: its action runs only
 when an audit row is deleted or its key changes, which the gateway's role cannot do. The
 migrations' trigger functions are in `plpgsql`, which is trusted, and are not
-`SECURITY DEFINER`, and the migrations make no foreign key, so a database they built passes.
+`SECURITY DEFINER`, and the migrations make no foreign key with an action, so a database they
+built passes.
+
+The receipt table is held to the same (#203). A rule on `switchboard_audit.receipts`, a foreign
+key on it whose action writes it, a grant on a view or rule that reaches it or owning one
+outside the schema, a definer function whose owner can read or change it or owns
+`receipt_moves`, and a cascading foreign key on a table whose owner can, would each let the
+gateway's role delete or rewrite a receipt, which its column grants and `receipt_moves`
+withhold; each is refused as it is for `call_rows`. A foreign key that references `receipts`
+is judged like any other: unlike one that references `call_rows`, it is not passed.
 
 This has an operational cost. In a database shared with other applications, a cascading
 foreign key on a table owned by a superuser, or by any role that can reach the audit tables,
@@ -1977,8 +1999,12 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   among them, is refused with the rest of the schema. Since migration 0009 it also requires
   `lookup_appends` on `receipt_lookups`, the columns reconciliation reads and writes, of their
   types, on both tables, and refuses an unlogged lookup table and any column privilege on it
-  beyond appending and reading. The definer, rule and foreign-key routes
-  it follows to `call_rows` are not followed to `receipts` yet.
+  beyond appending and reading. The definer, rule, view and foreign-key routes it follows to
+  `call_rows` it follows to `receipts` too (#203): a rule on `receipts`, a foreign key on it
+  whose action writes it, a grant on a view or rule elsewhere that reaches it, a definer
+  function whose owner can change it or owns `receipt_moves`, and a cascading foreign key on a
+  table whose owner can change it are each refused, as each would let the gateway's role
+  delete or rewrite a receipt. They are not followed to `receipt_lookups` yet.
 - Receipts in Postgres: built (#55, part 2). Migration 0008 adds `switchboard_audit.receipts`,
   one row per receipt, keyed by the audit row that reserved it (a foreign key to `call_rows`),
   with the key's scope (the principal's issuer and subject, and the delegation's scope, which
@@ -2004,10 +2030,12 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   `SB001` and the store completes the row again, leaving the receipt `pending`. `unknown`, or a
   reference, for a row that reserved no receipt is refused, and so is a `duplicate` at finish.
   The Postgres runner runs item 6 of the contract suite.
-  A begin whose confirmation is lost after it wrote a reused key's row gives that row up as
-  completed differently, where the in-memory store keeps its answer silently. The row is the
-  same in both. The in-memory store's silence is the behaviour to match: that row's completion
-  was not lost, so the give-up Postgres counts and reports for it is a false signal.
+  A begin whose confirmation is lost after it wrote a reused key's row leaves that row with its
+  answer, and nothing is given up (#203): the completion of the lost begin finds the row
+  complete with the answer to its own key, by the reuse check and the five answers a retried
+  begin reads, and takes it as settled, as the in-memory store does. A row it finds complete
+  with any other completion is given up as completed differently, as before. The contract
+  suite checks both stores. The `SB001` fallback above is tested too.
 - If retention needs it, a partitioned audit table, with the boot check reading the triggers,
   owner and grants of every partition, in whatever schema. Today the boot check refuses a
   partitioned audit table, and any table that inherits from it or that it inherits from.
@@ -2119,10 +2147,10 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   reads receipts as held. Both stores read it as `unknown` on a retried begin of its own row,
   the Postgres store by the database's clock, and refuse that begin rather than answer it as
   reserved, and item 6 of the contract suite checks that on each.
-- A finish given up names, for a side effect, the vendor's reference (part 2). Today the
-  Postgres store reports each finish it gives up, with the row, the outcome's kind and why it
-  stopped. A completion carries a vendor reference for a call that reserved a receipt, which
-  the Postgres store now keeps, but the report does not name it yet.
+- A finish given up names, for a side effect, the vendor's reference (part 2). The Postgres
+  store reports each finish it gives up, with the row, the outcome's kind, why it stopped and,
+  for a side effect whose connector reported one, the vendor's reference (#203). The gateway's
+  `audit_row_given_up` log line does not include the reference yet.
 - Already built and relied on: synchronous commit, the `fsync` and `full_page_writes` gate, a
   finish pool of its own, the open-row query's single connection apart from it, finish
   waiting at most the answer budget and then retrying on its own task until the deadline, an
