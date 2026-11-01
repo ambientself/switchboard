@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use gateway_core::audit::AuditRowId;
-use gateway_core::{AuditStore, Receipt, ReceiptQueue};
+use gateway_core::{AuditStore, Receipt, ReceiptAttribution, ReceiptQueue};
 use gateway_identity::Clock;
 use gateway_testkit::contract::{ContractStore, StoredRow};
 use gateway_testkit::{
@@ -82,6 +82,10 @@ impl ContractStore for InMemory {
         &self.store
     }
 
+    fn attribution(&self) -> &dyn ReceiptAttribution {
+        &self.store
+    }
+
     async fn pass_lease(&self, row: &AuditRowId) {
         let Some(until) = self.store.lease_until(row) else {
             panic!("the receipt {} was never leased", row.as_str());
@@ -146,4 +150,6 @@ contract!(
     a_receipt_settled_by_reconciliation_is_not_moved_by_a_late_finish,
     each_claim_is_counted_as_an_attempt,
     a_receipt_held_for_its_call_is_not_due_and_no_one_else_claims_it,
+    // Attribution.
+    an_attribution_read_finds_only_the_principals_completed_receipt_of_its_tool_target_and_reference,
 );
