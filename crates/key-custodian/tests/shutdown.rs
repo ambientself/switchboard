@@ -80,15 +80,15 @@ async fn a_revocation_github_fails_at_the_stop_is_tried_again_within_the_deadlin
 
 #[tokio::test]
 async fn a_stop_github_does_not_answer_ends_at_its_deadline() {
-    // Each revocation waits for GitHub's two seconds and is tried again; the stop gives up at
-    // its own deadline, and says the token is not revoked.
-    let mut world = World::new().await;
+    // GitHub may take ten seconds to answer a revocation; the stop gives up at its own
+    // deadline, and says the token is not revoked.
+    let mut world = World::with(|config| config.github.deadline_seconds = 10).await;
     world.client.token(&request()).await.unwrap();
     world.fake.hang_revocations(true);
     let started = Instant::now();
     let stopped = stop(&mut world, Duration::from_secs(1)).await;
     let took = started.elapsed();
-    assert!(took < Duration::from_secs(3), "{took:?}");
+    assert!(took < Duration::from_millis(2500), "{took:?}");
     assert_eq!(
         stopped,
         Stopped {
@@ -112,4 +112,29 @@ async fn a_token_past_githubs_expiry_is_not_revoked_at_the_stop() {
     let stopped = stop(&mut world, Duration::from_secs(2)).await;
     assert_eq!(stopped, Stopped::default());
     assert!(world.fake.revocation_attempts().is_empty());
+}
+
+#[tokio::test]
+async fn a_stop_with_a_request_in_flight_ends_at_its_deadline() {
+    // GitHub does not answer the token request, and would be given ten seconds.
+    let mut world = World::with(|config| config.github.deadline_seconds = 10).await;
+    world.fake.set_behaviour(Behaviour::Hang);
+    let client = world.client.clone();
+    let asking = tokio::spawn(async move { client.token(&request()).await });
+    while world.fake.token_requests() == 0 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let started = Instant::now();
+    let stopped = stop(&mut world, Duration::from_secs(1)).await;
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(2500), "{took:?}");
+    assert_eq!(
+        stopped,
+        Stopped {
+            revoked: 0,
+            not_revoked: 0,
+            in_flight: 1
+        }
+    );
+    asking.abort();
 }
