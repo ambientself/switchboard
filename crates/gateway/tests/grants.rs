@@ -1090,4 +1090,20 @@ fn each_key_configuration_refusal_refuses_to_start() {
     value["grants"] = doubled;
     let refused = serde_json::from_value::<Config>(value.clone()).unwrap_err();
     assert!(refused.to_string().contains("both map to"), "{refused}");
+
+    // So is one that names an Otto tool twice, in the JSON text the configuration is read from:
+    // the last is not kept in place of the first.
+    value["grants"] = grants(&minter, false);
+    let once = format!("\"otto_read\":\"{READ_TOOL}\"");
+    let text = value.to_string();
+    assert!(text.contains(&once), "{text}");
+    assert!(Config::from_json(&text).is_ok());
+    let twice = text.replacen(&once, &format!("{once},\"otto_read\":\"{DRAFT_TOOL}\""), 1);
+    let refused = Config::from_json(&twice).unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("Otto tool `otto_read` is mapped more than once"),
+        "{refused}"
+    );
 }

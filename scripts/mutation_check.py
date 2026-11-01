@@ -1743,6 +1743,11 @@ mutate("otto-mapping-last-one-wins", "a mapping file's repeated name keeps only 
 mutate("otto-mapping-unmapped-kept", "a name the mapping lacks is kept when it is a valid tool name", OT,
        ".filter_map(|name| self.get(name).cloned())",
        ".filter_map(|name| self.get(name).cloned().or_else(|| ToolName::parse(name).ok()))")
+# The mapping read as a member of the JSON configuration (#213) refuses a name given twice, as a
+# mapping file does. tests/mapping.rs and the gateway's grants.rs and tests/grants.rs catch this.
+mutate("otto-mapping-member-last-one-wins", "a mapping read inside the JSON configuration keeps only the last of a repeated name", OT,
+       "        let entries = Entries::<String>::deserialize(deserializer)?;\n        Self::from_pairs(entries.0)",
+       "        let entries = BTreeMap::<String, String>::deserialize(deserializer)?;\n        Self::from_pairs(entries)")
 
 # The resolver client (decisions 0003 and 0012, #22): the one-second budget enforced by the
 # client, no cache, a bounded answer, the version and the echo checked, and every failure read

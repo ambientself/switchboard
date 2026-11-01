@@ -45,7 +45,7 @@ use gateway_otto::{
     MappingError, PreviousKeyConfig, ToolMapping, VerifiedGrant,
 };
 use http::HeaderMap;
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use thiserror::Error;
 
 use crate::boot::GateState;
@@ -77,8 +77,8 @@ pub struct GrantsSection {
 pub struct GrantsConfig {
     /// Each issuer, with its keys.
     pub issuers: Vec<GrantIssuerEntry>,
-    /// Otto's bare tool names to this gateway's, one to one. In JSON, an object of names.
-    #[serde(deserialize_with = "tool_mapping")]
+    /// Otto's bare tool names to this gateway's, one to one. In JSON, an object of names, in
+    /// which a name given twice is refused rather than the last one kept.
     pub tool_mapping: ToolMapping,
 }
 
@@ -129,11 +129,6 @@ impl GrantIssuerEntry {
             require_egress: self.require_egress,
         }
     }
-}
-
-fn tool_mapping<'de, D: Deserializer<'de>>(deserializer: D) -> Result<ToolMapping, D::Error> {
-    let value = serde_json::Value::deserialize(deserializer)?;
-    ToolMapping::from_json(&value.to_string()).map_err(serde::de::Error::custom)
 }
 
 /// The deployment file's `[grants]` table as written.
@@ -826,6 +821,29 @@ mod tests {
             };
             assert_eq!(core.as_str(), expected, "{kind:?}");
         }
+    }
+
+    /// The JSON configuration's tool mapping refuses a name given twice, as the mapping file
+    /// does, rather than keeping the last.
+    #[test]
+    fn a_repeated_name_in_the_json_tool_mapping_is_refused() {
+        let section = |mapping: &str| {
+            serde_json::from_str::<GrantsSection>(&format!(
+                r#"{{"enforce": {{"issuers": [], "tool_mapping": {mapping}}}}}"#
+            ))
+        };
+        let one = section(r#"{"otto_read": "fixture__read"}"#).unwrap();
+        assert_eq!(
+            one.enforce.map(|config| config.tool_mapping),
+            Some(ToolMapping::from_pairs([("otto_read", "fixture__read")]).unwrap())
+        );
+        let repeated = section(r#"{"otto_read": "fixture__read", "otto_read": "fixture__draft"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            repeated.contains("Otto tool `otto_read` is mapped more than once"),
+            "{repeated}"
+        );
     }
 
     #[test]
