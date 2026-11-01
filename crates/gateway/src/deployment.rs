@@ -266,9 +266,9 @@
 //!   receipt a vendor never shows to a person about 12 to 13 minutes after it became `unknown`
 //!   with one instance, or a little sooner with several. That is an estimate, assuming no
 //!   backlog, lookups that answer promptly and saves that succeed: a pass works through up to
-//!   50 receipts one at a time, each lookup may take half the lease, and a lookup whose save
-//!   fails uses up no attempt, so a backlog, slow lookups or a failing store can make it much
-//!   longer. See
+//!   50 receipts one at a time, and each lookup may take half the lease, so a backlog or slow
+//!   lookups can make it much longer. A lookup whose save fails still uses up its attempt,
+//!   which is counted when its claim is made. See
 //!   [`DEFAULT_RECONCILE_INTERVAL`](crate::reconcile::DEFAULT_RECONCILE_INTERVAL),
 //!   [`DEFAULT_RECONCILE_LEASE`](crate::reconcile::DEFAULT_RECONCILE_LEASE) and
 //!   [`DEFAULT_RECONCILE_ATTEMPTS`](crate::reconcile::DEFAULT_RECONCILE_ATTEMPTS). The owner
