@@ -1080,8 +1080,11 @@ fn receipt_request(
         principal: call.caller.principal.get().id.clone(),
         delegation: verified(&call.caller).map(|delegation| delegation.get().key_scope()),
     };
+    // The team a lookup asks for its read credential for: the proved principal's, at begin.
+    let team = call.caller.principal.get().team().cloned();
     Ok(ReceiptRequest::new(
         scope,
+        team,
         key,
         tool.name.clone(),
         record.tool_use_id.clone(),

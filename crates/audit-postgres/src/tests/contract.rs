@@ -217,7 +217,7 @@ impl ContractStore for Postgres {
                      r.idempotency_key, r.tool, r.tool_use_id, r.digest, r.resources,
                      r.resources_omitted, r.state, r.established_by, r.established_person,
                      r.reference, r.target_system, r.target_kind, r.target_identifier,
-                     r.handed_to_person_at, r.claims",
+                     r.handed_to_person_at, r.claims, r.team",
                     " FROM switchboard_audit.receipts r"
                 ),
                 &[],

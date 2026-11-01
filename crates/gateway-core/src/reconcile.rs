@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audit::{AuditRowId, MAX_RECORDED_IDENTIFIER, RecordedResources, StoreError};
 use crate::connector::BoxFuture;
-use crate::names::ToolName;
+use crate::names::{PolicyRevision, TeamId, ToolName};
 use crate::policy::{Resource, Resources};
 use crate::receipt::{Receipt, ReceiptState, VendorReference};
 use crate::sentences;
@@ -218,9 +218,10 @@ impl fmt::Display for LeaseHolder {
 }
 
 /// What a lookup is given: the receipt's identifier, which is the marker the gateway attached
-/// to the request, the vendor target the receipt recorded, the tool, and the resources the
-/// call named, as its row records them. Never the call's arguments: a lookup has nothing to
-/// send but a search.
+/// to the request, the vendor target the receipt recorded, the tool, the resources the call
+/// named, as its row records them, the team the receipt recorded, and the policy revision in
+/// force, which a lookup that asks a custodian for its read credential sends with the team.
+/// Never the call's arguments: a lookup has nothing to send but a search.
 #[derive(Clone, Copy, Debug)]
 pub struct LookupRequest<'a> {
     /// The receipt's identifier: the marker.
@@ -231,6 +232,11 @@ pub struct LookupRequest<'a> {
     pub tool: &'a ToolName,
     /// The resources the call named.
     pub resources: &'a RecordedResources,
+    /// The proved principal's team, as the receipt recorded it at begin: `None` for a person,
+    /// and for a receipt reserved before receipts recorded it.
+    pub team: Option<&'a TeamId>,
+    /// The revision of the policy in force when the lookup is made.
+    pub revision: &'a PolicyRevision,
 }
 
 /// A connector's lookup by marker (decision 0009, "Reconciliation").
@@ -240,8 +246,9 @@ pub struct LookupRequest<'a> {
 /// vendor idempotency key, which would mean sending the request again. It is not a tool call,
 /// and writes no audit row. It answers [`LookupAnswer::NotFound`] as authoritative only for a
 /// search the vendor documents as complete and current, and [`LookupAnswer::Failed`] for
-/// anything it could not complete. Its read credential is narrowed through the custodian to the
-/// receipt's team, target and resources, once the custodian exists (#12).
+/// anything it could not complete. A lookup that asks a custodian for its read credential asks
+/// for it narrowed to the receipt's team and target, under the revision in force, and fails
+/// when the receipt recorded no team.
 pub trait Lookup: Send + Sync {
     /// Looks for the effect `request` names.
     fn look<'a>(&'a self, request: LookupRequest<'a>) -> BoxFuture<'a, LookupAnswer>;

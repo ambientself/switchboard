@@ -163,6 +163,7 @@ pub(crate) const RECEIPT_INSERTED: &[&str] = &[
     "target_system",
     "target_kind",
     "target_identifier",
+    "team",
 ];
 
 /// The columns of `receipts` the gateway's role updates: a move's, and reconciliation's lease,
@@ -204,10 +205,12 @@ pub(crate) const RECEIPT_SELECTED: &[&str] = &[
     "lease_until",
     "handed_to_person_at",
     "claims",
+    "team",
 ];
 
-/// The columns of `receipts` that migrations 0009 and 0012 add for reconciliation, with their
-/// types as Postgres's `format_type` names them.
+/// The columns of `receipts` that migrations 0009 and 0012 add for reconciliation, and 0013
+/// for the team a lookup asks for its read credential for, with their types as Postgres's
+/// `format_type` names them.
 pub(crate) const RECEIPT_COLUMNS: &[(&str, &str)] = &[
     ("target_system", "text"),
     ("target_kind", "text"),
@@ -216,6 +219,7 @@ pub(crate) const RECEIPT_COLUMNS: &[(&str, &str)] = &[
     ("lease_until", "timestamp with time zone"),
     ("handed_to_person_at", "timestamp with time zone"),
     ("claims", "integer"),
+    ("team", "text"),
 ];
 
 /// The table of lookups made on receipts (decision 0009, "Reconciliation"), which migration
@@ -1165,7 +1169,7 @@ impl PgAuditStore {
     ///   trigger `receipt_moves` enabled to fire before each insert or update, which moves a
     ///   receipt only as its state table allows (decision 0009, part 2), and with the columns
     ///   reconciliation reads and writes, of their types: the vendor target, the lease, the
-    ///   hand-off to a person and the count of claims.
+    ///   hand-off to a person, the count of claims and the team.
     /// - `switchboard_audit.receipt_lookups` is there, as a table that is not unlogged, with
     ///   every column of its type and its trigger `lookup_appends` enabled to fire before each
     ///   insert, update or delete, which appends a lookup to a receipt in `unknown` and refuses
