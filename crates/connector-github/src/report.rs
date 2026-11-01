@@ -24,7 +24,8 @@
 
 use std::collections::BTreeSet;
 
-use gateway_core::{ErrorKind, ToolOutcome};
+use gateway_core::{Classification, ErrorKind, ToolOutcome};
+use gateway_registry::{Assurance, StatedResources};
 use serde_json::{Value, json};
 
 use crate::api::{Answered, Api};
@@ -54,6 +55,12 @@ pub fn definition() -> Definition {
             "properties": {},
             "additionalProperties": false
         }),
+        // It reads only the names of the installation's repositories, nothing a limit applies
+        // to, for the registry alone, on the one surface the registry's loader allows it.
+        assurance: Assurance {
+            classification: Classification::Read,
+            resources: StatedResources::NoResources,
+        },
     }
 }
 

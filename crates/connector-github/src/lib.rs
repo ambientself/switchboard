@@ -40,7 +40,11 @@
 //! `github__get_issue`, and [`reads`] five more, `github__get_checks`, `github__get_job_log`,
 //! `github__list_releases`, `github__pr_template` and `github__repo_conventions`;
 //! [`definitions`] gives each one's definition, which its approval in the registry must hash
-//! to. Each bounds its result and tags it as external evidence, as Otto's gateway does. None of
+//! to, and its assurance, what the code here gives for it: its classification and how the
+//! resources it reaches are known, which its approval must declare (decision 0011, section 1).
+//! [`served`] gives the tools served on each entry, as the gateway checks their approvals at
+//! boot and on every reload: a reach-report entry's is the report's tool alone, and every other
+//! entry's every tool but that one. Each bounds its result and tags it as external evidence, as Otto's gateway does. None of
 //! these eight checks its own scope: each is declared from its arguments, so its row records the
 //! repository it reached. The first three ask for their entry's whole permission set; the other
 //! five each ask for their own, within the entry's.
@@ -75,6 +79,8 @@ pub use api::{ApiError, MAX_ANSWER_BYTES};
 pub use connector::{DEFAULT_CUSTODIAN_DEADLINE, GitHubConnector, GitHubSettings, SettingsError};
 pub use tools::{Definition, definitions};
 
+use gateway_registry::{BuiltInEntry, ServedTool};
+
 #[cfg(doc)]
 use gateway_core::ToolCall;
 
@@ -83,3 +89,17 @@ pub const SYSTEM: &str = "github";
 
 /// The kind of a GitHub repository in a limit and in a call's resources.
 pub const REPOSITORY: &str = "repository";
+
+/// The tools the connector serves on `entry`, each with the SHA-256 of its definition and its
+/// assurance, as the gateway compares each approval on the entry with them: on a reach-report
+/// entry (`reports_reach = true`), the report's tool alone; on any other, every tool but that
+/// one. The connector refuses the report's tool on any other entry when it runs, and an entry
+/// narrowed `none`, as a reach-report entry is, cannot run the others.
+pub fn served(entry: &BuiltInEntry) -> Vec<ServedTool> {
+    let tools = if entry.reports_reach {
+        vec![report::definition()]
+    } else {
+        definitions()
+    };
+    tools.iter().filter_map(Definition::served).collect()
+}
