@@ -1763,7 +1763,10 @@ mod tests {
         record.allowed_by_exception =
             Some(gateway_core::ExceptionName::parse("otto-comment-tools").unwrap());
         let row = BeginRow::from_record(&id(), &record, &budgets()).unwrap();
-        assert_eq!(row.allowed_by_exception.as_deref(), Some("otto-comment-tools"));
+        assert_eq!(
+            row.allowed_by_exception.as_deref(),
+            Some("otto-comment-tools")
+        );
         let sizes: std::collections::BTreeMap<&str, usize> = row.sizes().into_iter().collect();
         assert_eq!(sizes["allowed_by_exception"], "otto-comment-tools".len());
         assert!(

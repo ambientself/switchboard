@@ -14,10 +14,9 @@ use gateway_core::audit::{self, Begun, DecisionKind, MAX_RECORDED_RESOURCES, Req
 use gateway_core::{
     AuditRecord, CallContext, CallerContext, Claimed, Classification, Currency, CurrencyAnswer,
     Delegation, DelegationDigest, DelegationFailure, DeploymentName, Egress, ExceptionName,
-    IdempotencyKey,
-    Person, PolicySnapshot, PresentedDelegation, Principal, ProfileName, ReasonKind, ReceiptState,
-    RequestedTool, Resource, Resources, SnapshotData, SurfaceName, TeamId, ToolName,
-    UnverifiedDelegation, WasProved, decide, list_tools,
+    IdempotencyKey, Person, PolicySnapshot, PresentedDelegation, Principal, ProfileName,
+    ReasonKind, ReceiptState, RequestedTool, Resource, Resources, SnapshotData, SurfaceName,
+    TeamId, ToolName, UnverifiedDelegation, WasProved, decide, list_tools,
 };
 use serde::Deserialize;
 
@@ -286,9 +285,12 @@ fn expected_row(
         .and_then(|name| snapshot.tool(&name).cloned());
     let (decision, reason, sentence, exception) = match &case.expect {
         Expected::Allow { exception } => (DecisionKind::Allow, None, None, exception.clone()),
-        Expected::Deny { reason, sentence } => {
-            (DecisionKind::Deny, Some(*reason), Some(sentence.clone()), None)
-        }
+        Expected::Deny { reason, sentence } => (
+            DecisionKind::Deny,
+            Some(*reason),
+            Some(sentence.clone()),
+            None,
+        ),
     };
     // A failure is recorded only on the row check 3 denied for it: a call denied before
     // check 3 records that denial alone.
@@ -625,12 +627,9 @@ fn the_table_covers_every_reason_and_profile() {
         "no case expects allow"
     );
     assert!(
-        cases.iter().any(|case| matches!(
-            &case.expect,
-            Expected::Allow {
-                exception: Some(_)
-            }
-        )),
+        cases
+            .iter()
+            .any(|case| matches!(&case.expect, Expected::Allow { exception: Some(_) })),
         "no case expects an allow by an exception"
     );
 

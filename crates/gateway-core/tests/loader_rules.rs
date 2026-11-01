@@ -172,7 +172,10 @@ fn each_exception_rule_has_a_refusing_and_a_passing_case() {
     let table: Table = serde_json::from_str(TABLE).unwrap();
     let refusals = [
         ("a", &["ExceptionWithoutCurrency"][..]),
-        ("b", &["ExceptionToolUnapproved", "ExceptionToolNotWrite"][..]),
+        (
+            "b",
+            &["ExceptionToolUnapproved", "ExceptionToolNotWrite"][..],
+        ),
         ("c", &["ExceptedWriteSettledByPerson"][..]),
         ("d", &["DuplicateException", "ToolInTwoExceptions"][..]),
     ];

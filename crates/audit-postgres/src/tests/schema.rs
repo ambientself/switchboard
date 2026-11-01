@@ -7,8 +7,7 @@ use tokio_postgres::Client;
 
 use super::{
     ADDED_BY_0010, CHECK_VIOLATION, EXCEPTION_COLUMN, INSUFFICIENT_PRIVILEGE, NOT_NULL_VIOLATION,
-    SETUP,
-    TestDatabase, code, message,
+    SETUP, TestDatabase, code, message,
 };
 use crate::{GATEWAY_ROLE, MIGRATIONS, MigrateError, OWNER_ROLE, ROLES, migrate};
 
@@ -1654,7 +1653,10 @@ async fn the_error_kind_migration_marks_the_errors_already_written() {
     let denial = insert_row(&owner, &denied()).await;
     let before = rows_without_error_kind(&owner).await;
 
-    assert_eq!(migrate(&mut owner).await.unwrap(), vec![6, 7, 8, 9, 10, 11, 12]);
+    assert_eq!(
+        migrate(&mut owner).await.unwrap(),
+        vec![6, 7, 8, 9, 10, 11, 12]
+    );
     assert_eq!(rows_without_error_kind(&owner).await, before);
     for (id, kind) in [
         (&failed, Some("before-0006")),
@@ -1874,7 +1876,10 @@ async fn the_reach_and_credential_migration_keeps_the_rows_already_written() {
         before.push(row.get::<_, Option<serde_json::Value>>(0));
     }
 
-    assert_eq!(migrate(&mut owner).await.unwrap(), vec![7, 8, 9, 10, 11, 12]);
+    assert_eq!(
+        migrate(&mut owner).await.unwrap(),
+        vec![7, 8, 9, 10, 11, 12]
+    );
     for (id, resources) in [&named, &unknown, &listed].into_iter().zip(before) {
         let row = owner.query_one(&read(id), &[]).await.unwrap();
         assert_eq!(

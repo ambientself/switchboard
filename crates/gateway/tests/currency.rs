@@ -368,7 +368,11 @@ async fn an_excepted_write_is_allowed_only_when_current_and_its_row_names_the_ex
         assert_eq!(row.profile.as_str(), CONTROL_PLANE);
         assert_eq!(row.allowed_by_exception, None);
     }
-    assert_eq!(asked(&fake), before, "a call under the control-plane profile was asked about");
+    assert_eq!(
+        asked(&fake),
+        before,
+        "a call under the control-plane profile was asked about"
+    );
 }
 
 /// A grant for team B's turn, under the control-plane profile.

@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::classification::Classification;
 use crate::names::{
-    DeploymentName, ExceptionName, PolicyRevision, ProfileName, RequestedTool, SurfaceName,
-    TeamId, ToolName,
+    DeploymentName, ExceptionName, PolicyRevision, ProfileName, RequestedTool, SurfaceName, TeamId,
+    ToolName,
 };
 use crate::policy::{
     ApprovedTool, Narrowing, PolicySnapshot, Profile, Resource, ResourceDeclaration,

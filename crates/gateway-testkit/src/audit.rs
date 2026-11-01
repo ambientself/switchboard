@@ -9,9 +9,9 @@ use gateway_core::audit::{
 };
 use gateway_core::receipt::{EstablishedBy, ReceiptRequest, Reservation, may_move};
 use gateway_core::{
-    AuditRecord, AuditStore, BoxFuture, Classification, IdempotencyKey, InstanceName,
-    LeaseHolder, LookupAnswer, LookupRecord, ReasonKind, Receipt, ReceiptQueue, ReceiptState,
-    Recorded, Reuse, VendorReference,
+    AuditRecord, AuditStore, BoxFuture, Classification, IdempotencyKey, InstanceName, LeaseHolder,
+    LookupAnswer, LookupRecord, ReasonKind, Receipt, ReceiptQueue, ReceiptState, Recorded, Reuse,
+    VendorReference,
 };
 use gateway_identity::Clock;
 use rand_core::{OsRng, RngCore};

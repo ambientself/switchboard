@@ -78,9 +78,9 @@ use gateway_core::{
     CurrencyAnswer, Decision, Delegation, DelegationDigest, DelegationFailure, DelegationKeyScope,
     Egress, ExceptionName, IdempotencyKey, KeyScope, LeaseHolder, LookupAnswer, PodUid,
     PolicySnapshot, PresentedDelegation, Principal, PrincipalKind, Proved, Reason, ReasonKind,
-    Receipt, ReceiptQueue, ReceiptState, Recorded, RequestedTool,
-    Resource, Resources, Reuse, TeamId, ToolCall, ToolOutcome, ToolUseId, UnverifiedDelegation,
-    VendorReference, Verifier, WasProved, decide,
+    Receipt, ReceiptQueue, ReceiptState, Recorded, RequestedTool, Resource, Resources, Reuse,
+    TeamId, ToolCall, ToolOutcome, ToolUseId, UnverifiedDelegation, VendorReference, Verifier,
+    WasProved, decide,
 };
 use serde_json::{Value, json};
 
@@ -1187,14 +1187,16 @@ pub async fn an_exception_is_stored_on_an_allowed_write_and_refused_elsewhere(
             tool["settlement"] = draft_lookup();
         }
     }
-    for profile in data["profiles"].as_array_mut().expect("the fixture's profiles") {
+    for profile in data["profiles"]
+        .as_array_mut()
+        .expect("the fixture's profiles")
+    {
         if profile["name"] == PROFILE_TEAM_A {
             profile["requires_currency"] = json!(true);
             profile["exceptions"] = json!([{"name": exception.as_str(), "tools": [WRITE_TOOL]}]);
         }
     }
-    let policy: PolicySnapshot =
-        serde_json::from_value(data).expect("the excepting policy loads");
+    let policy: PolicySnapshot = serde_json::from_value(data).expect("the excepting policy loads");
     let arguments = json!({ DOCUMENT_ARGUMENT: TEAM_A_DOCUMENT });
     let key = fresh_key();
     let context = |currency: Currency| CallContext {

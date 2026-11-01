@@ -1235,7 +1235,9 @@ mod tests {
             tools: [tool_name("sys__comment")].into(),
         });
         assert_eq!(
-            profile.excepting(&tool_name("sys__comment")).map(ExceptionName::as_str),
+            profile
+                .excepting(&tool_name("sys__comment"))
+                .map(ExceptionName::as_str),
             Some("comment-tools")
         );
         for other in [
