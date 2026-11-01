@@ -13,7 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use gateway_core::audit::{self, Begun, DecisionKind, MAX_RECORDED_RESOURCES, RequestMetadata};
 use gateway_core::{
     AuditRecord, CallContext, CallerContext, Claimed, Classification, Currency, CurrencyAnswer,
-    Delegation, DelegationDigest, DelegationFailure, DeploymentName, Egress, IdempotencyKey,
+    Delegation, DelegationDigest, DelegationFailure, DeploymentName, Egress, ExceptionName,
+    IdempotencyKey,
     Person, PolicySnapshot, PresentedDelegation, Principal, ProfileName, ReasonKind, ReceiptState,
     RequestedTool, Resource, Resources, SnapshotData, SurfaceName, TeamId, ToolName,
     UnverifiedDelegation, WasProved, decide, list_tools,
@@ -173,7 +174,12 @@ impl ListCase {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case", deny_unknown_fields)]
 enum Expected {
-    Allow,
+    /// Allowed; by the exception named, when check 5 needed one (decision 0011, section 9).
+    /// The decision names it, and the row records it.
+    Allow {
+        #[serde(default)]
+        exception: Option<ExceptionName>,
+    },
     Deny {
         reason: ReasonKind,
         sentence: String,
@@ -278,10 +284,10 @@ fn expected_row(
         .ok()
         .and_then(|name| snapshot.surface(&case.surface)?.tools.get(&name).cloned())
         .and_then(|name| snapshot.tool(&name).cloned());
-    let (decision, reason, sentence) = match &case.expect {
-        Expected::Allow => (DecisionKind::Allow, None, None),
+    let (decision, reason, sentence, exception) = match &case.expect {
+        Expected::Allow { exception } => (DecisionKind::Allow, None, None, exception.clone()),
         Expected::Deny { reason, sentence } => {
-            (DecisionKind::Deny, Some(*reason), Some(sentence.clone()))
+            (DecisionKind::Deny, Some(*reason), Some(sentence.clone()), None)
         }
     };
     // A failure is recorded only on the row check 3 denied for it: a call denied before
@@ -354,6 +360,9 @@ fn expected_row(
             "digest": failure.digest(),
         })),
         "currency": case.currency,
+        // Only an allowed call records the exception that let it past check 5; every denial,
+        // one that passed check 5 by an exception included, records none.
+        "allowed_by_exception": exception,
         // The identity the served tool's entry states, if it has one.
         "credential": served
             .as_ref()
@@ -467,6 +476,7 @@ fn check_cases(world: &World, cases: &[Case]) -> Vec<String> {
         if decision.policy_revision() != snapshot.revision() {
             failures.push(format!("case `{}`: wrong policy revision", case.name));
         }
+        let exception = decision.exception().cloned();
         let metadata = RequestMetadata {
             tool_use_id: Some(format!("toolu-{index}").as_str().into()),
             claimed_team: Some(Claimed::new(TeamId::from("claimed-team"))),
@@ -487,11 +497,19 @@ fn check_cases(world: &World, cases: &[Case]) -> Vec<String> {
         ))
         .expect("the in-memory store refused a row");
         let got = match &begun {
-            Begun::Allowed(_) => Expected::Allow,
-            Begun::Denied(refusal) => Expected::Deny {
-                reason: refusal.reason().kind(),
-                sentence: refusal.sentence().to_owned(),
-            },
+            Begun::Allowed(_) => Expected::Allow { exception },
+            Begun::Denied(refusal) => {
+                if let Some(exception) = exception {
+                    failures.push(format!(
+                        "case `{}`: a denial names exception `{exception}`",
+                        case.name
+                    ));
+                }
+                Expected::Deny {
+                    reason: refusal.reason().kind(),
+                    sentence: refusal.sentence().to_owned(),
+                }
+            }
             Begun::Reused(reused) => {
                 failures.push(format!(
                     "case `{}`: a fresh store answered a reused key: {reused:?}",
@@ -517,7 +535,7 @@ fn check_cases(world: &World, cases: &[Case]) -> Vec<String> {
         }
         // An allowed side effect reserves one `pending` receipt, under its row and for its key,
         // and nothing else reserves any: a denial uses up no key.
-        let side_effect = case.expect == Expected::Allow
+        let side_effect = matches!(case.expect, Expected::Allow { .. })
             && want
                 .classification
                 .is_some_and(|classification| classification != Classification::Read);
@@ -575,7 +593,7 @@ fn every_list_case_holds() {
 }
 
 /// The table is only evidence if it covers what it claims to: every kind of reason, every
-/// profile, allows as well as denials, and enough cases.
+/// profile, allows as well as denials, an allow by an exception, and enough cases.
 #[test]
 fn the_table_covers_every_reason_and_profile() {
     let (world, cases, _) = load();
@@ -592,7 +610,7 @@ fn the_table_covers_every_reason_and_profile() {
         .iter()
         .filter_map(|case| match case.expect {
             Expected::Deny { reason, .. } => Some(reason),
-            Expected::Allow => None,
+            Expected::Allow { .. } => None,
         })
         .collect();
     let missing: Vec<_> = ReasonKind::ALL
@@ -601,8 +619,19 @@ fn the_table_covers_every_reason_and_profile() {
         .collect();
     assert!(missing.is_empty(), "no case expects {missing:?}");
     assert!(
-        cases.iter().any(|case| case.expect == Expected::Allow),
+        cases
+            .iter()
+            .any(|case| case.expect == Expected::Allow { exception: None }),
         "no case expects allow"
+    );
+    assert!(
+        cases.iter().any(|case| matches!(
+            &case.expect,
+            Expected::Allow {
+                exception: Some(_)
+            }
+        )),
+        "no case expects an allow by an exception"
     );
 
     for (snapshot, profiles) in &world.profiles {
