@@ -931,6 +931,29 @@ mutate("record-delegation-failure-on-earlier-denial",
        "a delegation's failure is recorded on a row denied before check 3", SRC + "audit.rs",
        "        delegation_failure.filter(|_| reason == Some(ReasonKind::DelegationUnverified));",
        "        delegation_failure.filter(|_| reason.is_some());")
+# The core's own test store refuses the delegation shapes the testkit's store and Postgres refuse
+# (migration 0010, #211), so the core's tests fail if it ever writes one. audit_flow.rs's
+# the_test_store_refuses_the_delegation_shapes_the_other_stores_refuse catches these.
+CORE_STORE = CRATE + "tests/common/mod.rs"
+mutate("core-store-failure-beside-claims", "the core's test store records a delegation's failure beside its claims", CORE_STORE,
+       "    if record.delegation.is_some()\n        || record.proved_delegation_team.is_some()\n        || record.claimed_acting_person.is_some()\n    {",
+       "    if false {")
+mutate("core-store-digest-without-binding", "the core's test store records a digest with a failure that is not a binding's", CORE_STORE,
+       "    if failure.digest.is_some() && !failure.failure.follows_signature() {", "    if false {")
+mutate("core-store-failure-on-any-row", "the core's test store records a delegation's failure on a row check 3 did not deny for it", CORE_STORE,
+       "    if !at_check_3 || record.decision != DecisionKind::Deny {", "    if false {")
+mutate("core-store-check-3-without-failure", "the core's test store writes a denial at check 3 that records no failure", CORE_STORE,
+       "        return if at_check_3 {\n            Err(violates(\"delegation_failure_shape\"))\n        } else {\n            Ok(())\n        };",
+       "        return Ok(());")
+mutate("core-store-delegation-without-team", "the core's test store records a verified delegation without its team or person", CORE_STORE,
+       "    if !(team && person) {", "    if false {")
+mutate("core-store-epoch-past-bigint", "the core's test store records a delegation's epoch past a Postgres bigint", CORE_STORE,
+       "    if i64::try_from(delegation.epoch).is_err() {", "    if false {")
+mutate("core-store-receipt-begin-unchecked", "the core's test store's begin with a receipt writes any delegation shape", CORE_STORE,
+       "        refused_shape(record)?;\n", "")
+mutate("core-store-list-unchecked", "the core's test store writes a list row with a verified delegation without its team or person", CORE_STORE,
+       "        } else if let Err(refused) = refused_delegation(\n            record.delegation.as_ref(),",
+       "        } else if let Err(refused) = refused_delegation(\n            None,")
 mutate("outcome-ok-renamed", "the Ok outcome is written as `success`", SRC + "audit.rs",
        "    Ok,\n    /// The ", "    #[serde(rename = \"success\")]\n    Ok,\n    /// The ")
 mutate("outcome-error-renamed", "the Error outcome is written as `failed`", SRC + "audit.rs",
@@ -1574,6 +1597,11 @@ mutate("otto-grant-s-unchecked", "a non-canonical S is left to the signature lib
        "        if !s_is_canonical(&signature_bytes) {", "        if false {")
 mutate("otto-grant-signature-unchecked", "a signature that does not verify is accepted", OV,
        "            .map_err(|_| refuse(FailureKind::Signature))?;", "            .ok();")
+# Strict verification (#211): tests/forgery.rs's grant whose R is of small order, which only the
+# lax check accepts, catches this.
+mutate_all("otto-grant-signature-lax", "the signature is verified with the lax check, which accepts a small-order R",
+           (OV, "use ed25519_dalek::Signature;\n", "use ed25519_dalek::{Signature, Verifier as _};\n"),
+           (OV, "            .verify_strict(\n", "            .verify(\n"))
 mutate("otto-grant-claims-before-signature", "the claims are decoded before the signature is checked", OV,
        "        // 3. The signature, before the claims are decoded.\n",
        "        LENIENT.decode(claims).ok().and_then(|bytes| Claims::parse(&bytes, false, false)).ok_or(refuse(FailureKind::Malformed))?;\n")
@@ -1593,6 +1621,14 @@ mutate("otto-grant-digest-dropped", "a failure after the signature verified carr
 mutate("otto-grant-digest-of-decoded-claims", "the digest is taken over the decoded claims, not the grant as presented", OV,
        "        let digest = GrantDigest::of(grant);",
        "        let digest = GrantDigest::of(&LENIENT.decode(claims).unwrap_or_default());")
+# Only a binding's failure carries the digest (#213): a signed grant refused for its encoding or
+# its claims' shape carries none. tests/forgery.rs, tests/format_doc.rs and the gateway's
+# tests/grant_logs.rs catch these.
+mutate("otto-grant-digest-on-encoding", "a signed grant refused for its encoding carries its digest", OV,
+       "            || CANONICAL.encode(&claims_bytes).as_bytes() != claims\n        {\n            return Err(refuse(FailureKind::Encoding));",
+       "            || CANONICAL.encode(&claims_bytes).as_bytes() != claims\n        {\n            return Err(bind(FailureKind::Encoding));")
+mutate("otto-grant-digest-on-malformed", "a signed grant whose claims are malformed carries its digest", OV,
+       "            .ok_or(refuse(FailureKind::Malformed))?;", "            .ok_or(bind(FailureKind::Malformed))?;")
 mutate("otto-grant-empty-tools-accepted", "a grant with no tools is accepted", OV,
        ".filter(|tools| !tools.is_empty() && tools.iter().all(|tool| !tool.is_empty()))?;",
        ".filter(|tools| tools.iter().all(|tool| !tool.is_empty()))?;")
@@ -1623,6 +1659,19 @@ mutate("otto-grant-unknown-key-falls-back", "an unknown key ID is verified with 
        "            .and_then(|id| self.keys.keys.get_key_value(id).or_else(|| self.keys.keys.iter().next()))\n")
 mutate("otto-grant-epoch-zero-accepted", "a grant with epoch 0 is accepted", OV,
        ".filter(|epoch| *epoch > 0)", ".filter(|epoch| *epoch >= 0)")
+# An integer is digits only (#211): `-0`, which JSON reads as a float, is not read as zero.
+# tests/forgery.rs catches this.
+mutate_all("otto-grant-negative-zero-read-as-zero", "iat is read through a float, so -0 and 1800000000.0 are read as integers",
+           (OV, '    #[serde(default, deserialize_with = "present")]\n    iat: Option<i64>,',
+            '    #[serde(default, deserialize_with = "through_float")]\n    iat: Option<i64>,'),
+           (OV, "/// A member that is present is its value, never `null`.",
+            "fn through_float<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<i64>, D::Error> {\n"
+            "    Ok(Some(f64::deserialize(deserializer)? as i64))\n}\n\n"
+            "/// A member that is present is its value, never `null`."))
+# One name for the lifetime failure (#213): the counter's label is the row's. tests/binding.rs,
+# tests/format_doc.rs, the gateway's grants.rs and tests/grant_logs.rs catch this.
+mutate("otto-grant-lifetime-label-short", "the lifetime failure is labelled `lifetime`, not the row's `lifetime_over_ceiling`", OV,
+       'FailureKind::LifetimeOverCeiling => "lifetime_over_ceiling",', 'FailureKind::LifetimeOverCeiling => "lifetime",')
 mutate("otto-grant-required-pod-optional", "a grant without pod is accepted when the issuer requires it", OV,
        "        if require_pod && claims.pod.is_none() {", "        if false {")
 mutate("otto-grant-required-egress-optional", "a grant without egress is accepted when the issuer requires it", OV,
@@ -1712,6 +1761,11 @@ mutate("otto-mapping-last-one-wins", "a mapping file's repeated name keeps only 
 mutate("otto-mapping-unmapped-kept", "a name the mapping lacks is kept when it is a valid tool name", OT,
        ".filter_map(|name| self.get(name).cloned())",
        ".filter_map(|name| self.get(name).cloned().or_else(|| ToolName::parse(name).ok()))")
+# The mapping read as a member of the JSON configuration (#213) refuses a name given twice, as a
+# mapping file does. tests/mapping.rs and the gateway's grants.rs and tests/grants.rs catch this.
+mutate("otto-mapping-member-last-one-wins", "a mapping read inside the JSON configuration keeps only the last of a repeated name", OT,
+       "        let entries = Entries::<String>::deserialize(deserializer)?;\n        Self::from_pairs(entries.0)",
+       "        let entries = BTreeMap::<String, String>::deserialize(deserializer)?;\n        Self::from_pairs(entries)")
 
 # The resolver client (decisions 0003 and 0012, #22): the one-second budget enforced by the
 # client, no cache, a bounded answer, the version and the echo checked, and every failure read

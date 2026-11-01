@@ -222,7 +222,7 @@ fn each_failure_kind_has_its_own_label() {
             "wrong_audience",
             "not_yet_valid",
             "expired",
-            "lifetime",
+            "lifetime_over_ceiling",
             "wrong_pod",
         ]
     );
