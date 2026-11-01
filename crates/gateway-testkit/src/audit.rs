@@ -9,9 +9,9 @@ use gateway_core::audit::{
 };
 use gateway_core::receipt::{EstablishedBy, ReceiptRequest, Reservation, may_move};
 use gateway_core::{
-    AuditRecord, AuditStore, BoxFuture, Classification, IdempotencyKey, InstanceName, LeaseHolder,
-    LookupAnswer, LookupRecord, ReasonKind, Receipt, ReceiptQueue, ReceiptState, Recorded, Reuse,
-    VendorReference,
+    AttributionQuery, AuditRecord, AuditStore, BoxFuture, Classification, IdempotencyKey,
+    InstanceName, LeaseHolder, LookupAnswer, LookupRecord, ReasonKind, Receipt, ReceiptAttribution,
+    ReceiptQueue, ReceiptState, Recorded, Reuse, VendorReference,
 };
 use gateway_identity::Clock;
 use rand_core::{OsRng, RngCore};
@@ -1414,6 +1414,25 @@ impl AuditStore for InMemoryAuditStore {
                 return Err(lost());
             }
             Ok(())
+        })
+    }
+}
+
+/// The attribution read: the first receipt reserved that the query matches.
+impl ReceiptAttribution for InMemoryAuditStore {
+    fn completed<'a>(
+        &'a self,
+        query: &'a AttributionQuery,
+    ) -> BoxFuture<'a, Result<Option<Receipt>, StoreError>> {
+        Box::pin(async move {
+            // Receipts are held in the order reserved, so the first found is the first
+            // reserved.
+            Ok(self
+                .state()
+                .receipts
+                .iter()
+                .find(|receipt| query.matches(receipt))
+                .cloned())
         })
     }
 }

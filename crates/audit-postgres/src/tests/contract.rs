@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gateway_core::audit::{AuditRowId, RowKind};
-use gateway_core::{AuditStore, Receipt, ReceiptQueue};
+use gateway_core::{AuditStore, Receipt, ReceiptAttribution, ReceiptQueue};
 use gateway_testkit::StoreBudgets;
 use gateway_testkit::contract::{self, ContractStore, StoredRecord, StoredRow};
 use serde_json::{Value, json};
@@ -278,6 +278,10 @@ impl ContractStore for Postgres {
         &self.store
     }
 
+    fn attribution(&self) -> &dyn ReceiptAttribution {
+        &self.store
+    }
+
     fn late_finish_disagreements(&self) -> u64 {
         self.store.stats().late_finish_disagreements
     }
@@ -402,4 +406,6 @@ contract!(
     each_claim_is_counted_as_an_attempt,
     a_receipt_held_for_its_call_is_not_due_and_no_one_else_claims_it,
     an_unknown_receipt_is_not_due_before_its_rows_deadline,
+    // Attribution.
+    an_attribution_read_finds_only_the_principals_completed_receipt_of_its_tool_target_and_reference,
 );

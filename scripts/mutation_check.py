@@ -1273,6 +1273,12 @@ mutate("core-tool-call-receipt-none", "a connector is never given its call's rec
 mutate("core-receipt-team-not-recorded", "begin reserves a receipt without its principal's team, so a lookup has none to ask for", SRC + "audit.rs",
        "    let team = call.caller.principal.get().team().cloned();",
        "    let team = call.caller.principal.get().team().cloned().filter(|_| false);")
+# The attribution read (decision 0011, section 6): a completed receipt of the principal's own.
+# receipt.rs's own test catches these, and the contract suite and github_proposals.rs the first.
+mutate("core-attribution-any-principal", "an attribution query answers another principal's receipt", SRC + "receipt.rs",
+       "            && receipt.scope.principal == self.principal\n", "")
+mutate("core-attribution-any-state", "an attribution query answers a receipt that is not completed", SRC + "receipt.rs",
+       "        receipt.state == ReceiptState::Completed\n            && ", "        ")
 # The gateway answers a duplicate as a success, with the receipt and the reference.
 mutate("gw-duplicate-answered-as-refusal", "the gateway answers a duplicate as a refusal", "crates/gateway/src/path.rs",
        "        Reuse::Duplicate {\n            receipt, reference, ..\n        } => Reply::ToolOk(",
@@ -2488,8 +2494,12 @@ BEFORE_CONNECTING = (
 )
 mutate_all("gw-receipt-gate-after-database", "start::prepare runs the receipt-store gate and the opt-outs after it connects to the database",
            (GW + "start.rs", BEFORE_CONNECTING, ""),
-           (GW + "start.rs", "    if let Some(store) = &store {\n        wiring = wiring.audit_store(store.clone());\n    }\n",
-            "    if let Some(store) = &store {\n        wiring = wiring.audit_store(store.clone());\n    }\n"
+           (GW + "start.rs", "    if let Some(store) = &store {\n        wiring = wiring.audit_store(store.clone());\n"
+            "        // The proposal tools read the gateway's receipts (decision 0011, section 6).\n"
+            "        if let Some(connector) = &github_connector {\n            connector.read_receipts_from(store.clone());\n        }\n    }\n",
+            "    if let Some(store) = &store {\n        wiring = wiring.audit_store(store.clone());\n"
+            "        // The proposal tools read the gateway's receipts (decision 0011, section 6).\n"
+            "        if let Some(connector) = &github_connector {\n            connector.read_receipts_from(store.clone());\n        }\n    }\n"
             + BEFORE_CONNECTING.replace("&deployment.identity", "&identity")))
 
 # Turn grants' gates (decision 0012, "Keys"): grant checking off only in a development build,
@@ -5451,6 +5461,16 @@ mutate("pg-receipt-team-not-recorded", "the Postgres store reserves a receipt wi
        '            team: optional("team", request.team().map(TeamId::as_str).filter(|_| false))?,')
 mutate("pg-check-receipt-team-unrequired", "the boot check accepts a database whose receipts have no team column, or one of another type", PG_CHECK,
        '    ("claims", "integer"),\n    ("team", "text"),\n', '    ("claims", "integer"),\n')
+# The attribution read (migration 0015's index): the contract suite's attribution case catches
+# these against Postgres.
+PG_RECONCILE = PG + "src/reconcile.rs"
+mutate("pg-attribution-any-principal", "the Postgres store answers an attribution query with another principal's receipt", PG_RECONCILE,
+       "         AND r.principal_issuer = $1 AND r.principal_subject = $2 AND r.tool = $3",
+       "         AND $1::text IS NOT NULL AND $2::text IS NOT NULL AND r.tool = $3")
+mutate("pg-attribution-any-tool", "the Postgres store answers an attribution query with another tool's receipt", PG_RECONCILE,
+       "AND r.principal_subject = $2 AND r.tool = $3", "AND r.principal_subject = $2 AND $3::text IS NOT NULL")
+mutate("pg-attribution-any-target", "the Postgres store answers an attribution query with a receipt in another target", PG_RECONCILE,
+       "AND r.target_identifier = $6", "AND $6::text IS NOT NULL")
 
 # --- demo-checks ---------------------------------------------------------------------------
 # The demo's scripts and manifests in deploy/, watched by crates/demo-checks.
@@ -7181,7 +7201,7 @@ mutate("gateway-connector-limits-dropped", "the deployment file's [connectors.<n
        "            wiring = wiring.in_process_limits(name.clone(), *limits);", "            let _ = limits;")
 mutate("gateway-github-quotas-dropped", "the deployment file's [limits] quotas do not reach the GitHub connector",
        "crates/gateway/src/start.rs",
-       "    .quotas(deployment.limits.quotas);", ";")
+       "    let mut wiring = wiring.quotas(deployment.limits.quotas);", "    let mut wiring = wiring;")
 mutate("gateway-reload-connectors-uncompared", "a reload that changes a built-in entry under a new revision is served",
        "crates/gateway/src/reload.rs",
        "        if registry.connectors() != self.basis.registry.connectors() {", "        if false {")
@@ -7259,6 +7279,119 @@ mutate("github-lookup-marker-substring", "a lookup finds the marker anywhere in 
 mutate("github-lookup-entry-set", "a lookup's token asks for the write entry's whole set, not pull_requests: read", GHL,
        "            permissions: BTreeMap::from([(LOOKUP_PERMISSION.to_owned(), Access::Read)]),",
        '            permissions: BTreeMap::from([("contents".to_owned(), Access::Write), (LOOKUP_PERMISSION.to_owned(), Access::Write)]),')
+# The refused-path predicate every proposal tool shares: each of Otto's groups, in any case.
+# writes.rs's own tests and github_proposals.rs catch these.
+GHS = GH + "writes.rs"
+mutate("github-refused-path-workflows", "a file under .github/workflows/ may be proposed", GHS,
+       '    if segments[0] == ".github" && segments.get(1).is_none_or(|second| second == "workflows") {',
+       "    if false {")
+mutate("github-refused-path-atlantis", "Atlantis configuration may be proposed", GHS,
+       '    if last == "atlantis.yaml" || last == "atlantis.yml" {', "    if false {")
+mutate("github-refused-path-agents-md", "an AGENTS.md may be proposed", GHS,
+       '    if last == "agents.md" {', "    if false {")
+mutate("github-refused-path-agents-dir", "a file under .agents/ may be proposed", GHS,
+       '    if segments.iter().any(|segment| segment == ".agents") {', "    if false {")
+mutate("github-refused-path-case", "a refused path written in another case may be proposed", GHS,
+       "        .map(str::to_ascii_lowercase)", "        .map(str::to_owned)")
+mutate("github-proposal-entry-unchecked", "an entry serving a proposal tool is not held to call and its permissions", GHS,
+       "        proposals::PROPOSE_CHANGE | proposals::AMEND_CHANGE => Some(proposals::PERMISSIONS),\n", "")
+# github__propose_change and github__amend_change (#12): every answer that writes nothing decided
+# from reads first, attribution from the gateway's receipts, the draft, the otto/ prefix, the
+# forward move without force, the claims fence and the marker block, and the outcome after a
+# write. github_proposals.rs, proposals.rs's, propose.rs's, amend.rs's and connector.rs's own
+# tests catch these.
+GHP = GH + "proposals.rs"
+GHPC = GH + "propose.rs"
+GHAC = GH + "amend.rs"
+mutate("github-proposal-refused-path-unchecked", "a proposal tool writes a file in a refused group", GHP,
+       "            if let Some(refused) = writes::refused_path(&file.path) {",
+       "            if let Some(refused) = writes::refused_path(&file.path).filter(|_| false) {")
+mutate("github-proposal-command-text-unchecked", "a proposal's title, body or claim Atlantis would read as a command is sent", GHP,
+       "            if writes::command_text(text) {", "            if false && writes::command_text(text) {")
+mutate("github-proposal-marker-text-unchecked", "a proposal's title, body or claim holding the marker's text is sent", GHP,
+       "            if writes::holds_marker(text) {", "            if false && writes::holds_marker(text) {")
+mutate("github-proposal-git-token-set", "the git writes' token is asked for with pull_requests: write too", GHP,
+       'pub const GIT_PERMISSIONS: &[(&str, Access)] = &[("contents", Access::Write)];',
+       'pub const GIT_PERMISSIONS: &[(&str, Access)] = &[("contents", Access::Write), ("pull_requests", Access::Write)];')
+mutate("github-proposal-pull-token-set", "the reads' and pull request's token is asked for with contents: write", GHP,
+       '    &[("contents", Access::Read), ("pull_requests", Access::Write)];',
+       '    &[("contents", Access::Write), ("pull_requests", Access::Write)];')
+mutate("github-proposal-token-not-narrowed", "a proposal tool's token is asked for with no repositories, which GitHub reads as all", GHP,
+       "            repositories: vec![repository.to_owned()],\n            permissions: permissions",
+       "            repositories: Vec::new(),\n            permissions: permissions")
+mutate("github-attribution-other-tool", "a pull request is the caller's on a receipt of github__create_pr, not github__propose_change", GHP,
+       "        let Ok(tool) = ToolName::parse(PROPOSE_CHANGE) else {",
+       '        let Ok(tool) = ToolName::parse("github__create_pr") else {')
+mutate("github-attribution-other-principal", "a pull request is the caller's on a receipt another principal of the same issuer holds", GHP,
+       "            call.call().caller.principal.get().id.clone(),",
+       '            gateway_core::PrincipalId { issuer: call.call().caller.principal.get().id.issuer.clone(), subject: gateway_core::Subject::new("someone-else") },')
+mutate("github-proposal-symlink-mode-is-file", "a path the tree says is a symbolic link is written over as a regular file", GHP,
+       '        "120000" => Kind::Symlink,', '        "120000" => Kind::File,')
+mutate("github-proposal-submodule-mode-is-file", "a path the tree says is a submodule is written over as a regular file", GHP,
+       '        "160000" => Kind::Submodule,', '        "160000" => Kind::File,')
+mutate("github-proposal-directory-path-is-file", "a path the tree says is a directory is taken for a regular file", GHP,
+       "                    (Kind::File, true) => regular = true,",
+       "                    (Kind::File | Kind::Directory, true) => regular = true,")
+mutate("github-proposal-under-non-directory", "a path under a file, link or submodule is walked as if under a directory", GHP,
+       "                    (Kind::Directory, false) => directory.clone_from(&entry.sha),",
+       "                    (_, false) => directory.clone_from(&entry.sha),")
+mutate("github-proposal-truncated-listing-accepted", "a tree listing GitHub cut short is read as whole", GHP,
+       '        if found.get("truncated").and_then(Value::as_bool) != Some(false) {',
+       "        if false {")
+mutate("github-no-change-check-removed", "files the same as the base or the head are written, as a change", GHP,
+       "            if !same_file(&found, &file.content) {", "            if true {")
+mutate("github-claims-fence-short", "a claim's fence is three backticks, which a claim holding three closes", GHP,
+       '    "`".repeat(longest.max(2) + 1)', '    "`".repeat(3)')
+mutate("github-commit-parent-wrong", "a proposal's commit names the base's tree as its parent", GHP,
+       "                    parents: [parent],", "                    parents: [base_tree],")
+mutate("github-propose-key-trailing-dot", "a key ending in \".\", which no branch name may, is taken", GHPC,
+       "        && !key.ends_with('.')\n", "")
+mutate("github-propose-branch-prefix", "a proposal's branch is the key alone, not under otto/", GHPC,
+       '        format!("{BRANCH_PREFIX}{}", self.key)', "        self.key.clone()")
+mutate("github-propose-not-a-draft", "a proposal's pull request is opened ready for review", GHPC,
+       "                    draft: true,", "                    draft: false,")
+mutate("github-propose-digest-uncompared", "a repeat under the same key with other arguments is answered already_proposed", GHPC,
+       "    } else if ArgumentDigest::of(call.arguments()) == *recorded {", "    } else if true {")
+mutate("github-propose-decline-unchecked", "a repeat after a person closed the proposal is answered as if it were open", GHPC,
+       "    } else if !open {", "    } else if false {")
+mutate("github-propose-foreign-pull-not-refused", "a pull request from the branch the gateway did not open for the caller is not refused for that", GHPC,
+       "        if let Some(number) = pulls\n            .first()",
+       "        if let Some(number) = pulls\n            .first()\n            .filter(|_| false)")
+mutate("github-propose-later-failure-reported-error", "a refusal of the branch after the git writes is an error, settling its receipt not_performed", GHPC,
+       "        if let Err(outcome) = writes\n            .send(\n                self.api(),\n                WriteMethod::Post,",
+       "        if let Err(outcome) = Writes::new()\n            .send(\n                self.api(),\n                WriteMethod::Post,")
+mutate("github-amend-without-bot-login", "an amendment with no bot login configured is sent", GHAC,
+       "        let Some(bot_login) = self.bot_login() else {",
+       '        let Some(bot_login) = self.bot_login().or(Some(super::proposals::PROPOSE_CHANGE)) else {')
+mutate("github-amend-closed-accepted", "a closed pull request is amended", GHAC,
+       '        if text("/state") != Some("open") {', "        if false {")
+mutate("github-amend-author-unchecked", "a pull request someone other than the App opened is amended", GHAC,
+       '        if text("/user/login") != Some(bot_login) {', "        if false {")
+mutate("github-amend-fork-accepted", "a pull request whose branch is in another repository is amended", GHAC,
+       "        if !same_repository {", "        if false {")
+mutate("github-amend-prefix-unchecked", "a pull request whose branch is not under otto/ is amended", GHAC,
+       "        if !branch.starts_with(BRANCH_PREFIX) {", "        if false {")
+mutate("github-amend-receipt-other-number", "an amendment takes another pull request's proposal receipt as its own", GHAC,
+       "            .proposed_for(&ready.receipts, call, &repository, number)",
+       "            .proposed_for(&ready.receipts, call, &repository, 1)")
+mutate("github-amend-ready-for-review-accepted", "a pull request a person marked ready for review is amended", GHAC,
+       '        if pull.get("draft").and_then(Value::as_bool) != Some(true) {', "        if false {")
+mutate("github-amend-marker-removal-accepted", "a pull request whose marker a person removed is amended", GHAC,
+       '            proposals::marker_block(text("/body").unwrap_or(""), &own)',
+       '            proposals::marker_block(text("/body").unwrap_or(""), &own).or(Some((Vec::new(), String::new())))')
+mutate("github-amend-marker-block-dropped", "an amendment replaces the marker block with its own line", GHAC,
+       "        markers.push(writes::marker(receipt));", "        markers = vec![writes::marker(receipt)];")
+mutate("github-amend-stale-head-accepted", "an amendment with a stale expected_head is written", GHAC,
+       "            && *expected != head\n", "            && false\n")
+mutate("github-amend-expected-head-unrequired", "a repeat amendment that changes nothing is no_change without expected_head", GHAC,
+       "                return match &parsed.expected_head {", "                return match &Some(String::new()) {")
+mutate("github-amend-forced", "an amendment forces the branch", GHAC,
+       "                    force: false,", "                    force: true,")
+mutate("github-lookup-any-author", "with a bot login, a lookup finds a copy someone else opened", GHL,
+       "                .find(|pull| opened_by(pull, self.bot_login()) && marked(pull, &marker))",
+       "                .find(|pull| marked(pull, &marker))")
+mutate("github-bot-login-unchecked", "a bot login that is not a GitHub login is taken", GHC,
+       "            && !bot_login(login)\n", "            && false\n")
 # github__pr_comment (#12): the shared command-text guard it refuses Atlantis commands with, its
 # own refusals before any request, the pull request check, its token, one post only, and the
 # lookup of its comment by the marker. crates/gateway/tests/github_comment.rs and writes.rs's and

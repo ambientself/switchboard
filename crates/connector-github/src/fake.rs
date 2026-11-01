@@ -31,10 +31,12 @@
 //! late (see [`Mode`]). Every error it answers carries the token it was sent in its body, as a
 //! careless vendor might, so a test can show that nothing the caller reads holds it.
 //!
-//! For the write tools it opens pull requests, lists them, and answers comparisons, and a write
-//! can be given a fault of its own ([`Fault`]); see `writes`. It posts comments on pull requests
-//! and lists a repository's comments, for the comment tool and its lookup; see `comments`. It
-//! records each request's body beside its token.
+//! For the write tools it opens, lists and changes pull requests, and answers comparisons, and a
+//! write can be given a fault of its own ([`Fault`]); see `writes`. For the proposal tools it
+//! keeps a repository's git data: its branches, commits, trees and blobs, and each file's
+//! contents at a commit; see `git`. It posts comments on pull requests and lists a repository's
+//! comments, for the comment tool and its lookup; see `comments`. It records each request's body
+//! beside its token.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -54,9 +56,11 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 mod comments;
+mod git;
 mod reads;
 mod writes;
 
+pub use git::Special;
 pub use reads::{FakeLogHost, LogHit};
 pub use writes::Fault;
 
@@ -108,6 +112,7 @@ struct Shared {
     reads: Mutex<reads::Content>,
     writes: Mutex<writes::Content>,
     comments: Mutex<comments::Content>,
+    git: Mutex<git::Content>,
     /// Whether to stop taking connections once the next comparison is answered.
     close_after_compare: AtomicBool,
     /// Stops the server taking connections.
@@ -143,6 +148,7 @@ impl FakeRest {
             reads: Mutex::new(reads::Content::default()),
             writes: Mutex::new(writes::Content::default()),
             comments: Mutex::new(comments::Content::default()),
+            git: Mutex::new(git::Content::default()),
             close_after_compare: AtomicBool::new(false),
             close: Notify::new(),
         });
@@ -372,6 +378,12 @@ async fn answer(
             token.as_deref(),
         );
     };
+    // The git data of a repository given some (`git`).
+    if let Some(response) =
+        git::answer(&shared, &issued, &method, &uri, token.as_deref(), &body).await
+    {
+        return response;
+    }
     // The comment tool's endpoints and its lookup's (`comments`).
     if let Some(response) =
         comments::answer(&shared, &issued, &method, &uri, token.as_deref(), &body).await

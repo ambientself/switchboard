@@ -158,16 +158,7 @@ pub(crate) fn parse(arguments: &Value) -> Result<CreatePr, String> {
         ));
     }
     let (owner, repo) = tools::owner_repo(arguments)?;
-    let title = tools::required(arguments, "title")?;
-    if title.trim().is_empty() {
-        return Err("title must not be empty".into());
-    }
-    if title.chars().count() > MAX_TITLE_CHARS {
-        return Err(format!("title is longer than {MAX_TITLE_CHARS} characters"));
-    }
-    if title.chars().any(char::is_control) {
-        return Err("title contains a control character".into());
-    }
+    let title = title(arguments)?;
     let head = tools::required(arguments, "head")?;
     branch(&head, "head")?;
     let base = tools::required(arguments, "base")?;
@@ -183,12 +174,28 @@ pub(crate) fn parse(arguments: &Value) -> Result<CreatePr, String> {
     })
 }
 
+/// The argument `title`: required, not empty, at most [`MAX_TITLE_CHARS`] characters, with no
+/// control character. Every proposal tool's title is held to it.
+pub(crate) fn title(arguments: &Map<String, Value>) -> Result<String, String> {
+    let title = tools::required(arguments, "title")?;
+    if title.trim().is_empty() {
+        return Err("title must not be empty".into());
+    }
+    if title.chars().count() > MAX_TITLE_CHARS {
+        return Err(format!("title is longer than {MAX_TITLE_CHARS} characters"));
+    }
+    if title.chars().any(char::is_control) {
+        return Err("title contains a control character".into());
+    }
+    Ok(title)
+}
+
 /// Refuses `value`, the argument `name`, unless it is a git branch name: 1 to
 /// [`MAX_BRANCH_BYTES`] bytes, with no control character, whitespace, `:`, `~`, `^`, `?`, `*`,
 /// `[` or `\`, no `..` or `@{`, not `@`, not beginning with `-`, with no empty segment, no
 /// segment beginning with `.` or ending with `.lock`, and not ending with `.` or `/`. Git's own
 /// rules, with whitespace refused beside the space.
-fn branch(value: &str, name: &str) -> Result<(), String> {
+pub(crate) fn branch(value: &str, name: &str) -> Result<(), String> {
     let refused = |why: &str| {
         Err(format!(
             "{name} {:?} is not a git branch name: {why}",
@@ -243,7 +250,7 @@ fn with_marker(body: &str, marker: &str) -> Result<String, String> {
 }
 
 /// `branch` for a path: each segment percent-encoded, the slashes kept.
-fn branch_path(branch: &str) -> String {
+pub(crate) fn branch_path(branch: &str) -> String {
     branch
         .split('/')
         .map(tools::encoded)

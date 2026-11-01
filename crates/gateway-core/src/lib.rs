@@ -61,8 +61,9 @@ pub use principal::{
 };
 pub use proof::{Claimed, Provable, Proved, Verifier, WasProved};
 pub use receipt::{
-    ArgumentDigest, DelegationKeyScope, IdempotencyKey, InvalidIdempotencyKey, KeyScope,
-    MAX_IDEMPOTENCY_KEY, Receipt, ReceiptState, Reuse, VendorReference,
+    ArgumentDigest, AttributionQuery, DelegationKeyScope, IdempotencyKey, InvalidIdempotencyKey,
+    KeyScope, MAX_IDEMPOTENCY_KEY, Receipt, ReceiptAttribution, ReceiptState, Reuse,
+    VendorReference,
 };
 pub use reconcile::{
     LeaseHolder, Lookup, LookupAnswer, LookupRecord, LookupRequest, ReceiptQueue, Recorded,

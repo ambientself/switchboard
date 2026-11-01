@@ -34,8 +34,9 @@ use deadpool_postgres::Object;
 use gateway_core::audit::{AuditRowId, StoreError};
 use gateway_core::receipt::EstablishedBy;
 use gateway_core::{
-    ArgumentDigest, BoxFuture, IdempotencyKey, LeaseHolder, LookupAnswer, LookupRecord, Receipt,
-    ReceiptQueue, ReceiptState, Recorded, Resource, TeamId, ToolName, ToolUseId, VendorReference,
+    ArgumentDigest, AttributionQuery, BoxFuture, IdempotencyKey, LeaseHolder, LookupAnswer,
+    LookupRecord, Receipt, ReceiptAttribution, ReceiptQueue, ReceiptState, Recorded, Resource,
+    TeamId, ToolName, ToolUseId, VendorReference,
 };
 use serde_json::{Value, json};
 use tokio::time::{Instant, timeout_at};
@@ -166,6 +167,20 @@ pub(crate) const HAND_OFF_HELD: &str = concat!(
      WHERE r.row_id = ($1::text)::uuid AND c.id = r.row_id AND r.lease_holder = $2
          AND r.lease_until > clock_timestamp() AND r.handed_to_person_at IS NULL AND ",
     reads_as_unknown!()
+);
+
+/// The receipt that answers an attribution query (decision 0011, section 6): `completed`, for
+/// the issuer `$1` and subject `$2`, of the tool `$3`, in the target `$4`, `$5`, `$6`, with the
+/// reference `$7`, each compared exactly; the first reserved, if more than one does.
+pub(crate) const ATTRIBUTED: &str = concat!(
+    "SELECT ",
+    receipt_columns!(),
+    " FROM switchboard_audit.receipts r
+     WHERE r.reference = $7 AND r.state = 'completed'
+         AND r.principal_issuer = $1 AND r.principal_subject = $2 AND r.tool = $3
+         AND r.target_system = $4 AND r.target_kind = $5 AND r.target_identifier = $6
+     ORDER BY r.reserved_at, r.row_id
+     LIMIT 1"
 );
 
 /// The error for a column that holds `what` in a form the store does not write.
@@ -448,6 +463,39 @@ impl ReceiptQueue for PgAuditStore {
                     0 => Err(PgAuditError::LeaseNotHeld { row: id.clone() }),
                     _ => Ok(()),
                 }
+            })
+            .await
+            .map_err(StoreError::from)
+        })
+    }
+}
+
+/// The attribution read, on the open-row query's pool as reconciliation is, with its 2 s. It
+/// reads only.
+impl ReceiptAttribution for PgAuditStore {
+    fn completed<'a>(
+        &'a self,
+        query: &'a AttributionQuery,
+    ) -> BoxFuture<'a, Result<Option<Receipt>, StoreError>> {
+        Box::pin(async move {
+            let principal = query.principal();
+            let target = query.target();
+            self.apart(async |client: &mut Object| {
+                let found = client
+                    .query(
+                        ATTRIBUTED,
+                        &[
+                            &principal.issuer.as_str(),
+                            &principal.subject.as_str(),
+                            &query.tool().as_str(),
+                            &target.system,
+                            &target.kind,
+                            &target.identifier,
+                            &query.reference().as_str(),
+                        ],
+                    )
+                    .await?;
+                Ok(with_lookups(client, found).await?.pop())
             })
             .await
             .map_err(StoreError::from)

@@ -80,14 +80,14 @@ use gateway_core::audit::{
 };
 use gateway_core::receipt::EstablishedBy;
 use gateway_core::{
-    ArgumentDigest, AuditGuard, AuditRecord, AuditStore, BoxFuture, CallContext, CallerContext,
-    Claimed, Classification, Connector, CredentialIdentity, CredentialMode, Currency,
-    CurrencyAnswer, Decision, Delegation, DelegationDigest, DelegationFailure, DelegationKeyScope,
-    Egress, ExceptionName, IdempotencyKey, Issuer, KeyScope, LeaseHolder, LookupAnswer,
-    MAX_IDEMPOTENCY_KEY, PodUid, PolicySnapshot, PresentedDelegation, Principal, PrincipalKind,
-    Proved, Reason, ReasonKind, Receipt, ReceiptQueue, ReceiptState, Recorded, RequestedTool,
-    Resource, Resources, Reuse, Subject, TeamId, ToolCall, ToolOutcome, ToolUseId,
-    UnverifiedDelegation, VendorReference, Verifier, WasProved, decide,
+    ArgumentDigest, AttributionQuery, AuditGuard, AuditRecord, AuditStore, BoxFuture, CallContext,
+    CallerContext, Claimed, Classification, Connector, CredentialIdentity, CredentialMode,
+    Currency, CurrencyAnswer, Decision, Delegation, DelegationDigest, DelegationFailure,
+    DelegationKeyScope, Egress, ExceptionName, IdempotencyKey, Issuer, KeyScope, LeaseHolder,
+    LookupAnswer, MAX_IDEMPOTENCY_KEY, PodUid, PolicySnapshot, PresentedDelegation, Principal,
+    PrincipalKind, Proved, Reason, ReasonKind, Receipt, ReceiptAttribution, ReceiptQueue,
+    ReceiptState, Recorded, RequestedTool, Resource, Resources, Reuse, Subject, TeamId, ToolCall,
+    ToolOutcome, ToolUseId, UnverifiedDelegation, VendorReference, Verifier, WasProved, decide,
 };
 use serde_json::{Value, json};
 
@@ -142,6 +142,10 @@ pub trait ContractStore {
 
     /// The store's queue of `unknown` receipts. For item 7's functions only.
     fn queue(&self) -> &dyn ReceiptQueue;
+
+    /// The store's read of the receipts it settled `completed`, by principal, tool, target and
+    /// reference. For the attribution function only.
+    fn attribution(&self) -> &dyn ReceiptAttribution;
 
     /// Ends the lease on the receipt reserved under `row` now, as if its time had passed: the
     /// in-memory store's clock moves past it, and Postgres's lease is set to have ended. For
@@ -3865,4 +3869,227 @@ pub async fn a_receipt_held_for_its_call_is_not_due_and_no_one_else_claims_it(
             .await
             .expect("the hold failed")
     );
+}
+
+// --- Attribution (decision 0011, section 6) ------------------------------------------------
+
+/// A second document team A may reach under [`attribution_policy`].
+const OTHER_TEAM_A_DOCUMENT: &str = "team-a-other-notes";
+
+/// The fixture policy with the draft tool settled by a lookup, as for item 7, and with what the
+/// attribution function needs besides: the write tool classified `propose` and settled the
+/// same way, so team A has a second tool that keeps receipts; team B's profile may propose;
+/// team B may reach team A's document; and team A may reach a second document.
+fn attribution_policy() -> Value {
+    let mut data = policy_data_with_draft_lookup();
+    for tool in data["tools"]
+        .as_array_mut()
+        .expect("the policy lists tools")
+    {
+        if tool["name"] == WRITE_TOOL {
+            tool["classification"] = json!("propose");
+            tool["settlement"] = crate::fixture::draft_lookup();
+        }
+    }
+    for profile in data["profiles"]
+        .as_array_mut()
+        .expect("the policy lists profiles")
+    {
+        if profile["name"] == crate::fixture::PROFILE_TEAM_B {
+            profile["classifications"] = json!(["read", "propose"]);
+        }
+    }
+    data["limits"]["teams"][crate::fixture::TEAM_B] =
+        json!([document(TEAM_B_DOCUMENT), document(TEAM_A_DOCUMENT)]);
+    data["limits"]["teams"][TEAM_A] =
+        json!([document(TEAM_A_DOCUMENT), document(OTHER_TEAM_A_DOCUMENT)]);
+    data
+}
+
+/// A call by `caller` of `tool` on `document`, begun under a fresh key, whose connector
+/// reported `outcome`, finished within its deadline: the row that reserved its receipt.
+async fn finished_proposal(
+    contract: &impl ContractStore,
+    fixture: &Fixture,
+    caller: Caller,
+    tool: &str,
+    document: &str,
+    outcome: ToolOutcome,
+) -> AuditRowId {
+    let store = contract.store();
+    let arguments = json!({ DOCUMENT_ARGUMENT: document, "text": "p" });
+    let key = fresh_key();
+    let context = CallContext {
+        caller: fixture
+            .caller_context(caller, SURFACE_ALL)
+            .expect("the fixture knows the caller"),
+        tool: RequestedTool::new(tool),
+        resources: FixtureConnector::resources_of(tool, &arguments),
+        key: gateway_core::CallKey::Valid(key.clone()),
+        currency: gateway_core::Currency::NotAsked,
+    };
+    let start = row_start();
+    let decision = decide(&fixture.policy, &context);
+    let guard = match begin_keyed(store, &start, decision, &arguments, Some(key.as_str())).await {
+        Ok(Begun::Allowed(guard)) => guard,
+        other => panic!("{caller:?}'s call of {tool} was not begun as allowed: {other:?}"),
+    };
+    let ran = audit::run(&Answering::with(outcome), guard).await;
+    let finished = audit::finish(store, ran, 1).await;
+    assert!(finished.failure().is_none(), "{:?}", finished.failure());
+    start.row
+}
+
+/// The row of the receipt that answers `caller`'s query for `tool` in `document` with
+/// `reference`, as the store's attribution read finds it, or `None`.
+async fn attributed(
+    contract: &impl ContractStore,
+    fixture: &Fixture,
+    caller: Caller,
+    tool: &str,
+    document: &str,
+    reference: &str,
+) -> Option<AuditRowId> {
+    let principal = fixture
+        .principal(caller)
+        .expect("the fixture knows the caller");
+    let query = AttributionQuery::new(
+        principal.get().id.clone(),
+        tool.parse().expect("a valid tool name"),
+        crate::connector::document(document),
+        &VendorReference::new(reference),
+    );
+    contract
+        .attribution()
+        .completed(&query)
+        .await
+        .expect("the attribution read failed")
+        .map(|receipt| receipt.row)
+}
+
+/// A connector that changes only what the gateway made for the same principal reads it from
+/// the gateway's receipts (decision 0011, section 6). The store answers with a `completed`
+/// receipt of the tool, for the principal's issuer and subject, in the target, with the
+/// reference, the first reserved; one settled `completed` by reconciliation counts as one
+/// settled by its call. It never answers with another principal's receipt, another tool's,
+/// another target's or another reference's, nor with one that is `unknown`, `not_performed`,
+/// or `completed` with no reference.
+pub async fn an_attribution_read_finds_only_the_principals_completed_receipt_of_its_tool_target_and_reference(
+    contract: &impl ContractStore,
+) {
+    use Caller::{TeamA, TeamB};
+    let mut fixture = fixture();
+    fixture.policy =
+        serde_json::from_value(attribution_policy()).expect("the attribution policy loads");
+    let fixture = &fixture;
+    let completed = |reference: &str| {
+        ToolOutcome::Completed(json!({"draft": reference}), VendorReference::new(reference))
+    };
+    let draft = DRAFT_TOOL;
+    let ours = TEAM_A_DOCUMENT;
+    let first = finished_proposal(contract, fixture, TeamA, draft, ours, completed("d-1")).await;
+    // The same reference again, reserved later: the first reserved answers.
+    finished_proposal(contract, fixture, TeamA, draft, ours, completed("d-1")).await;
+    assert_eq!(
+        attributed(contract, fixture, TeamA, draft, ours, "d-1").await,
+        Some(first)
+    );
+    // Another reference, another target, another tool, another principal.
+    assert_eq!(
+        attributed(contract, fixture, TeamA, draft, ours, "d-10").await,
+        None
+    );
+    assert_eq!(
+        attributed(
+            contract,
+            fixture,
+            TeamA,
+            draft,
+            OTHER_TEAM_A_DOCUMENT,
+            "d-1"
+        )
+        .await,
+        None
+    );
+    assert_eq!(
+        attributed(contract, fixture, TeamA, WRITE_TOOL, ours, "d-1").await,
+        None
+    );
+    assert_eq!(
+        attributed(contract, fixture, TeamB, draft, ours, "d-1").await,
+        None,
+        "another principal's receipt was answered"
+    );
+
+    // Team B's own, in team A's document: its own, and not team A's.
+    let team_bs = finished_proposal(contract, fixture, TeamB, draft, ours, completed("d-2")).await;
+    assert_eq!(
+        attributed(contract, fixture, TeamB, draft, ours, "d-2").await,
+        Some(team_bs)
+    );
+    assert_eq!(
+        attributed(contract, fixture, TeamA, draft, ours, "d-2").await,
+        None
+    );
+
+    // Another tool's, and another target's.
+    let written =
+        finished_proposal(contract, fixture, TeamA, WRITE_TOOL, ours, completed("d-3")).await;
+    assert_eq!(
+        attributed(contract, fixture, TeamA, WRITE_TOOL, ours, "d-3").await,
+        Some(written)
+    );
+    assert_eq!(
+        attributed(contract, fixture, TeamA, draft, ours, "d-3").await,
+        None
+    );
+    let other = OTHER_TEAM_A_DOCUMENT;
+    let elsewhere =
+        finished_proposal(contract, fixture, TeamA, draft, other, completed("d-4")).await;
+    assert_eq!(
+        attributed(contract, fixture, TeamA, draft, other, "d-4").await,
+        Some(elsewhere)
+    );
+    assert_eq!(
+        attributed(contract, fixture, TeamA, draft, ours, "d-4").await,
+        None
+    );
+
+    // An `unknown` receipt is not answered; once reconciliation finds what it made, it is.
+    let unknown =
+        finished_proposal(contract, fixture, TeamA, draft, ours, ToolOutcome::Unknown).await;
+    assert_eq!(
+        attributed(contract, fixture, TeamA, draft, ours, "d-5").await,
+        None
+    );
+    // Its row's deadline passes, so it is due.
+    contract.pass_deadline(&unknown).await;
+    let holder = holder("attribution");
+    claimed(contract, &unknown, &holder).await;
+    let found = LookupAnswer::Found {
+        reference: VendorReference::new("d-5"),
+    };
+    assert_eq!(
+        recorded(contract, &unknown, &holder, found, ATTEMPTS).await,
+        Recorded::Settled(ReceiptState::Completed)
+    );
+    assert_eq!(
+        attributed(contract, fixture, TeamA, draft, ours, "d-5").await,
+        Some(unknown)
+    );
+
+    // A receipt settled `not_performed`, and one `completed` with no reference, record no
+    // reference, so they answer no query.
+    for outcome in [
+        ToolOutcome::error(ErrorKind::VendorRefusal, "The vendor said no."),
+        ToolOutcome::Refused("The connector refused.".into()),
+        ToolOutcome::Ok(json!({"draft": "none"})),
+    ] {
+        let row = finished_proposal(contract, fixture, TeamA, draft, ours, outcome.clone()).await;
+        assert_eq!(
+            receipt_under(contract, &row).await.reference,
+            None,
+            "{outcome:?}"
+        );
+    }
 }

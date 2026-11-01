@@ -145,7 +145,7 @@ async fn migrating_again_applies_nothing() {
         .collect();
     assert_eq!(
         recorded,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
 }
 
@@ -187,7 +187,7 @@ async fn two_migrators_at_once_take_turns() {
         applied.sort_unstable();
         assert_eq!(
             applied,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
             "each migration is applied once"
         );
     }
@@ -1010,7 +1010,7 @@ async fn the_deadline_migration_keeps_the_rows_already_written() {
 
     assert_eq!(
         migrate(&mut owner).await.unwrap(),
-        vec![3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        vec![3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
     for (id, due) in [
         (&open, "begun_at"),
@@ -1658,7 +1658,7 @@ async fn the_error_kind_migration_marks_the_errors_already_written() {
 
     assert_eq!(
         migrate(&mut owner).await.unwrap(),
-        vec![6, 7, 8, 9, 10, 11, 12, 13, 14]
+        vec![6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
     assert_eq!(rows_without_error_kind(&owner).await, before);
     for (id, kind) in [
@@ -1881,7 +1881,7 @@ async fn the_reach_and_credential_migration_keeps_the_rows_already_written() {
 
     assert_eq!(
         migrate(&mut owner).await.unwrap(),
-        vec![7, 8, 9, 10, 11, 12, 13, 14]
+        vec![7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
     for (id, resources) in [&named, &unknown, &listed].into_iter().zip(before) {
         let row = owner.query_one(&read(id), &[]).await.unwrap();
@@ -2292,7 +2292,10 @@ async fn the_delegation_migration_keeps_the_rows_already_written() {
         before.push(row.get::<_, serde_json::Value>(0));
     }
 
-    assert_eq!(migrate(&mut owner).await.unwrap(), vec![10, 11, 12, 13, 14]);
+    assert_eq!(
+        migrate(&mut owner).await.unwrap(),
+        vec![10, 11, 12, 13, 14, 15]
+    );
     for (id, before) in rows.iter().zip(before) {
         let row = owner.query_one(&compared, &[id]).await.unwrap();
         assert_eq!(row.get::<_, serde_json::Value>(0), before, "{id}");

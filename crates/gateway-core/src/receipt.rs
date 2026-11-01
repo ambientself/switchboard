@@ -27,8 +27,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
-use crate::audit::{AuditRowId, Completion, Outcome, RecordedResources};
+use crate::audit::{AuditRowId, Completion, Outcome, RecordedResources, StoreError};
 use crate::canonical::canonical;
+use crate::connector::BoxFuture;
 use crate::names::{Person, TeamId, ToolName, ToolUseId};
 use crate::policy::Resource;
 use crate::principal::PrincipalId;
@@ -605,6 +606,81 @@ pub enum Reservation {
     Reused(Reuse),
 }
 
+/// What [`ReceiptAttribution::completed`] looks for: a receipt the gateway settled
+/// `completed`, of one tool, for one principal, in one vendor target, with one vendor
+/// reference. It is how a connector tells that the gateway made something for the caller
+/// before it changes it (decision 0011, section 6: "the gateway created it for the same
+/// principal: from the gateway's receipts").
+///
+/// The same principal is the same issuer and subject. A delegation's fields are not compared:
+/// a later turn of the same principal may change what an earlier one made.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttributionQuery {
+    principal: PrincipalId,
+    tool: ToolName,
+    target: Resource,
+    reference: VendorReference,
+}
+
+impl AttributionQuery {
+    /// A query for `principal`'s completed receipts of `tool` in `target` that recorded
+    /// `reference`, compared as a receipt records it: made safe and capped.
+    pub fn new(
+        principal: PrincipalId,
+        tool: ToolName,
+        target: Resource,
+        reference: &VendorReference,
+    ) -> Self {
+        Self {
+            principal,
+            tool,
+            target,
+            reference: reference.recorded(),
+        }
+    }
+
+    /// The principal: its issuer and subject.
+    pub fn principal(&self) -> &PrincipalId {
+        &self.principal
+    }
+
+    /// The tool.
+    pub fn tool(&self) -> &ToolName {
+        &self.tool
+    }
+
+    /// The vendor target.
+    pub fn target(&self) -> &Resource {
+        &self.target
+    }
+
+    /// The vendor reference, as a receipt records it.
+    pub fn reference(&self) -> &VendorReference {
+        &self.reference
+    }
+
+    /// Whether `receipt` answers the query: `completed`, for the same issuer and subject, of
+    /// the same tool, with the same target and the same reference, each compared exactly.
+    pub fn matches(&self, receipt: &Receipt) -> bool {
+        receipt.state == ReceiptState::Completed
+            && receipt.scope.principal == self.principal
+            && receipt.tool == self.tool
+            && receipt.target.as_ref() == Some(&self.target)
+            && receipt.reference.as_ref() == Some(&self.reference)
+    }
+}
+
+/// A store's read of the receipts it holds, for a connector that changes only what the
+/// gateway made for the same principal ([`AttributionQuery`]). Reads only.
+pub trait ReceiptAttribution: Send + Sync {
+    /// The receipt that answers `query` ([`AttributionQuery::matches`]), the one reserved
+    /// first if more than one does; `None` when none does.
+    fn completed<'a>(
+        &'a self,
+        query: &'a AttributionQuery,
+    ) -> BoxFuture<'a, Result<Option<Receipt>, StoreError>>;
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -831,6 +907,57 @@ mod tests {
             (RecordedResources::Named(Vec::new()), 0),
             None,
         )
+    }
+
+    /// An attribution query answers only a `completed` receipt of its own issuer and subject,
+    /// tool, target and reference, each compared exactly, whatever the delegation.
+    #[test]
+    fn an_attribution_query_matches_only_its_own_completed_receipt() {
+        let repository = Resource {
+            system: "github".into(),
+            kind: "repository".into(),
+            identifier: "example-org/atlas".into(),
+        };
+        let mut receipt = request(Some("toolu-1"), "github__propose_change", json!({}))
+            .reserve(&AuditRowId::new("row-1"));
+        receipt.state = ReceiptState::Completed;
+        receipt.target = Some(repository.clone());
+        receipt.reference = Some(VendorReference::new("pull/7"));
+        let query = AttributionQuery::new(
+            receipt.scope.principal.clone(),
+            receipt.tool.clone(),
+            repository.clone(),
+            &VendorReference::new("pull/7"),
+        );
+        assert!(query.matches(&receipt));
+        let mut delegated = receipt.clone();
+        delegated.scope.delegation = Some(DelegationKeyScope::new("turn-2"));
+        assert!(query.matches(&delegated));
+        let changes: [fn(&mut Receipt); 9] = [
+            |receipt| receipt.state = ReceiptState::Unknown,
+            |receipt| receipt.state = ReceiptState::Pending,
+            |receipt| receipt.state = ReceiptState::NotPerformed,
+            |receipt| receipt.scope.principal.issuer = "https://other.example.test".into(),
+            |receipt| receipt.scope.principal.subject = "other".into(),
+            |receipt| receipt.tool = ToolName::parse("github__amend_change").unwrap(),
+            |receipt| receipt.target = None,
+            |receipt| {
+                receipt.target = Some(Resource {
+                    system: "github".into(),
+                    kind: "repository".into(),
+                    identifier: "example-org/borealis".into(),
+                });
+            },
+            |receipt| receipt.reference = Some(VendorReference::new("pull/70")),
+        ];
+        for (at, change) in changes.into_iter().enumerate() {
+            let mut other = receipt.clone();
+            change(&mut other);
+            assert!(!query.matches(&other), "change {at}");
+        }
+        let mut unreferenced = receipt;
+        unreferenced.reference = None;
+        assert!(!query.matches(&unreferenced));
     }
 
     /// Each receipt state against each line of the reuse table, and the first line that
