@@ -1396,11 +1396,14 @@ delete or on update is `CASCADE`, `SET NULL` or `SET DEFAULT` and that table's o
 able as a definer function's owner does, or can run such a function, whatever the table has: a
 bare cascading key with no trigger, rule, check or default of its own is refused too. A
 partitioned table's key is judged by the partitioned table's owner, not by the owners of the
-partitions' copies. A foreign key that references the audit table passes: its action runs only
-when an audit row is deleted or its key changes, which the gateway's role cannot do. The
-migrations' trigger functions are in `plpgsql`, which is trusted, and are not
-`SECURITY DEFINER`, and the migrations make no foreign key with an action, so a database they
-built passes.
+partitions' copies. A foreign key that references the audit table passes on its action on
+delete, which runs only when an audit row is deleted, which the gateway's role cannot do. Its
+action on update is judged like any other: the completion of a row begun with unknown resources
+changes `resources` and `resources_omitted` from values with no NULL in them, so an action on a
+key that holds either runs when the gateway completes a row, and fires the referencing table's
+triggers as that table's owner. The migrations' trigger functions are in `plpgsql`, which is
+trusted, and are not `SECURITY DEFINER`, and the migrations make no foreign key with an action,
+so a database they built passes.
 
 The receipt table is held to the same (#203). A rule on `switchboard_audit.receipts`, a foreign
 key on it whose action writes it, a grant on a view or rule that reaches it or owning one
@@ -1409,8 +1412,10 @@ outside the schema, a definer function whose owner can read or change it or owns
 gateway's role delete or rewrite a receipt, which its column grants and `receipt_moves`
 withhold; each is refused as it is for `call_rows`. So is a rule on
 `switchboard_audit.receipt_lookups`, which the gateway appends to: its statements would run as
-the table's owner. A foreign key that references `receipts` is judged like any other: unlike
-one that references `call_rows`, it is not passed.
+the table's owner. A foreign key that references `receipts` is judged like any other, on delete
+as on update: unlike one that references `call_rows`, its action on delete is not passed. Both
+tables must stand alone, as `call_rows` must: `receipt_moves` does not fire on a delete, so a
+delete through a parent elsewhere, under the parent's grants, would remove receipts.
 
 This has an operational cost. In a database shared with other applications, a cascading
 foreign key on a table owned by a superuser, or by any role that can reach the audit tables,

@@ -2402,8 +2402,8 @@ async fn fired_in(session: &tokio_postgres::Client) -> String {
 /// updated the row it references, as a rule's statements run as their table's owner. So a
 /// foreign key on `call_rows` with a `CASCADE`, `SET NULL` or `SET DEFAULT` action, on delete
 /// or on update, is refused. `NO ACTION` and `RESTRICT` only refuse a write, and pass; so does
-/// any action of a foreign key on another table that references `call_rows`, which writes only
-/// that table.
+/// the action on delete of a foreign key on another table that references `call_rows`, which
+/// the gateway, holding no DELETE, cannot set off. Its action on update is the cascade check's.
 #[tokio::test]
 async fn a_foreign_key_on_the_table_whose_action_writes_it_is_refused() {
     let Some(db) = TestDatabase::create().await else {
@@ -2458,8 +2458,8 @@ async fn a_foreign_key_on_the_table_whose_action_writes_it_is_refused() {
         .unwrap();
     assert_eq!(rows(&db).await, 0);
 
-    // Foreign keys that only refuse a write pass, as does a cascade from call_rows to another
-    // table.
+    // Foreign keys that only refuse a write pass, as does a cascade on delete from call_rows to
+    // another table.
     admin
         .batch_execute(&format!(
             "SET ROLE {OWNER_ROLE};
@@ -2472,7 +2472,7 @@ async fn a_foreign_key_on_the_table_whose_action_writes_it_is_refused() {
                      ON DELETE NO ACTION ON UPDATE NO ACTION;
              CREATE TABLE reports.notes (
                  call uuid REFERENCES switchboard_audit.call_rows
-                     ON DELETE CASCADE ON UPDATE SET NULL
+                     ON DELETE CASCADE ON UPDATE NO ACTION
              );
              RESET ROLE;"
         ))
@@ -3863,4 +3863,163 @@ async fn a_rule_on_the_lookup_table_is_refused() {
         .await
         .unwrap();
     assert_eq!(receipts(&db).await, 0);
+}
+
+/// The completion of a row begun with unknown resources changes `resources` and
+/// `resources_omitted` from values with no NULL in them (migration 0011). So a foreign key on
+/// another table that references a key holding them, with an action on update, runs that action
+/// when the gateway completes the row, as the referencing table's owner, and fires that table's
+/// triggers as that owner: here a plain trigger deletes every receipt. A foreign key that
+/// references `call_rows` passes on its action on delete, which the gateway cannot set off, but
+/// its action on update is refused when the table's owner can change a receipt.
+#[tokio::test]
+async fn a_foreign_keys_action_on_update_of_the_resources_a_completion_writes_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let deleter = db.new_role("NOLOGIN", &[]).await;
+    let admin = db.admin().await;
+    let row = fresh_id(&admin).await;
+    admin
+        .batch_execute(&format!(
+            "CREATE SCHEMA reports AUTHORIZATION {OWNER_ROLE};
+             GRANT USAGE ON SCHEMA reports TO PUBLIC;
+             GRANT CREATE ON SCHEMA reports TO {deleter};
+             SET ROLE {OWNER_ROLE};
+             GRANT USAGE ON SCHEMA switchboard_audit TO {deleter};
+             GRANT DELETE ON switchboard_audit.receipts TO {deleter};
+             ALTER TABLE switchboard_audit.call_rows ADD CONSTRAINT reached UNIQUE (id, resources);
+             GRANT REFERENCES (id, resources) ON switchboard_audit.call_rows TO {deleter};
+             INSERT INTO switchboard_audit.call_rows (
+                 id, deployment, surface, profile, tool, connector, classification, resources,
+                 resources_omitted, decision, policy_revision, proved_issuer, proved_subject,
+                 proved_kind, proved_team, instance, kind, allowance_ms)
+             VALUES ('{row}', 'fixture', 'fixture-all', 'workload-rw', 'fixture__read',
+                     'fixture', 'read', '\"unknown\"', 0, 'allow', 'fixture-1',
+                     'https://issuer.fixture.test', 'secret-subject', 'workload', 'team-a',
+                     'fixture-instance', 'call', 37000);
+             SET ROLE {deleter};
+             CREATE TABLE reports.reached (
+                 call uuid,
+                 resources jsonb,
+                 CONSTRAINT follow FOREIGN KEY (call, resources)
+                     REFERENCES switchboard_audit.call_rows (id, resources) ON UPDATE CASCADE
+             );
+             CREATE FUNCTION reports.on_reached() RETURNS trigger
+                 LANGUAGE plpgsql
+                 AS $$BEGIN DELETE FROM switchboard_audit.receipts; RETURN NEW; END$$;
+             CREATE TRIGGER on_reached BEFORE UPDATE ON reports.reached
+                 FOR EACH ROW EXECUTE FUNCTION reports.on_reached();
+             INSERT INTO reports.reached VALUES ('{row}', '\"unknown\"');
+             RESET ROLE;"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems_of(&db).await,
+        vec![Problem::CascadeAction {
+            table: "reports.reached".into(),
+            owner: deleter.clone(),
+            constraint: "follow".into(),
+            referenced: "switchboard_audit.call_rows".into(),
+        }]
+    );
+
+    // What the check refuses is real: the gateway's completion writes what the call reached,
+    // and every receipt is gone.
+    a_receipt(&db).await;
+    let completed = db
+        .connect_as(GATEWAY_ROLE)
+        .await
+        .execute(
+            &format!(
+                "UPDATE switchboard_audit.call_rows
+                 SET outcome = 'ok', resources = '[]', resources_omitted = 0, latency_ms = 1
+                 WHERE id = '{row}' AND outcome IS NULL"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed, 1);
+    assert_eq!(receipts(&db).await, 0);
+
+    // The same key acting only on delete passes: the gateway may not delete an audit row.
+    admin
+        .batch_execute(
+            "ALTER TABLE reports.reached
+                 DROP CONSTRAINT follow,
+                 ADD CONSTRAINT follow FOREIGN KEY (call, resources)
+                     REFERENCES switchboard_audit.call_rows (id, resources) ON DELETE CASCADE",
+        )
+        .await
+        .unwrap();
+    db.store(PoolSizes::default())
+        .check_at_boot()
+        .await
+        .unwrap();
+}
+
+/// A delete through a parent reaches its children's rows under the parent's grants, and
+/// `receipt_moves` does not fire on a delete. So a receipt table that inherits from a table
+/// elsewhere, on which the gateway holds DELETE, lets the gateway delete receipts. The receipt
+/// and lookup tables must stand alone, as `call_rows` must.
+#[tokio::test]
+async fn a_receipt_or_lookup_table_that_inherits_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let admin = db.admin().await;
+    admin
+        .batch_execute(&format!(
+            "CREATE SCHEMA reports AUTHORIZATION {OWNER_ROLE};
+             SET ROLE {OWNER_ROLE};
+             CREATE TABLE reports.parent (LIKE switchboard_audit.receipts);
+             ALTER TABLE switchboard_audit.receipts INHERIT reports.parent;
+             GRANT USAGE ON SCHEMA reports TO {GATEWAY_ROLE};
+             GRANT SELECT, DELETE ON reports.parent TO {GATEWAY_ROLE};
+             RESET ROLE;"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems_of(&db).await,
+        vec![inheritance("switchboard_audit.receipts", "reports.parent")]
+    );
+
+    // What the check refuses is real: a delete through the parent removes the receipt.
+    a_receipt(&db).await;
+    assert_eq!(receipts(&db).await, 1);
+    db.connect_as(GATEWAY_ROLE)
+        .await
+        .batch_execute("DELETE FROM reports.parent")
+        .await
+        .unwrap();
+    assert_eq!(receipts(&db).await, 0);
+
+    admin
+        .batch_execute("ALTER TABLE switchboard_audit.receipts NO INHERIT reports.parent")
+        .await
+        .unwrap();
+    db.store(PoolSizes::default())
+        .check_at_boot()
+        .await
+        .unwrap();
+
+    admin
+        .batch_execute(&format!(
+            "SET ROLE {OWNER_ROLE};
+             CREATE TABLE reports.lookup_parent (LIKE switchboard_audit.receipt_lookups);
+             ALTER TABLE switchboard_audit.receipt_lookups INHERIT reports.lookup_parent;
+             RESET ROLE;"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems_of(&db).await,
+        vec![inheritance(
+            "switchboard_audit.receipt_lookups",
+            "reports.lookup_parent"
+        )]
+    );
 }

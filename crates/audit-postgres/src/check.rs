@@ -611,10 +611,12 @@ pub enum Problem {
     /// another schema, so the store refuses a partitioned table rather than trust what the
     /// partitioned table alone shows.
     Partitioned,
-    /// A table inherits from `switchboard_audit.call_rows` or is a partition of it, or
-    /// `call_rows` inherits from a table or is a partition of one. An update or delete through
-    /// the parent reaches the child's rows, under the child's own triggers and the parent's
-    /// grants, so the store requires `call_rows` to stand alone.
+    /// A table inherits from `switchboard_audit.call_rows`, `receipts` or `receipt_lookups`
+    /// or is a partition of it, or one of them inherits from a table or is a partition of one.
+    /// An update or delete through the parent reaches the child's rows, under the child's own
+    /// triggers and the parent's grants, so a grant on a parent elsewhere would let the
+    /// gateway's role delete an audit row, a receipt or a lookup. The store requires each of
+    /// the three to stand alone.
     Inheritance {
         /// The table that inherits.
         child: String,
@@ -906,7 +908,8 @@ impl fmt::Display for Problem {
             Self::Inheritance { child, parent } => write!(
                 f,
                 "the table {child} inherits from {parent} or is a partition of it, and the \
-                 store requires switchboard_audit.call_rows to stand alone"
+                 store requires switchboard_audit.call_rows, receipts and receipt_lookups to \
+                 stand alone"
             ),
             Self::Unlogged { table } => write!(
                 f,
@@ -1173,7 +1176,9 @@ impl PgAuditStore {
     /// `receipt_moves`, and a foreign key's action on another table whose owner can. Each would
     /// let the gateway's role delete or rewrite a receipt, which its grants on `receipts` and
     /// the trigger withhold, and each is refused as it is for `call_rows`. So is a rule on
-    /// `receipt_lookups`, which the gateway appends to.
+    /// `receipt_lookups`, which the gateway appends to. Both tables must stand alone, as
+    /// `call_rows` must: a delete through a parent they inherit from, or are a partition of,
+    /// runs under the parent's grants.
     ///
     /// # What it requires
     ///
@@ -1192,11 +1197,14 @@ impl PgAuditStore {
     ///   trigger `receipt_moves` enabled to fire before each insert or update, which moves a
     ///   receipt only as its state table allows (decision 0009, part 2), and with the columns
     ///   reconciliation reads and writes, of their types: the vendor target, the lease, the
-    ///   hand-off to a person and the count of claims.
-    /// - `switchboard_audit.receipt_lookups` is there, as a table that is not unlogged, with
-    ///   every column of its type and its trigger `lookup_appends` enabled to fire before each
-    ///   insert, update or delete, which appends a lookup to a receipt in `unknown` and refuses
-    ///   every change and removal.
+    ///   hand-off to a person and the count of claims. It stands alone: no table inherits from
+    ///   it or is a partition of it, and it inherits from none. `receipt_moves` does not fire
+    ///   on a delete, so a delete through a parent elsewhere would reach its receipts under the
+    ///   parent's grants.
+    /// - `switchboard_audit.receipt_lookups` is there, as a table that is not unlogged and
+    ///   stands alone, with every column of its type and its trigger `lookup_appends` enabled
+    ///   to fire before each insert, update or delete, which appends a lookup to a receipt in
+    ///   `unknown` and refuses every change and removal.
     /// - The session's `session_replication_role` is not `replica`, which a role or database
     ///   default can set, and under which no trigger fires.
     /// - The session logged in as the role it runs as, so `SET ROLE NONE` cannot take it
@@ -1266,9 +1274,10 @@ impl PgAuditStore {
     ///   the partitioned table's owner on every partition, whoever owns the partition. The
     ///   catalog cannot say what each of those writes, so the foreign key itself is refused,
     ///   whatever the table has: a bare cascading key with no trigger, rule, check or default
-    ///   is refused too. A foreign key that references `call_rows` passes: its action runs only
-    ///   when an audit row is deleted or its key changes, which the gateway's role may not do.
-    ///   One that references `receipts` is judged like any other. In a database shared with
+    ///   is refused too. A foreign key that references `call_rows` passes on its action on
+    ///   delete, which runs only when an audit row is deleted, which the gateway's role may not
+    ///   do; its action on update is judged, since the completion changes `resources` and
+    ///   `resources_omitted`. One that references `receipts` is judged like any other. In a database shared with
     ///   other applications, a cascading key on a table owned by a superuser, or by any role
     ///   that can reach `call_rows` or `receipts`, therefore stops the gateway from booting;
     ///   narrowing this is #151.
@@ -1733,19 +1742,13 @@ async fn rules(
 /// asked of `call_rows` and of `receipts`, whose migrations' foreign keys, to each other, are
 /// `NO ACTION`.
 ///
-/// A foreign key on another table that references `call_rows` passes. Its action writes that
-/// other table, not `call_rows`, and the gateway's role cannot set it off. The action fires only
-/// when a referenced row is deleted or its referenced key changes from a value with no NULL in
-/// it. The role holds no DELETE, which [`other_privileges`] refuses, and its only UPDATE is the
-/// completion, which [`column_privileges`] holds it to. `complete_once` lets that write only the
-/// completion's columns, and only on a row whose `outcome` is NULL, and `completion_shape` and
-/// `error_kind_shape` keep every completion column NULL until then. So a referenced key holds
-/// none of those columns and never changes, or its old value has a NULL and Postgres takes no
-/// action. The one exception is `resources` and `resources_omitted`, which the completion of a
-/// row begun with unknown resources writes once (migration 0011): a key on them can change
-/// then, and its action writes only the referencing table. A foreign key on another table, whose
-/// action runs as that table's owner, is [`cascade_actions`]', and so is one that references
-/// `receipts`.
+/// A foreign key on another table, whose action runs as that table's owner, is
+/// [`cascade_actions`]', whether it references `call_rows`, `receipts` or any other table.
+/// There, one that references `call_rows` passes on its action on delete, which the gateway's
+/// role cannot set off: it holds no DELETE, which [`other_privileges`] refuses. Its action on
+/// update is refused when the table's owner is able: the completion changes `resources` and
+/// `resources_omitted` from values with no NULL in them (migration 0011), so an action on a
+/// key that holds either runs when the gateway completes a row.
 async fn referential_actions(
     client: &ClientWrapper,
     table: tokio_postgres::types::Oid,
@@ -1889,8 +1892,8 @@ async fn ordinary_table(
 /// columns what the store needs of receipts and nothing more: [`RECEIPT_INSERTED`],
 /// [`RECEIPT_UPDATED`] and [`RECEIPT_SELECTED`]. Anything on the table as a whole, `DELETE`
 /// among them, is refused with the rest of the schema by `other_privileges`; its trigger is
-/// checked with the others. It has no rule and no foreign key whose action writes it, as for
-/// `call_rows`. Then the same of the lookup table, [`lookups`]. The receipt table, if it is
+/// checked with the others. It stands alone ([`inheritance`]), and has no rule and no foreign
+/// key whose action writes it, as for `call_rows`. Then the same of the lookup table, [`lookups`]. The receipt table, if it is
 /// there, for the routes [`check`] follows to it after.
 async fn receipts(
     client: &ClientWrapper,
@@ -1900,6 +1903,7 @@ async fn receipts(
         problems.push(Problem::ReceiptsMissing);
         return Ok(None);
     };
+    inheritance(client, table, problems).await?;
     unlogged(client, table, problems).await?;
     columns(client, table, RECEIPTS, RECEIPT_COLUMNS, problems).await?;
     rules(client, table, RECEIPTS_TABLE, problems).await?;
@@ -1924,7 +1928,8 @@ async fn receipts(
 /// reads and writes, of its type ([`LOOKUP_COLUMNS`]), and the session's role may append a
 /// lookup ([`LOOKUP_INSERTED`]) and read them ([`LOOKUP_SELECTED`]), and nothing more: it may
 /// update no column. Anything on the table as a whole is refused by `other_privileges`; its
-/// trigger, which refuses every change and removal, is checked with the others.
+/// trigger, which refuses every change and removal, is checked with the others. It stands alone
+/// ([`inheritance`]), as `call_rows` and `receipts` do.
 ///
 /// It has no rule. The gateway's role appends lookups, and a rule's statements run as the
 /// table's owner whenever it does, so a rule here could delete or rewrite a receipt, or an
@@ -1938,6 +1943,7 @@ async fn lookups(
         problems.push(Problem::LookupsMissing);
         return Ok(());
     };
+    inheritance(client, table, problems).await?;
     unlogged(client, table, problems).await?;
     columns(client, table, LOOKUPS, LOOKUP_COLUMNS, problems).await?;
     rules(client, table, LOOKUPS_TABLE, problems).await?;
@@ -2343,11 +2349,16 @@ async fn definers(
 /// table that holds it.
 ///
 /// A foreign key on an audit table itself is [`referential_actions`]', which refuses its action
-/// whoever owns the table. One that references `call_rows`, `table`, acts only when an audit
-/// row is deleted, which the gateway's role may not do, or when its referenced key changes,
-/// which an update of the completion cannot do, but for a key on the resources a completion
-/// writes once, as [`referential_actions`] says; it passes. One that references `receipts` is
-/// judged here like any other.
+/// whoever owns the table. One that references `call_rows`, `table`, passes on its action on
+/// delete alone: that acts only when an audit row is deleted, which the gateway's role may not
+/// do. Its action on update is judged like any other. The completion changes `resources` and
+/// `resources_omitted` from values with no NULL in them (migration 0011), so an action on a key
+/// that holds either runs when the gateway completes a row, and its write fires the
+/// referencing table's triggers as that table's owner, which can then delete a receipt or an
+/// audit row. A key on other columns could not change that way, but the action on update is
+/// refused whatever columns the key holds, as the store cannot follow every column a later
+/// migration lets the completion write. One that references `receipts` is judged here like any
+/// other.
 async fn cascade_actions(
     client: &ClientWrapper,
     table: tokio_postgres::types::Oid,
@@ -2367,8 +2378,9 @@ async fn cascade_actions(
                      JOIN pg_catalog.pg_class r ON r.oid = k.confrelid
                      JOIN pg_catalog.pg_namespace rn ON rn.oid = r.relnamespace
                  WHERE k.contype = 'f' AND k.conparentid = 0
-                     AND k.conrelid <> ALL($3::oid[]) AND k.confrelid <> $1::oid
-                     AND (k.confdeltype NOT IN ('a', 'r') OR k.confupdtype NOT IN ('a', 'r'))
+                     AND k.conrelid <> ALL($3::oid[])
+                     AND (k.confdeltype NOT IN ('a', 'r') AND k.confrelid <> $1::oid
+                          OR k.confupdtype NOT IN ('a', 'r'))
                      AND {}
                  ORDER BY 1, 3",
                 by_any_member("tbl.relowner", "$2"),

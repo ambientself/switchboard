@@ -5110,14 +5110,14 @@ mutate("pg-check-cascade-partition-copy-judged", "a partitioned table's foreign 
        "WHERE k.contype = 'f' AND (k.conparentid <> 0 OR NOT EXISTS (SELECT FROM pg_catalog.pg_inherits i WHERE i.inhparent = k.conrelid))\n")
 mutate("pg-check-cascade-partition-copies-refused", "a partition's copy of a foreign key is refused for the partition's owner, which the action does not run as", PG_CHECK,
        "WHERE k.contype = 'f' AND k.conparentid = 0\n", "WHERE k.contype = 'f'\n")
-mutate("pg-check-cascade-references-call-rows-refused", "a cascading foreign key that references call_rows is refused", PG_CHECK,
-       "AND k.conrelid <> ALL($3::oid[]) AND k.confrelid <> $1::oid",
-       "AND k.conrelid <> ALL($3::oid[]) AND $1::oid IS NOT NULL")
+mutate("pg-check-cascade-references-call-rows-refused", "a foreign key that references call_rows and cascades on delete is refused", PG_CHECK,
+       "AND k.confrelid <> $1::oid\n", "AND $1::oid IS NOT NULL\n")
 # #203: the routes around the grants that the check follows to call_rows, followed to receipts
 # too: a rule or a foreign key's action on receipts, a view or rule elsewhere that reaches it, a
 # definer function or a cascading table whose owner can change it, and one whose owner owns
-# receipt_moves; and a rule on receipt_lookups, which the gateway appends to. tests/check.rs's
-# receipt route tests catch these.
+# receipt_moves; a rule on receipt_lookups, which the gateway appends to; a foreign key's action
+# on update of a key on call_rows, whose resources a completion changes; and a receipt or
+# lookup table that does not stand alone. tests/check.rs's receipt route tests catch these.
 mutate("pg-check-receipt-rule-ignored", "a rule on the receipt table passes the check", PG_CHECK,
        "    rules(client, table, RECEIPTS_TABLE, problems).await?;\n", "")
 mutate("pg-check-lookup-rule-ignored", "a rule on the lookup table passes the check", PG_CHECK,
@@ -5128,6 +5128,14 @@ mutate("pg-check-reaching-receipts-ignored", "a grant on a view or rule outside 
        "reaching_privileges(client, &audited, version", "reaching_privileges(client, &audited[..1], version")
 mutate("pg-check-able-receipts-ignored", "a definer function or cascading table whose owner can delete receipts passes the check", PG_CHECK,
        "able(client, &audited, version)", "able(client, &audited[..1], version)")
+mutate("pg-check-cascade-update-of-call-rows-ignored", "a foreign key that references call_rows' resources with ON UPDATE CASCADE, on a table owned by a role that can delete receipts, passes the check", PG_CHECK,
+       "OR k.confupdtype NOT IN ('a', 'r'))", "OR k.confupdtype NOT IN ('a', 'r') AND k.confrelid <> $1::oid)")
+mutate("pg-check-receipt-inheritance-ignored", "a receipt table that inherits from a table elsewhere passes the check", PG_CHECK,
+       "    inheritance(client, table, problems).await?;\n    unlogged(client, table, problems).await?;\n    columns(client, table, RECEIPTS,",
+       "    unlogged(client, table, problems).await?;\n    columns(client, table, RECEIPTS,")
+mutate("pg-check-lookup-inheritance-ignored", "a lookup table that inherits from a table elsewhere passes the check", PG_CHECK,
+       "    inheritance(client, table, problems).await?;\n    unlogged(client, table, problems).await?;\n    columns(client, table, LOOKUPS,",
+       "    unlogged(client, table, problems).await?;\n    columns(client, table, LOOKUPS,")
 mutate("pg-check-definer-ignores-receipt-trigger-function-owner", "a definer function whose owner owns receipt_moves passes the check", PG_CHECK,
        "WHERE g.tgrelid = ANY($1::oid[])", "WHERE g.tgrelid = ($1::oid[])[1]")
 # Receipts (decision 0009, part 2): migration 0008's table, grants and trigger receipt_moves, the
