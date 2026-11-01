@@ -57,6 +57,12 @@
 //! marker that reconciliation settles such a call's `unknown` receipt by; the gateway registers
 //! it for each entry that serves a write.
 //!
+//! [`pr_comment`] has `github__pr_comment`, which is `write`: it posts a comment on a pull
+//! request under its receipt's marker, after refusing a comment Atlantis could read as a
+//! command, on a token narrowed to the call's repository with `pull_requests: write` alone. The
+//! gateway's check 5 lets it pass only under a profile whose own exception names it (decision
+//! 0011, section 9). The lookup finds its comment by the marker.
+//!
 //! [`search`] has one more read tool, `github__search`, which is declared `checks_own_scope`
 //! (decision 0011): which repositories a search reaches is known only once GitHub answers. It
 //! builds its query as Otto's gateway does, withholds every result from a repository outside
@@ -80,6 +86,7 @@ pub mod create_pr;
 #[cfg(feature = "test-support")]
 pub mod fake;
 pub mod lookup;
+pub mod pr_comment;
 pub mod reads;
 pub mod report;
 pub mod search;

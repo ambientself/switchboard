@@ -20,6 +20,9 @@
 //! - A receipt with no team, a target that is not one repository of the configured
 //!   organization, the custodian's refusal, and any error or answer that cannot be read are
 //!   `failed`.
+//!
+//! A receipt of `github__pr_comment` is looked for among the repository's comments instead,
+//! with the same token, by the same rule: see [`crate::pr_comment`].
 
 use std::collections::BTreeMap;
 
@@ -77,6 +80,11 @@ impl GitHubConnector {
         let Ok(token) = self.token(&token).await else {
             return LookupAnswer::Failed;
         };
+        if request.tool.as_str() == crate::pr_comment::PR_COMMENT {
+            return self
+                .find_comment(request.marker, repository, token.expose())
+                .await;
+        }
         let marker = writes::marker(request.marker);
         for page in 1..=MAX_LOOKUP_PAGES {
             let path = format!(
@@ -105,8 +113,8 @@ impl GitHubConnector {
     }
 }
 
-/// Whether `pull`'s body has a line exactly equal to `marker`.
-fn marked(pull: &Value, marker: &str) -> bool {
+/// Whether `pull`'s body, or a comment's, has a line exactly equal to `marker`.
+pub(crate) fn marked(pull: &Value, marker: &str) -> bool {
     pull.get("body")
         .and_then(Value::as_str)
         .is_some_and(|body| body.lines().any(|line| line == marker))

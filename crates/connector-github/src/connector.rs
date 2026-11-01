@@ -215,6 +215,9 @@ impl GitHubConnector {
         if tool.as_str() == crate::create_pr::CREATE_PR {
             return self.create_pr(&call).await;
         }
+        if tool.as_str() == crate::pr_comment::PR_COMMENT {
+            return self.pr_comment(&call).await;
+        }
         if tool.as_str() == search::SEARCH {
             return self.search(&call).await;
         }

@@ -64,6 +64,7 @@ use serde_json::Value;
 use crate::api::{Api, WriteMethod, Wrote};
 use crate::connector::SettingsError;
 use crate::create_pr;
+use crate::pr_comment;
 
 /// The text every marker begins with, after `<!-- `. A call whose text holds it, in any case,
 /// is refused.
@@ -204,19 +205,25 @@ pub fn refused_path(path: &str) -> Option<RefusedPath> {
 }
 
 /// The receipt `call` sends under: its audit row, which the gateway reserved as its receipt.
-/// Nothing is sent for a write tool approved as anything but `propose`, whatever its approval
-/// says, or for a call that reserved no receipt: the outcome then is `error`, before the key
+/// Nothing is sent for a write tool approved as anything but what the connector states it is,
+/// `write` for `github__pr_comment` and `propose` for every other, whatever its approval says,
+/// or for a call that reserved no receipt: the outcome then is `error`, before the key
 /// custodian is asked.
 #[allow(clippy::result_large_err)]
 pub(crate) fn receipt(call: &ToolCall) -> Result<&AuditRowId, ToolOutcome> {
     let tool = &call.tool().name;
     let classification = call.tool().classification;
-    if classification != Classification::Propose {
+    let stated = if tool.as_str() == pr_comment::PR_COMMENT {
+        Classification::Write
+    } else {
+        Classification::Propose
+    };
+    if classification != stated {
         return Err(ToolOutcome::error(
             ErrorKind::Other,
             format!(
                 "`{tool}` is approved as `{classification}`, and the GitHub connector sends it \
-                 only as `propose`; nothing was sent"
+                 only as `{stated}`; nothing was sent"
             ),
         ));
     }
@@ -233,6 +240,7 @@ pub(crate) fn receipt(call: &ToolCall) -> Result<&AuditRowId, ToolOutcome> {
 pub(crate) fn asked(tool: &str) -> Option<&'static [(&'static str, Access)]> {
     match tool {
         create_pr::CREATE_PR => Some(create_pr::PERMISSIONS),
+        pr_comment::PR_COMMENT => Some(pr_comment::PERMISSIONS),
         _ => None,
     }
 }
