@@ -123,7 +123,7 @@ CHECK = {
     2: "    let tool = tool_is_approved_on_surface(snapshot, &caller.surface, tool)?;\n",
     3: "    delegation_agrees(caller, profile, principal)?;\n",
     4: "    delegation_lists_tool(caller.delegation.as_ref(), tool)?;\n",
-    5: "    classification_is_permitted(profile, tool)?;\n",
+    5: "    let exception = classification_is_permitted(profile, tool)?;\n",
     6: (
         "    if let Some(resources) = resources {\n"
         "        resources_are_within_limit(snapshot.limits(), principal, tool, resources)?;\n"
@@ -153,8 +153,11 @@ mutate(
     CHECK[3] + CHECK[4] + CHECK[5],
     CHECK[5] + CHECK[3] + CHECK[4],
 )
+# Removing check 5 leaves the exception it would have returned empty, so the rest compiles.
+REMOVED = {5: "    let exception = None;\n"}
 for number in (1, 3, 4, 5, 6):
-    mutate(f"check-{number}-removed", f"check {number} is not run", SRC + "decision.rs", CHECK[number], "")
+    mutate(f"check-{number}-removed", f"check {number} is not run", SRC + "decision.rs", CHECK[number],
+           REMOVED.get(number, ""))
 # The currency check after check 5 (decision 0012): a direct write is reported before currency.
 # tests/decision_table.json's order cases catch these.
 mutate("currency-before-check-5", "the currency check runs before check 5, so a direct write is reported as not current",
@@ -275,8 +278,8 @@ mutate(
     "tool-name-may-be-empty",
     "a tool name may be empty",
     SRC + "names.rs",
-    "        let valid = !value.is_empty()\n            && value.len()",
-    "        let valid = value.len()",
+    "        let valid = !value.is_empty()\n            && value.len() <= MAX_TOOL_NAME",
+    "        let valid = value.len() <= MAX_TOOL_NAME",
 )
 mutate(
     "tool-name-unchecked-conversion",
@@ -418,6 +421,40 @@ for id, description, replacement in [
     ),
 ]:
     mutate(id, description, SRC + "decision.rs", PROFILE_LISTS, f"    let permitted = {replacement};")
+# Decision 0011, section 9: check 5 lets a `write` tool past only when the calling profile's own
+# list of exceptions names it by its exact name, and every later check still runs; the decision
+# names the exception only on an allow, and the row records it. tests/decision_table.json's
+# exception cases, tests/properties.rs and policy.rs's own tests catch these.
+mutate("exception-list-ignored", "check 5 ignores the profile's list of exceptions, so no excepted tool is allowed",
+       SRC + "decision.rs", "    match profile.excepting(&tool.name) {", "    match None::<&ExceptionName> {")
+mutate("exception-list-of-any-profile", "check 5 lets a tool past when any profile of the snapshot excepts it",
+       SRC + "decision.rs", CHECK[5],
+       "    let exception = classification_is_permitted(profile, tool).or_else(|denied| {\n"
+       "        snapshot.profiles().find_map(|any| any.excepting(&tool.name)).map(Some).ok_or(denied)\n"
+       "    })?;\n")
+mutate("exception-by-prefix", "a profile excepts every tool whose name starts with one its list names",
+       SRC + "policy.rs", "            .find(|exception| exception.tools.contains(tool))",
+       "            .find(|exception| exception.tools.iter().any(|named| tool.as_str().starts_with(named.as_str())))")
+mutate("exception-skips-later-checks", "a call check 5 let past by an exception skips the currency check and check 6",
+       SRC + "decision.rs", CHECK[5],
+       CHECK[5] + "    if exception.is_some() {\n        return Ok((tool, exception));\n    }\n")
+mutate("exception-not-recorded", "an allowed call's row does not record the exception that allowed it",
+       SRC + "audit.rs", "        allowed_by_exception: exception,\n",
+       "        allowed_by_exception: { let _ = exception; None },\n")
+mutate("exception-recorded-on-denial", "a denial names the exception its profile's list holds for its tool",
+       SRC + "decision.rs", "            // A denial names no exception, whichever check denied it.\n            None,\n",
+       "            snapshot\n                .profile(&call.caller.profile)\n"
+       "                .and_then(|profile| call.tool.name().ok().and_then(|name| profile.excepting(&name).cloned())),\n")
+mutate("exception-list-required", "a policy that does not mention exceptions is refused, not read as none", SRC + "policy.rs",
+       "    #[serde(default)]\n    pub exceptions: Vec<Exception>,", "    pub exceptions: Vec<Exception>,")
+mutate("exception-record-field-required", "a stored record without the exception column does not read back", SRC + "audit.rs",
+       "    #[serde(default)]\n    pub allowed_by_exception: Option<ExceptionName>,", "    pub allowed_by_exception: Option<ExceptionName>,")
+mutate("exception-name-any-case", "an exception's name may hold capitals", SRC + "names.rs",
+       "                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');",
+       "                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');")
+mutate("exception-name-uncapped", "an exception's name may be longer than 64 characters", SRC + "names.rs",
+       "            && value.len() <= MAX_EXCEPTION_NAME\n            && !value.starts_with('-')",
+       "            && !value.starts_with('-')")
 mutate(
     "classification-write-parses-as-propose",
     "`write` in configuration reads as propose, and `propose` is refused",
@@ -580,21 +617,23 @@ DECIDE_CHECKED = (
     "        Some(call.currency),\n"
     "        Some(&call.resources),\n"
     "    )\n"
-    "    .and_then(|tool| key_is_carried(tool, call.key.as_ref()).map(|()| tool));\n"
+    "    .and_then(|(tool, exception)| {\n"
+    "        key_is_carried(tool, call.key.as_ref()).map(|()| (tool, exception))\n"
+    "    });\n"
 )
 mutate("key-check-on-list", "tools/list runs the key check, so a proposal is never listed", SRC + "decision.rs",
        "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None, None).ok())",
-       "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None, None).and_then(|tool| key_is_carried(tool, None).map(|()| tool)).ok())")
+       "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None, None).and_then(|passed| key_is_carried(passed.0, None).map(|()| passed)).ok())")
 mutate("key-check-before-resources", "the key check runs before check 6, so a call outside its limit is asked for a key", SRC + "decision.rs",
        DECIDE_CHECKED,
        "    let checked = check(snapshot, &call.caller, &call.tool, Some(call.currency), None)\n"
-       "        .and_then(|tool| key_is_carried(tool, call.key.as_ref()).map(|()| tool))\n"
-       "        .and_then(|_| check(snapshot, &call.caller, &call.tool, Some(call.currency), Some(&call.resources)));\n")
+       "        .and_then(|(tool, _)| key_is_carried(tool, call.key.as_ref()))\n"
+       "        .and_then(|()| check(snapshot, &call.caller, &call.tool, Some(call.currency), Some(&call.resources)));\n")
 mutate("key-check-before-currency", "the key check runs before the currency check, so a turn that is not current is asked for a key",
        SRC + "decision.rs", DECIDE_CHECKED,
        "    let checked = check(snapshot, &call.caller, &call.tool, None, None)\n"
-       "        .and_then(|tool| key_is_carried(tool, call.key.as_ref()).map(|()| tool))\n"
-       "        .and_then(|_| check(snapshot, &call.caller, &call.tool, Some(call.currency), Some(&call.resources)));\n")
+       "        .and_then(|(tool, _)| key_is_carried(tool, call.key.as_ref()))\n"
+       "        .and_then(|()| check(snapshot, &call.caller, &call.tool, Some(call.currency), Some(&call.resources)));\n")
 mutate("key-check-first", "the key check runs before every other check, so a denied write is asked for a key", SRC + "decision.rs",
        DECIDE_CHECKED,
        "    let checked = call.tool.name().ok().and_then(|name| snapshot.tool(&name))\n"
@@ -674,6 +713,7 @@ for path, struct in [
     (SRC + "policy.rs", "ResourceLimits"),
     (SRC + "policy.rs", "Resource"),
     (SRC + "policy.rs", "ConnectorEntry"),
+    (SRC + "policy.rs", "Exception"),
     (SRC + "principal.rs", "PrincipalId"),
     (SRC + "audit.rs", "AuditRecord"),
     (SRC + "audit.rs", "RecordedResource"),
@@ -760,6 +800,30 @@ mutate("snapshot-settlement-undeclared-accepted", "the loader accepts an approva
        "                let _ = classification;\n")
 mutate("snapshot-settlement-on-read-accepted", "the loader accepts a read tool that declares a settlement", SRC + "policy.rs",
        "                return Err(SnapshotError::SettlementOnRead(tool.name.clone()));\n", "")
+# Decision 0011, section 9, and decision 0009, "Reconciliation": the loader's rules for a
+# profile's exceptions. tests/loader_rules.json has a refusing and a passing case for each.
+mutate("exception-without-currency-loads", "the loader accepts an exception on a profile that does not require currency",
+       SRC + "policy.rs", "            if !profile.requires_currency {\n                return Err(SnapshotError::ExceptionWithoutCurrency {",
+       "            if false {\n                return Err(SnapshotError::ExceptionWithoutCurrency {")
+mutate("exception-names-non-write-loads", "the loader accepts an exception naming a tool not classified write",
+       SRC + "policy.rs", "                if tool.classification != Classification::Write {", "                if false {")
+mutate("excepted-write-settled-by-person-loads", "the loader accepts an excepted write tool settled by a person",
+       SRC + "policy.rs", "                if tool.settlement == Some(Settlement::Person) {", "                if false {")
+mutate("exception-unapproved-tool-loads", "the loader accepts an exception naming a tool that is not approved",
+       SRC + "policy.rs",
+       "                let Some(tool) = snapshot.tools.get(name) else {\n"
+       "                    return Err(SnapshotError::ExceptionToolUnapproved {\n"
+       "                        profile: profile_name.clone(),\n"
+       "                        exception: exception_name.clone(),\n"
+       "                        tool: name.clone(),\n"
+       "                    });\n"
+       "                };\n",
+       "                let Some(tool) = snapshot.tools.get(name) else {\n                    continue;\n                };\n")
+mutate("exception-duplicate-name-loads", "the loader accepts two exceptions of one profile with one name",
+       SRC + "policy.rs", "            if !names.insert(exception_name) {", "            if false && !names.insert(exception_name) {")
+mutate("exception-tool-twice-loads", "the loader accepts one tool in two exceptions of one profile",
+       SRC + "policy.rs", "                if let Some(first) = named.insert(tool, exception_name) {",
+       "                if let Some(first) = named.insert(tool, exception_name).filter(|_| false) {")
 
 # --- Principals and proof ------------------------------------------------------------------
 
@@ -1912,6 +1976,10 @@ mutate("testkit-failure-on-any-row", "the in-memory store records a delegation's
        "    if !at_check_3 || record.decision != DecisionKind::Deny {", "    if false {")
 mutate("testkit-delegation-without-team", "the in-memory store records a verified delegation without its team or person", A,
        "    if delegation && !(team && person) {", "    if false && delegation && !(team && person) {")
+# Migration 0012's allowed_by_exception_shape: the contract suite's
+# an_exception_is_stored_on_an_allowed_write_and_refused_elsewhere catches this.
+mutate("testkit-exception-shape-unchecked", "the in-memory store records an exception on a denial, a read or a proposal", A,
+       "    refused_exception(id, record)?;\n", "")
 mutate("testkit-outcome-sentence-uncapped", "the in-memory store writes a refusal's sentence of any length at finish", A,
        "        refuse_long_sentence(sentence)?;\n", "        let _ = refuse_long_sentence(sentence);\n")
 mutate("testkit-outcome-sentence-refused-at-cap", "the in-memory store refuses a refusal's sentence of exactly the cap", ROW_BOUND,
@@ -3754,6 +3822,10 @@ mutate("registry-currency-ignored", "a registry file's requires_currency is not 
        "            requires_currency: profile.requires_currency,", "            requires_currency: false,")
 mutate("registry-currency-setting-required", "a registry file that does not mention requires_currency is refused", RF,
        "    #[serde(default)]\n    pub requires_currency: bool,", "    pub requires_currency: bool,")
+mutate("registry-exceptions-ignored", "a registry file's profile exceptions are not carried to the profile", RR,
+       "            exceptions: profile.exceptions,", "            exceptions: Vec::new(),")
+mutate("registry-exceptions-required", "a registry file whose profile does not mention exceptions is refused", RF,
+       "    #[serde(default)]\n    pub exceptions: Vec<Exception>,", "    pub exceptions: Vec<Exception>,")
 mutate("registry-empty-text-accepted", "required text may be empty", RR,
        "    if value.is_empty() {\n        Err(RegistryError::EmptyField {", "    if false {\n        Err(RegistryError::EmptyField {")
 mutate("registry-limit-identifier-empty", "a limit or a reach may name the empty identifier", RR,
@@ -4161,7 +4233,7 @@ mutate("pg-session-search-path-kept", "sessions look names up in the schemas a d
 mutate("pg-session-options-caller-last", "the caller's session options override the store's", PG_STORE,
        'format!("{existing} {SESSION_OPTIONS}")', 'format!("{SESSION_OPTIONS} {existing}")')
 mutate("pg-begin-no-on-conflict", "a retried begin inserts again and fails on its own row", PG_COLUMNS,
-       '$37, $38\n        ) ON CONFLICT (id) DO NOTHING";', '$37, $38\n        )";')
+       '$37, $38, $39\n        ) ON CONFLICT (id) DO NOTHING";', '$37, $38, $39\n        )";')
 mutate("pg-begin-decision-not-compared", "a begin with a known identifier and another decision succeeds", PG_STORE,
        "    if decision == row.decision {", "    if true {")
 mutate("pg-columns-id-unchecked", "an identifier that is not a lowercase UUID is sent to the database", PG_COLUMNS,
@@ -5012,7 +5084,28 @@ mutate("pg-columns-failure-digest-not-written", "a failure's digest is not writt
        "            delegation_digest: failure\n                .and_then(|failure| failure.digest)\n",
        "            delegation_digest: failure\n                .and_then(|_| None::<gateway_core::DelegationDigest>)\n")
 mutate("pg-check-misses-currency", "the boot check does not require the currency column", PG_CHECK,
-       '    ("currency", "text"),\n];', "];")
+       '    ("currency", "text"),\n    ("allowed_by_exception", "text"),\n];', '    ("allowed_by_exception", "text"),\n];')
+
+# Migration 0012: the exception that allowed a call, in a column of its own (decision 0011,
+# section 9; #12, #56). The schema test
+# the_exception_column_holds_an_allowed_writes_exception_and_nothing_else and the contract
+# suite's an_exception_is_stored_on_an_allowed_write_and_refused_elsewhere catch the
+# constraints and the grant against Postgres; the columns' own tests catch the write without a
+# server.
+PG_EXCEPTION = PG + "sql/migrations/0012_exception.sql"
+mutate("pg-exception-shape-loosened", "an exception may be stored on a denial, a read or a proposal", PG_EXCEPTION,
+       "        OR coalesce(kind = 'call' AND decision = 'allow'\n            AND classification IN ('write', 'destructive'), false)",
+       "        OR coalesce(kind = 'call', false)")
+mutate("pg-exception-name-unchecked", "an exception's name may be any text of 1 to 64 characters", PG_EXCEPTION,
+       "        AND allowed_by_exception ~ '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'\n", "")
+mutate("pg-exception-grant-missing", "the gateway's role may not insert the exception", PG_EXCEPTION,
+       "GRANT INSERT (allowed_by_exception) ON switchboard_audit.call_rows TO switchboard_gateway;\n", "")
+mutate("pg-columns-exception-not-written", "begin writes no exception", PG_COLUMNS,
+       "            allowed_by_exception: record\n                .allowed_by_exception\n                .as_ref()\n"
+       "                .map(|exception| exception.as_str().to_owned()),\n",
+       "            allowed_by_exception: { let _ = &record.allowed_by_exception; None },\n")
+mutate("pg-check-misses-exception", "the boot check does not require the exception column", PG_CHECK,
+       '    ("allowed_by_exception", "text"),\n];', "];")
 
 # Migration 0011: what a tool that checks its own scope reached replaces the row's unknown
 # resources in finish's own statement (decision 0011, #12). The schema test
