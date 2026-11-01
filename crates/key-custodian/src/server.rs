@@ -28,14 +28,16 @@
 //!
 //! The custodian keeps every token it handed out, or issued and did not hand out, until it is
 //! revoked or reaches GitHub's expiry. When it stops gracefully ([`crate::Running::stop`]), it
-//! stops accepting, waits for the requests in flight to be answered, and then revokes each
-//! token it still keeps, all at once, trying a failed revocation again as above. All of this is
-//! bounded by one deadline, [`SHUTDOWN_DEADLINE`] by default: what is not done by then is
+//! stops accepting and at once starts revoking each token it still keeps, all together, trying
+//! a failed revocation again as above. Meanwhile it waits for the requests in flight to be
+//! answered, and revokes each token GitHub issues for one as soon as it is issued. All of this
+//! is bounded by one deadline, [`SHUTDOWN_DEADLINE`] by default: what is not done by then is
 //! abandoned, and each token not revoked is logged, with when it lapses, and counted in the
 //! [`Stopped`] the stop returns. So a token outlives the custodian only if GitHub does not
-//! accept its revocation within the deadline, or if the custodian is killed rather than
-//! stopped. A token revoked this way may be one the gateway is using for a call in flight,
-//! which then fails: a stop ends every token the custodian handed out.
+//! accept its revocation within the deadline, if GitHub issues it after the deadline to a
+//! request still in flight then, or if the custodian is killed rather than stopped. A token
+//! revoked this way may be one the gateway is using for a call in flight, which then fails: a
+//! stop ends every token the custodian handed out.
 //!
 //! Every request, whatever its outcome, writes one record line (see [`crate::record`]) and is
 //! counted (see [`crate::metrics`]).
@@ -49,6 +51,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
+use tokio::sync::mpsc::{UnboundedSender, error::SendError, unbounded_channel};
 use tokio::task::{AbortHandle, JoinSet};
 
 use crate::clock;
@@ -100,8 +103,18 @@ pub struct Custodian {
 pub(crate) struct Outstanding {
     next: u64,
     tokens: BTreeMap<u64, Kept>,
-    /// Set once a stop has taken the tokens to revoke them.
+    /// While a stop is revoking: where a token issued meanwhile goes, to be revoked at once.
+    stopping: Option<UnboundedSender<ToRevoke>>,
+    /// Set once a stop has ended: a token issued after it is not revoked.
     closed: bool,
+}
+
+/// A token a stop revokes, kept as `id`, lapsing at `lapses_at`, GitHub's expiry, in seconds
+/// since the epoch.
+struct ToRevoke {
+    id: u64,
+    token: Secret,
+    lapses_at: u64,
 }
 
 /// One token kept.
@@ -286,12 +299,24 @@ impl Custodian {
         if kept.closed {
             tracing::error!(
                 lapses_at,
-                "a token was issued after the stop revoked the others, and is not revoked: it \
-                 works until GitHub's expiry"
+                "a token was issued after the stop's deadline, and is not revoked: it works \
+                 until GitHub's expiry"
             );
         }
         let id = kept.next;
         kept.next += 1;
+        // A stop is revoking: it revokes this one now.
+        let token = match &kept.stopping {
+            Some(stopping) => match stopping.send(ToRevoke {
+                id,
+                token,
+                lapses_at,
+            }) {
+                Ok(()) => return,
+                Err(SendError(back)) => back.token,
+            },
+            None => token,
+        };
         // The task removes the token once it is done, which waits for this lock.
         let revoking = revoke_at.map(|at| {
             tokio::spawn(self.clone().revoke_at(id, token.clone(), at, lapses_at)).abort_handle()
@@ -362,58 +387,83 @@ impl Custodian {
         }
     }
 
-    /// For a graceful stop, once the socket accepts no more: waits for the requests in flight,
-    /// then revokes every token kept and not yet lapsed, all within `deadline` (see the [module
+    /// For a graceful stop, once the socket accepts no more: revokes every token kept and not
+    /// yet lapsed, all at once, and, while it waits for the requests in flight, each token
+    /// issued for one as it is issued, all within `deadline` (see the [module
     /// documentation](self)). Logs each token not revoked by then.
     pub(crate) async fn revoke_outstanding(self: Arc<Self>, deadline: Duration) -> Stopped {
         let until = tokio::time::Instant::now() + deadline;
-        let settled = tokio::time::timeout_at(until, self.slots.acquire_many(MAX_CONNECTIONS))
-            .await
-            .is_ok_and(|permits| permits.is_ok());
-        let in_flight = if settled {
-            0
-        } else {
-            let free = u32::try_from(self.slots.available_permits()).unwrap_or(MAX_CONNECTIONS);
-            usize::try_from(MAX_CONNECTIONS.saturating_sub(free)).unwrap_or(usize::MAX)
-        };
-        let kept = {
+        let (stopping, mut landed) = unbounded_channel();
+        {
             let mut kept = self
                 .outstanding
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            kept.closed = true;
-            std::mem::take(&mut kept.tokens)
-        };
-        let now = clock::now();
+            for (id, each) in std::mem::take(&mut kept.tokens) {
+                if let Some(task) = each.revoking {
+                    task.abort();
+                }
+                // `landed` is held until the stop ends, so this is received.
+                let _ = stopping.send(ToRevoke {
+                    id,
+                    token: each.token,
+                    lapses_at: each.lapses_at,
+                });
+            }
+            kept.stopping = Some(stopping);
+        }
+        let mut settling = Box::pin(self.slots.acquire_many(MAX_CONNECTIONS));
+        let mut settled = false;
+        let mut open = true;
+        let mut ends = pin!(tokio::time::sleep_until(until));
         let mut left: BTreeMap<u64, u64> = BTreeMap::new();
         let mut revoking = JoinSet::new();
-        for (id, each) in kept {
-            if let Some(task) = each.revoking {
-                task.abort();
+        let mut stopped = Stopped::default();
+        while open || !revoking.is_empty() {
+            tokio::select! {
+                _ = &mut settling, if !settled => {
+                    // No request is in flight, so no token can be issued: once those sent are
+                    // received, there are no more.
+                    settled = true;
+                    self.outstanding
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .stopping = None;
+                }
+                received = landed.recv(), if open => match received {
+                    Some(each) => self.revoke_for_stop(each, until, &mut left, &mut revoking),
+                    None => open = false,
+                },
+                Some(joined) = revoking.join_next(), if !revoking.is_empty() => {
+                    if let Ok((id, true)) = joined {
+                        left.remove(&id);
+                        stopped.revoked += 1;
+                    }
+                }
+                () = &mut ends => break,
             }
-            if each.lapses_at <= now {
-                continue;
-            }
-            left.insert(id, each.lapses_at);
-            let custodian = self.clone();
-            revoking.spawn(async move { (id, custodian.revoke_by(each.token, until).await) });
         }
-        let mut stopped = Stopped {
-            in_flight,
-            ..Stopped::default()
-        };
-        loop {
-            match tokio::time::timeout_at(until, revoking.join_next()).await {
-                Ok(Some(Ok((id, true)))) => {
-                    left.remove(&id);
-                    stopped.revoked += 1;
-                }
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(_) => {
-                    revoking.abort_all();
-                    break;
-                }
+        revoking.abort_all();
+        // The wait holds the slots it has taken so far until it is dropped.
+        drop(settling);
+        if !settled {
+            let free = u32::try_from(self.slots.available_permits()).unwrap_or(MAX_CONNECTIONS);
+            stopped.in_flight =
+                usize::try_from(MAX_CONNECTIONS.saturating_sub(free)).unwrap_or(usize::MAX);
+        }
+        {
+            let mut kept = self
+                .outstanding
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            kept.stopping = None;
+            kept.closed = true;
+        }
+        // Issued before the deadline, and not taken up by then.
+        let now = clock::now();
+        while let Ok(each) = landed.try_recv() {
+            if each.lapses_at > now {
+                left.insert(each.id, each.lapses_at);
             }
         }
         for lapses_at in left.values() {
@@ -422,15 +472,32 @@ impl Custodian {
                 "could not revoke a token before stopping: it works until GitHub's expiry"
             );
         }
-        if in_flight > 0 {
+        if stopped.in_flight > 0 {
             tracing::error!(
-                in_flight,
+                in_flight = stopped.in_flight,
                 "requests were still in flight when the stop's deadline passed; a token GitHub \
                  issues for one is not revoked"
             );
         }
         stopped.not_revoked = left.len();
         stopped
+    }
+
+    /// For a stop: starts revoking `each` by `until`, unless it is past GitHub's expiry, and
+    /// notes it in `left` until it is revoked.
+    fn revoke_for_stop(
+        self: &Arc<Self>,
+        each: ToRevoke,
+        until: tokio::time::Instant,
+        left: &mut BTreeMap<u64, u64>,
+        revoking: &mut JoinSet<(u64, bool)>,
+    ) {
+        if each.lapses_at <= clock::now() {
+            return;
+        }
+        left.insert(each.id, each.lapses_at);
+        let custodian = self.clone();
+        revoking.spawn(async move { (each.id, custodian.revoke_by(each.token, until).await) });
     }
 }
 

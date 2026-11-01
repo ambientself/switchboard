@@ -354,10 +354,11 @@ impl Running {
         self.stop_within(SHUTDOWN_DEADLINE).await
     }
 
-    /// Stops accepting and removes the socket; waits for the requests in flight and revokes
-    /// every token handed out, or issued and not handed out, that is not yet revoked or past
-    /// GitHub's expiry, all within `deadline`, logging each token not revoked by then (see
-    /// [`crate::server`]); then stops the policy watch and the metrics listener.
+    /// Stops accepting and removes the socket; revokes every token handed out, or issued and
+    /// not handed out, that is not yet revoked or past GitHub's expiry, and, while it waits for
+    /// the requests in flight, each token issued for one, all within `deadline`, logging each
+    /// token not revoked by then (see [`crate::server`]); then stops the policy watch and the
+    /// metrics listener.
     pub async fn stop_within(mut self, deadline: Duration) -> Stopped {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
