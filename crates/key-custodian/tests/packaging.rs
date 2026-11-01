@@ -21,7 +21,12 @@ const SERVER_ONLY: [&str; 10] = [
     "tracing-subscriber",
 ];
 
-/// `cargo tree` for `package`'s own build, offline, with `arguments` added.
+/// `cargo tree` for `package`'s own build on this host, offline, with `arguments` added.
+///
+/// Not `--target all`: that resolves every platform's dependencies, which a build on this host
+/// never downloads, so offline it fails on any Cargo cache filled by a build alone. None of the
+/// crates between the gateway and this one has a dependency for one platform only, so the host's
+/// resolution gives this crate the same features and dependencies as any other's.
 fn tree(package: &str, arguments: &[&str]) -> String {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     let output = std::process::Command::new(cargo)
@@ -31,8 +36,6 @@ fn tree(package: &str, arguments: &[&str]) -> String {
             "--offline",
             "--manifest-path",
             concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"),
-            "--target",
-            "all",
             "-e",
             "normal,build",
             "-p",
