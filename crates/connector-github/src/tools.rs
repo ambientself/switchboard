@@ -183,6 +183,8 @@ pub fn definitions() -> Vec<Definition> {
         },
         crate::search::definition(),
         crate::create_pr::definition(),
+        crate::propose::definition(),
+        crate::amend::definition(),
     ];
     definitions.extend(crate::reads::definitions());
     definitions.sort_by_key(|definition| definition.name);
@@ -320,22 +322,7 @@ fn file(arguments: &Value) -> Result<Call, String> {
     let arguments = object(arguments)?;
     let (owner, repo) = owner_repo(arguments)?;
     let path = required(arguments, "path")?;
-    if path.is_empty() || path.len() > MAX_PATH_BYTES {
-        return Err(format!("path must be 1 to {MAX_PATH_BYTES} bytes long"));
-    }
-    if path.chars().any(char::is_control) || path.contains('\\') {
-        return Err("path contains a control character or a backslash".into());
-    }
-    if path
-        .split('/')
-        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
-    {
-        return Err(
-            "path contains a \"..\" segment, a \".\" segment, an empty segment or a leading or \
-             trailing slash"
-                .into(),
-        );
-    }
+    checked_path(&path, "path")?;
     let reference = text(arguments, "ref")?;
     if let Some(reference) = &reference
         && (reference.is_empty()
@@ -354,6 +341,30 @@ fn file(arguments: &Value) -> Result<Call, String> {
         path,
         reference,
     })
+}
+
+/// Refuses `path`, the argument `name`, unless it is a path in a repository: 1 to
+/// [`MAX_PATH_BYTES`] bytes, with no control character or backslash, and no `..`, `.` or empty
+/// segment, so no leading or trailing slash.
+pub(crate) fn checked_path(path: &str, name: &str) -> Result<(), String> {
+    if path.is_empty() || path.len() > MAX_PATH_BYTES {
+        return Err(format!("{name} must be 1 to {MAX_PATH_BYTES} bytes long"));
+    }
+    if path.chars().any(char::is_control) || path.contains('\\') {
+        return Err(format!(
+            "{name} contains a control character or a backslash"
+        ));
+    }
+    if path
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(format!(
+            "{name} contains a \"..\" segment, a \".\" segment, an empty segment or a leading or \
+             trailing slash"
+        ));
+    }
+    Ok(())
 }
 
 /// Everything but the characters a path segment or a query value may carry as they are.
@@ -684,7 +695,9 @@ mod tests {
             };
             assert_eq!(tool.assurance.resources, want, "{}", tool.name);
             let classification = match tool.name.as_str() {
-                crate::create_pr::CREATE_PR => Classification::Propose,
+                crate::create_pr::CREATE_PR
+                | crate::proposals::PROPOSE_CHANGE
+                | crate::proposals::AMEND_CHANGE => Classification::Propose,
                 _ => Classification::Read,
             };
             assert_eq!(tool.assurance.classification, classification);
@@ -721,7 +734,13 @@ mod tests {
     #[test]
     fn each_definition_names_a_tool_this_connector_parses() {
         for definition in definitions().into_iter().filter(|definition| {
-            ![crate::search::SEARCH, crate::create_pr::CREATE_PR].contains(&definition.name)
+            ![
+                crate::search::SEARCH,
+                crate::create_pr::CREATE_PR,
+                crate::proposals::PROPOSE_CHANGE,
+                crate::proposals::AMEND_CHANGE,
+            ]
+            .contains(&definition.name)
         }) {
             assert!(
                 parse(definition.name, &json!({})).is_some(),

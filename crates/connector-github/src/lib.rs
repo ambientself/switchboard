@@ -74,12 +74,15 @@
 
 #![forbid(unsafe_code)]
 
+pub mod amend;
 mod api;
 mod connector;
 pub mod create_pr;
 #[cfg(feature = "test-support")]
 pub mod fake;
 pub mod lookup;
+pub mod proposals;
+pub mod propose;
 pub mod reads;
 pub mod report;
 pub mod search;

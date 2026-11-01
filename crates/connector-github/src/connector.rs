@@ -2,11 +2,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use gateway_core::{
-    BoxFuture, ConnectorName, ErrorKind, Narrowing, PrincipalKind, Resource, TeamId, ToolCall,
-    ToolOutcome,
+    BoxFuture, ConnectorName, ErrorKind, Narrowing, PrincipalKind, ReceiptAttribution, Resource,
+    TeamId, ToolCall, ToolOutcome,
 };
 use gateway_registry::{Access, BuiltInEntry};
 use hyper::StatusCode;
@@ -40,6 +41,11 @@ pub struct GitHubSettings {
     /// a port, if not the scheme's own, and nothing else, held to the same rules and the same
     /// CA file as `api_url`. A redirect to any other is refused, and with none every one is.
     pub job_log_hosts: Vec<String>,
+    /// The App's own login, such as `my-app[bot]`, which GitHub names as the author of every
+    /// pull request the App opens. `github__amend_change` needs it, and refuses a pull request
+    /// opened by anyone else; with it, a lookup by marker finds only pull requests the App
+    /// opened. `None` when the deployment gives none.
+    pub bot_login: Option<String>,
 }
 
 /// Why the connector could not be built.
@@ -59,6 +65,12 @@ pub enum SettingsError {
          every token but a reach report's, so declare \"limit\" or \"call\""
     )]
     NotNarrowed(ConnectorName),
+    /// The bot login is not a GitHub login, with `[bot]` after it or not.
+    #[error(
+        "`{0}` is not a GitHub login: 1 to 39 letters, digits and hyphens, with \"[bot]\" after \
+         it or not"
+    )]
+    BotLogin(String),
     /// A job log host was refused.
     #[error("the job log host `{0}` was refused: {1}")]
     JobLogHost(String, ApiError),
@@ -120,6 +132,10 @@ pub struct GitHubConnector {
     custodian: CustodianClient,
     entries: BTreeMap<ConnectorName, EntryCredential>,
     job_log_hosts: Vec<Api>,
+    bot_login: Option<String>,
+    /// The gateway's receipts, once its store has connected: see
+    /// [`read_receipts_from`](GitHubConnector::read_receipts_from).
+    receipts: OnceLock<Arc<dyn ReceiptAttribution>>,
 }
 
 impl std::fmt::Debug for GitHubConnector {
@@ -148,6 +164,11 @@ impl GitHubConnector {
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
         if !account {
             return Err(SettingsError::Organization(organization.clone()));
+        }
+        if let Some(login) = &settings.bot_login
+            && !bot_login(login)
+        {
+            return Err(SettingsError::BotLogin(login.clone()));
         }
         let api = Api::new(&settings.api_url, settings.ca_file.as_deref())?;
         let mut served = BTreeMap::new();
@@ -186,7 +207,27 @@ impl GitHubConnector {
                 settings.custodian_deadline,
             ),
             entries: served,
+            bot_login: settings.bot_login.clone(),
+            receipts: OnceLock::new(),
         })
+    }
+
+    /// Gives the connector the gateway's receipts to read, once the gateway's receipt store has
+    /// connected, which is after the connector is built. The proposal tools read them to tell a
+    /// pull request the gateway opened for the caller ([`crate::proposals`]), and send nothing
+    /// until they are given. Given once; a second is passed over.
+    pub fn read_receipts_from(&self, receipts: Arc<dyn ReceiptAttribution>) {
+        let _ = self.receipts.set(receipts);
+    }
+
+    /// The gateway's receipts, once given.
+    pub(crate) fn receipts(&self) -> Option<Arc<dyn ReceiptAttribution>> {
+        self.receipts.get().cloned()
+    }
+
+    /// The App's own login, if the deployment gives it.
+    pub(crate) fn bot_login(&self) -> Option<&str> {
+        self.bot_login.as_deref()
     }
 
     /// The sentence for a call naming an owner other than the configured organization: Otto's.
@@ -214,6 +255,12 @@ impl GitHubConnector {
         }
         if tool.as_str() == crate::create_pr::CREATE_PR {
             return self.create_pr(&call).await;
+        }
+        if tool.as_str() == crate::proposals::PROPOSE_CHANGE {
+            return self.propose_change(&call).await;
+        }
+        if tool.as_str() == crate::proposals::AMEND_CHANGE {
+            return self.amend_change(&call).await;
         }
         if tool.as_str() == search::SEARCH {
             return self.search(&call).await;
@@ -697,6 +744,16 @@ fn not_served(call: &ToolCall) -> ToolOutcome {
 
 /// The caller's sentence when no token came back. The custodian's own sentence goes to the
 /// log, not the caller.
+/// Whether `login` is a GitHub login, 1 to 39 ASCII letters, digits and hyphens, with `[bot]`
+/// after it or not, as GitHub names an App's own account.
+fn bot_login(login: &str) -> bool {
+    let account = login.strip_suffix("[bot]").unwrap_or(login);
+    (1..=39).contains(&account.len())
+        && account
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
 fn custodian_sentence(team: &TeamId, kind: ErrorKind) -> String {
     match kind {
         ErrorKind::CustodianRefusal => format!(
@@ -734,6 +791,7 @@ mod tests {
             custodian_socket: PathBuf::from("/nonexistent/custodian.sock"),
             custodian_deadline: DEFAULT_CUSTODIAN_DEADLINE,
             job_log_hosts: Vec::new(),
+            bot_login: None,
         }
     }
 
@@ -837,6 +895,99 @@ mod tests {
                     permission: missing.into(),
                 }
             );
+        }
+    }
+
+    /// An entry serving `github__propose_change` or `github__amend_change` must be narrowed
+    /// `call` and state `contents: write` and `pull_requests: write`: its git writes need the
+    /// one, and its pull request's the other.
+    #[test]
+    fn an_entry_serving_a_proposal_states_both_writes_and_is_narrowed_to_the_call() {
+        for tool in [
+            crate::proposals::PROPOSE_CHANGE,
+            crate::proposals::AMEND_CHANGE,
+        ] {
+            let writing = |narrowing: Narrowing, permissions: &[(&str, Access)]| {
+                let mut entry = entry(narrowing, false);
+                entry.name = "github-write".into();
+                entry.tools = BTreeSet::from([tool.parse().unwrap()]);
+                entry.permissions = permissions
+                    .iter()
+                    .map(|(permission, access)| ((*permission).to_owned(), *access))
+                    .collect();
+                entry
+            };
+            let stated = [
+                ("contents", Access::Write),
+                ("pull_requests", Access::Write),
+            ];
+            GitHubConnector::new(
+                &settings("example-org"),
+                [&writing(Narrowing::Call, &stated)],
+            )
+            .unwrap();
+            assert_eq!(
+                GitHubConnector::new(
+                    &settings("example-org"),
+                    [&writing(Narrowing::Limit, &stated)],
+                )
+                .unwrap_err(),
+                SettingsError::WriteNotNarrowedToTheCall {
+                    entry: "github-write".into(),
+                    tool: tool.into(),
+                }
+            );
+            for (permissions, missing) in [
+                (
+                    vec![("contents", Access::Read), ("pull_requests", Access::Write)],
+                    "contents: write",
+                ),
+                (
+                    vec![("contents", Access::Write), ("pull_requests", Access::Read)],
+                    "pull_requests: write",
+                ),
+            ] {
+                assert_eq!(
+                    GitHubConnector::new(
+                        &settings("example-org"),
+                        [&writing(Narrowing::Call, &permissions)],
+                    )
+                    .unwrap_err(),
+                    SettingsError::WritePermissionNotStated {
+                        entry: "github-write".into(),
+                        tool: tool.into(),
+                        permission: missing.into(),
+                    }
+                );
+            }
+        }
+    }
+
+    /// The bot login is a GitHub login, with `[bot]` after it or not.
+    #[test]
+    fn the_bot_login_is_a_github_login() {
+        let with = |login: &str| GitHubSettings {
+            bot_login: Some(login.to_owned()),
+            ..settings("example-org")
+        };
+        let long = "a".repeat(40);
+        for refused in [
+            "",
+            "[bot]",
+            "my app[bot]",
+            "my_app",
+            "app[bot] ",
+            "a[bot][bot]",
+            long.as_str(),
+        ] {
+            assert_eq!(
+                GitHubConnector::new(&with(refused), []).unwrap_err(),
+                SettingsError::BotLogin(refused.to_owned())
+            );
+        }
+        let longest = format!("{}[bot]", "a".repeat(39));
+        for accepted in ["switchboard-app[bot]", "octocat", longest.as_str()] {
+            GitHubConnector::new(&with(accepted), []).unwrap();
         }
     }
 

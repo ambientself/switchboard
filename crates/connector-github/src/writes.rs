@@ -60,7 +60,7 @@ use serde_json::Value;
 
 use crate::api::{Api, WriteMethod, Wrote};
 use crate::connector::SettingsError;
-use crate::create_pr;
+use crate::{create_pr, proposals};
 
 /// The text every marker begins with, after `<!-- `. A call whose text holds it, in any case,
 /// is refused.
@@ -187,6 +187,7 @@ pub(crate) fn receipt(call: &ToolCall) -> Result<&AuditRowId, ToolOutcome> {
 pub(crate) fn asked(tool: &str) -> Option<&'static [(&'static str, Access)]> {
     match tool {
         create_pr::CREATE_PR => Some(create_pr::PERMISSIONS),
+        proposals::PROPOSE_CHANGE | proposals::AMEND_CHANGE => Some(proposals::PERMISSIONS),
         _ => None,
     }
 }

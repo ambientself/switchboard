@@ -12,7 +12,12 @@
 //! - The first pull request whose body has a line exactly equal to the receipt's marker
 //!   ([`crate::writes::marker`]) is the effect: `found`, with the reference `pull/<number>`. A
 //!   line, not a substring, and never a branch name or anything else the caller chose: no
-//!   caller can write the marker, since a call whose text holds its prefix is refused.
+//!   caller can write the marker, since a call whose text holds its prefix is refused. The
+//!   marker is the line of a pull request `github__create_pr` or `github__propose_change`
+//!   opened, or the line `github__amend_change` added to one.
+//! - With the App's own login configured (`[github] bot_login`), only a pull request GitHub
+//!   says that login opened is looked at: a person who copies a draft's description, marker
+//!   and all, into a pull request of their own makes nothing a lookup finds.
 //! - Nothing found is `not_found`, never authoritative: GitHub does not document the list as
 //!   complete and current, and a pull request updated by others since may sit past the pages
 //!   read. So a lookup never settles a receipt `not_performed`; one never found goes to a
@@ -87,7 +92,10 @@ impl GitHubConnector {
             else {
                 return LookupAnswer::Failed;
             };
-            if let Some(found) = pulls.iter().find(|pull| marked(pull, &marker)) {
+            if let Some(found) = pulls
+                .iter()
+                .find(|pull| opened_by(pull, self.bot_login()) && marked(pull, &marker))
+            {
                 return match found.get("number").and_then(Value::as_u64) {
                     Some(number) => LookupAnswer::Found {
                         reference: VendorReference::new(format!("pull/{number}")),
@@ -103,6 +111,12 @@ impl GitHubConnector {
             authoritative: false,
         }
     }
+}
+
+/// Whether `pull` was opened by `bot_login`, as GitHub names its author; any pull request when
+/// no bot login is configured.
+fn opened_by(pull: &Value, bot_login: Option<&str>) -> bool {
+    bot_login.is_none_or(|login| pull.pointer("/user/login").and_then(Value::as_str) == Some(login))
 }
 
 /// Whether `pull`'s body has a line exactly equal to `marker`.
@@ -146,5 +160,16 @@ mod tests {
         }
         assert!(!marked(&json!({ "body": null }), marker));
         assert!(!marked(&json!({}), marker));
+    }
+
+    #[test]
+    fn with_a_bot_login_only_its_pull_requests_are_looked_at() {
+        let app = json!({"user": {"login": "switchboard-app[bot]"}});
+        let person = json!({"user": {"login": "switchboard-app"}});
+        assert!(opened_by(&app, Some("switchboard-app[bot]")));
+        assert!(!opened_by(&person, Some("switchboard-app[bot]")));
+        assert!(!opened_by(&json!({}), Some("switchboard-app[bot]")));
+        assert!(opened_by(&person, None));
+        assert!(opened_by(&json!({}), None));
     }
 }
