@@ -2,20 +2,23 @@
 //! effect made through the gateway's HTTP endpoint whose answer was lost is left `unknown`, and
 //! the instance's reconciler later settles it by asking the connector's lookup, or hands it to
 //! a person. The fixture's draft tool runs on the fixture connector, which can lose a draft's
-//! answer after opening it, and its lookup is the testkit's fake, which sends nothing.
+//! answer after opening it, or hang past its deadline, and its lookup is the testkit's fake,
+//! which sends nothing. A second instance's reconciler works the same store, as another replica
+//! would.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod support;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use gateway::{
-    Config, ReconcileSettings, Reconciler, TELEMETRY_QUEUE, Telemetry, Timeouts, Wiring, boot,
-    serve_with_telemetry,
+    Config, DEFAULT_IN_PROCESS_RESULT_BYTES, InProcessLimits, ReconcileSettings, Reconciler,
+    TELEMETRY_QUEUE, Telemetry, Timeouts, Wiring, boot, serve_with_telemetry,
 };
 use gateway_core::receipt::EstablishedBy;
 use gateway_core::{LookupAnswer, Receipt, ReceiptState, VendorReference};
+use gateway_identity::{Clock, SystemClock};
 use gateway_mcp::TOOL_USE_ID_META;
 use gateway_testkit::{
     CONNECTOR, Caller, DOCUMENT_ARGUMENT, DRAFT_TOOL, FakeCredentialSource, FakeLookup, Fixture,
@@ -23,7 +26,7 @@ use gateway_testkit::{
     policy_data, policy_data_with_draft_lookup,
 };
 use serde_json::{Value, json};
-use support::{FixtureResources, Server, legacy};
+use support::{FixtureResources, Server, eventually, legacy};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
@@ -35,28 +38,73 @@ const SETTINGS: ReconcileSettings = ReconcileSettings {
 };
 
 /// The fixture served over loopback with `policy`, its store on the fixture's clock, and the
-/// fake lookup registered for the fixture connector, answering `answer`.
+/// fake lookup registered for the fixture connector, answering `answer`; and another instance's
+/// reconciler on the same store.
 struct World {
     server: Server,
     reconciler: Reconciler,
+    other: Reconciler,
     lookup: Arc<FakeLookup>,
 }
 
+/// How a world is set up beyond its policy and its lookup's answer.
+struct Setup {
+    settings: ReconcileSettings,
+    /// The store reads the system's clock, not the fixture's, so a lease runs out in real time.
+    real_time: bool,
+    /// The fixture connector's deadline in the gateway's own process, if not the default.
+    deadline: Option<Duration>,
+}
+
+impl Default for Setup {
+    fn default() -> Self {
+        Self {
+            settings: SETTINGS,
+            real_time: false,
+            deadline: None,
+        }
+    }
+}
+
 async fn start(policy: Value, answer: LookupAnswer) -> World {
+    start_with(policy, answer, Setup::default()).await
+}
+
+async fn start_with(policy: Value, answer: LookupAnswer, setup: Setup) -> World {
     let fixture = Fixture::new().unwrap();
     let credentials = Arc::new(FakeCredentialSource::new());
     let connector = Arc::new(FixtureConnector::new(credentials.clone()));
-    let store = Arc::new(InMemoryAuditStore::new().with_clock(Arc::new(fixture.clock.clone())));
+    let clock: Arc<dyn Clock> = if setup.real_time {
+        Arc::new(SystemClock)
+    } else {
+        Arc::new(fixture.clock.clone())
+    };
+    let store = Arc::new(InMemoryAuditStore::new().with_clock(clock));
     let lookup = Arc::new(FakeLookup::answering(answer));
     let mut config = support::config(&fixture);
     config["policy"] = policy;
-    let config: Config = serde_json::from_value(config).unwrap();
-    let wiring = Wiring::new(Arc::new(fixture.clock.clone()))
-        .audit_store(store.clone())
-        .connector(CONNECTOR, connector.clone(), Arc::new(FixtureResources))
-        .lookup(CONNECTOR, lookup.clone());
-    let gates = boot::check(config, wiring).unwrap();
-    let reconciler = gates.reconciler(store.clone(), SETTINGS);
+    let wiring = || {
+        let wiring = Wiring::new(Arc::new(fixture.clock.clone()))
+            .audit_store(store.clone())
+            .connector(CONNECTOR, connector.clone(), Arc::new(FixtureResources))
+            .lookup(CONNECTOR, lookup.clone());
+        match setup.deadline {
+            Some(deadline) => wiring.in_process_limits(
+                CONNECTOR,
+                InProcessLimits {
+                    deadline,
+                    max_result_bytes: DEFAULT_IN_PROCESS_RESULT_BYTES,
+                },
+            ),
+            None => wiring,
+        }
+    };
+    let gates = boot::check(serde_json::from_value(config.clone()).unwrap(), wiring()).unwrap();
+    let reconciler = gates.reconciler(store.clone(), setup.settings);
+    let others: Config = serde_json::from_value(config).unwrap();
+    let other = boot::check(others, wiring())
+        .unwrap()
+        .reconciler(store.clone(), setup.settings);
     let grant_signals = gates.grant_signals();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -87,6 +135,7 @@ async fn start(policy: Value, answer: LookupAnswer) -> World {
             serving,
         },
         reconciler,
+        other,
         lookup,
     }
 }
@@ -316,4 +365,183 @@ async fn nothing_is_looked_up_before_the_claim_is_committed() {
     let report = passing.await.unwrap();
     assert_eq!((report.claimed, report.looked_up), (1, 1), "{report:?}");
     assert_eq!(world.lookup.looked_up().len(), 1);
+}
+
+/// A side effect answered `unknown` at its deadline runs on in a task of its own, and while it
+/// runs no instance looks its receipt up, however long that is (#217): the task holds the
+/// receipt's lease, from before the call is answered, renewing it, so neither this instance's
+/// reconciler nor another's claims it, though a lookup would find nothing and settle it
+/// `not_performed` while the draft is still on its way. When the side effect ends the task
+/// holds the receipt once more, for a full lease, and only after that is it looked up.
+#[tokio::test]
+async fn no_instance_looks_up_a_receipt_while_its_late_side_effect_runs() {
+    let lease = Duration::from_millis(1600);
+    let world = start_with(
+        policy_data_with_draft_lookup(),
+        LookupAnswer::NotFound {
+            authoritative: true,
+        },
+        Setup {
+            settings: ReconcileSettings {
+                interval: Duration::from_secs(60),
+                lease,
+                attempts: 3,
+            },
+            real_time: true,
+            deadline: Some(Duration::from_millis(200)),
+        },
+    )
+    .await;
+    let store = &world.server.store;
+    let draft = world.server.connector.hang_next();
+    let answer = world.propose(fresh_key().as_str()).await;
+    assert_eq!(answer.result()["isError"], json!(true), "{answer:?}");
+    let receipt = store
+        .receipts()
+        .last()
+        .expect("a receipt was reserved")
+        .clone();
+    assert_eq!(receipt.state, ReceiptState::Unknown);
+    assert!(
+        world.server.connector.writes().is_empty(),
+        "the draft is still on its way"
+    );
+    let holder = store
+        .lease_holder(&receipt.row)
+        .expect("the receipt was answered unheld");
+    assert!(holder.as_str().ends_with("late-call"), "{holder}");
+
+    // For two leases, with the draft on its way, neither instance claims it.
+    let until = Instant::now() + lease * 2;
+    while Instant::now() < until {
+        for reconciler in [&world.reconciler, &world.other] {
+            let report = reconciler.pass().await;
+            assert_eq!((report.claimed, report.looked_up), (0, 0), "{report:?}");
+        }
+        tokio::time::sleep(lease / 8).await;
+    }
+    assert!(
+        world.lookup.looked_up().is_empty(),
+        "looked up while it ran"
+    );
+    assert_eq!(world.receipt(&receipt).state, ReceiptState::Unknown);
+
+    // It ends: the draft is opened, and the receipt is held a full lease from then.
+    let opened = SystemTime::now();
+    draft.open();
+    eventually("the late side effect ran to its end", || {
+        world.server.connector.writes().len() == 1
+    })
+    .await;
+    eventually(
+        "the receipt was held once more as the side effect ended",
+        || {
+            store
+                .lease_until(&receipt.row)
+                .is_some_and(|until| until >= opened + lease)
+        },
+    )
+    .await;
+    for reconciler in [&world.reconciler, &world.other] {
+        assert_eq!(reconciler.pass().await.claimed, 0);
+    }
+
+    // A lease later, it is looked up as any unknown receipt, and the draft is found.
+    world.lookup.answer(LookupAnswer::Found {
+        reference: VendorReference::new("draft-1"),
+    });
+    tokio::time::sleep(lease + Duration::from_millis(200)).await;
+    let report = world.reconciler.pass().await;
+    assert_eq!(
+        (report.claimed, report.looked_up, report.settled),
+        (1, 1, 1),
+        "{report:?}"
+    );
+    let settled = world.receipt(&receipt);
+    assert_eq!(
+        (settled.state, &settled.established_by),
+        (ReceiptState::Completed, &EstablishedBy::Reconciliation)
+    );
+}
+
+/// A lookup whose record fails to save still uses up its attempt (#206): an attempt is counted
+/// when its claim is made, so a store that cannot save lookups lets a receipt be looked up
+/// `attempts` times, and the next claim hands it to a person with no lookup.
+#[tokio::test]
+async fn a_lookup_whose_record_fails_to_save_still_uses_up_an_attempt() {
+    let world = start(
+        policy_data_with_draft_lookup(),
+        LookupAnswer::NotFound {
+            authoritative: false,
+        },
+    )
+    .await;
+    let receipt = world.lost_proposal(fresh_key().as_str()).await;
+    world.server.store.fail_all_lookup_records();
+
+    for attempt in 1..=SETTINGS.attempts {
+        let report = world.reconciler.pass().await;
+        assert_eq!(
+            (report.claimed, report.looked_up),
+            (1, 1),
+            "attempt {attempt}: {report:?}"
+        );
+        world.server.fixture.clock.advance(SETTINGS.lease);
+    }
+    let report = world.reconciler.pass().await;
+    assert_eq!(
+        (report.claimed, report.looked_up, report.handed_to_person),
+        (1, 0, 1),
+        "{report:?}"
+    );
+    assert_eq!(
+        world.lookup.looked_up().len(),
+        usize::try_from(SETTINGS.attempts).unwrap()
+    );
+    let handed = world.receipt(&receipt);
+    assert_eq!(
+        (handed.state, handed.lookups.len(), handed.claims),
+        (ReceiptState::Unknown, 0, SETTINGS.attempts + 1)
+    );
+    assert!(handed.handed_to_person.is_some());
+    world.server.fixture.clock.advance(SETTINGS.lease);
+    assert_eq!(world.reconciler.pass().await.due, 0);
+    assert_eq!(
+        world.reconciler.signals().counts().store_failures,
+        u64::from(SETTINGS.attempts)
+    );
+}
+
+/// A lookup has half the lease to answer, so it ends while the lease is held: one that never
+/// answers is given up at half the lease and recorded as failed, leaving the receipt `unknown`.
+#[tokio::test]
+async fn a_lookup_has_half_the_lease_to_answer() {
+    let lease = Duration::from_millis(1200);
+    let world = start_with(
+        policy_data_with_draft_lookup(),
+        LookupAnswer::Found {
+            reference: VendorReference::new("draft-1"),
+        },
+        Setup {
+            settings: ReconcileSettings { lease, ..SETTINGS },
+            ..Setup::default()
+        },
+    )
+    .await;
+    let receipt = world.lost_proposal(fresh_key().as_str()).await;
+    let _never = world.lookup.hold();
+
+    let started = Instant::now();
+    let report = world.reconciler.pass().await;
+    let took = started.elapsed();
+    assert_eq!((report.claimed, report.looked_up), (1, 1), "{report:?}");
+    assert!(
+        took >= lease / 2 && took < lease * 3 / 4,
+        "the lookup was given up after {took:?}"
+    );
+    let left = world.receipt(&receipt);
+    assert_eq!(left.state, ReceiptState::Unknown);
+    assert_eq!(left.lookups.len(), 1);
+    assert_eq!(left.lookups[0].answer, LookupAnswer::Failed);
+    assert_eq!(world.reconciler.signals().counts().failed, 1);
 }

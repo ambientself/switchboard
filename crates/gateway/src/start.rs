@@ -58,7 +58,11 @@
 //!
 //! The Postgres store reports each audit row it stops trying to complete. The gateway logs each
 //! report as [`GIVEN_UP_EVENT`] at `ERROR`, naming the row, so an open row is found when it is
-//! left open and not only by querying for it (decision 0009).
+//! left open and not only by querying for it (decision 0009). It reports, too, each finish that
+//! completed its row after the row's deadline and disagreed with the state reconciliation had
+//! settled the receipt in, which the gateway logs as [`LATE_FINISH_DISAGREES_EVENT`] at `WARN`;
+//! the store counts each, and the metrics export the count (decision 0009, "What a receipt
+//! is").
 //!
 //! It logs a boot line for the caps on calls in flight and the rate quotas, and one for each
 //! server's bounds.
@@ -86,7 +90,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use audit_postgres::{BootCheckError, GivenUp, PgAuditError, PgAuditStore, PoolSizes};
+use audit_postgres::{
+    BootCheckError, Disagreement, GivenUp, PgAuditError, PgAuditStore, PoolSizes,
+};
 use connector_github::{GitHubConnector, GitHubSettings, SettingsError};
 use connector_proxy::{
     CredentialFileError, FileCredentials, Loopback, ProxyConnector, Refusal, Upstream,
@@ -117,6 +123,13 @@ use crate::reload::Reloader;
 /// `row`, the `outcome` that was not written (`ok`, `error` or `refused`), and the `cause`.
 /// The row keeps an empty outcome.
 pub const GIVEN_UP_EVENT: &str = "audit_row_given_up";
+
+/// The `event` field of the warning logged for each finish that completed its row after the
+/// row's deadline, when reconciliation had already settled the row's receipt in another state
+/// than the finish's outcome settles it in. It names the `receipt`, the state the finish
+/// reported (`finish`) and the one reconciliation settled (`reconciliation`). The receipt is
+/// left as reconciliation settled it.
+pub const LATE_FINISH_DISAGREES_EVENT: &str = "late_finish_disagrees_with_reconciliation";
 
 /// The environment variable that names the gateway instance, before [`HOSTNAME_VAR`].
 pub const INSTANCE_VAR: &str = "SWITCHBOARD_INSTANCE";
@@ -639,7 +652,9 @@ async fn prepare_with(
     );
 
     // Every instance works the queue of unknown receipts (decision 0009, "Reconciliation"). No
-    // connector registers a lookup yet, so each such receipt goes to a person.
+    // connector registers a lookup yet, so each such receipt goes to a person. A side effect of
+    // a connector in this process that runs past its deadline holds its receipt in the same
+    // queue while it runs, so no instance looks it up meanwhile.
     let reconciler = store.clone().map(|store| {
         let settings = deployment.reconciliation;
         tracing::info!(
@@ -1026,8 +1041,9 @@ async fn audit_store(url: &str, pools: PoolSizes) -> Result<Arc<PgAuditStore>, S
     let config: tokio_postgres::Config = url
         .parse()
         .map_err(|error: tokio_postgres::Error| StartError::DatabaseUrl(error.to_string()))?;
-    let store =
-        PgAuditStore::connect(config, tokio_postgres::NoTls, pools)?.on_given_up(log_given_up);
+    let store = PgAuditStore::connect(config, tokio_postgres::NoTls, pools)?
+        .on_given_up(log_given_up)
+        .on_late_finish_disagreeing(log_late_finish_disagreeing);
     match tokio::time::timeout(AUDIT_CHECK_BUDGET, store.check_at_boot()).await {
         Err(_elapsed) => Err(StartError::AuditCheckTimedOut),
         Ok(Err(refused)) => Err(StartError::AuditCheck(refused)),
@@ -1044,6 +1060,19 @@ fn log_given_up(given_up: GivenUp<'_>) {
         outcome = given_up.outcome,
         cause = %given_up.error,
         "an audit row's completion was not written, and the store has stopped trying"
+    );
+}
+
+/// Logs one late finish that disagreed with reconciliation as [`LATE_FINISH_DISAGREES_EVENT`].
+/// Called on the finish's own task, once the row's completion has committed.
+fn log_late_finish_disagreeing(disagreement: Disagreement<'_>) {
+    tracing::warn!(
+        event = LATE_FINISH_DISAGREES_EVENT,
+        receipt = disagreement.row,
+        finish = disagreement.finish,
+        reconciliation = disagreement.reconciliation,
+        "a finish written after its row's deadline disagrees with the state reconciliation \
+         settled its receipt in; the receipt is left as reconciliation settled it"
     );
 }
 
