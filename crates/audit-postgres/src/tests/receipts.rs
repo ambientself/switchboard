@@ -548,7 +548,8 @@ async fn the_receipt_team_migration_keeps_the_receipts_already_reserved() {
         .unwrap();
     let id = fresh_id(&admin).await;
     receipt_in(&admin, &id, "key-before-0013", "unknown", false).await;
-    let read = format!("SELECT to_jsonb(r) FROM switchboard_audit.receipts r WHERE row_id = '{id}'");
+    let read =
+        format!("SELECT to_jsonb(r) FROM switchboard_audit.receipts r WHERE row_id = '{id}'");
     let before = values(&admin, &read).await;
 
     let mut owner = db.connect_as(OWNER_ROLE).await;
@@ -574,7 +575,12 @@ async fn the_receipt_team_migration_keeps_the_receipts_already_reserved() {
         )
         .await
         .unwrap_err();
-    assert_eq!(code(&error), Some(INSUFFICIENT_PRIVILEGE), "{}", message(&error));
+    assert_eq!(
+        code(&error),
+        Some(INSUFFICIENT_PRIVILEGE),
+        "{}",
+        message(&error)
+    );
     let error = owner
         .execute(
             &format!("UPDATE switchboard_audit.receipts SET team = 'team-a' WHERE row_id = '{id}'"),

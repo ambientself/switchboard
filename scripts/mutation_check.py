@@ -1165,7 +1165,7 @@ mutate("reconcile-target-not-recorded", "begin records no vendor target, so ever
        "            .and_then(|_| None),")
 mutate("core-tool-call-receipt-none", "a connector is never given its call's receipt, so a write tool sends nothing", SRC + "connector.rs",
        "        (self.tool.classification != Classification::Read).then_some(&self.granted.row)",
-       "        (self.tool.classification == Classification::Destructive).then_some(&self.granted.row)")
+       "        None")
 mutate("core-receipt-team-not-recorded", "begin reserves a receipt without its principal's team, so a lookup has none to ask for", SRC + "audit.rs",
        "    let team = call.caller.principal.get().team().cloned();",
        "    let team = call.caller.principal.get().team().cloned().filter(|_| false);")
