@@ -707,18 +707,20 @@ counted, logged and tried again, waiting from a second up to a minute between at
 GitHub accepts it or the token reaches GitHub's expiry; so while GitHub refuses revocations a
 token works past its lifetime, until GitHub's expiry at most, an hour after it was issued.
 GitHub's 401, to a token it no longer accepts because it already revoked or expired it, counts
-as revoked. A graceful stop (a terminate signal or an interrupt) stops accepting, waits for the
-requests in flight and revokes every token the custodian handed out, or issued and did not hand
-out, that is not yet revoked or expired, retrying as above, all within ten seconds, which the
+as revoked. A graceful stop (a terminate signal or an interrupt) stops accepting and at once
+revokes every token the custodian handed out, or issued and did not hand out, that is not yet
+revoked or expired, retrying as above; meanwhile it waits for the requests in flight and
+revokes each token GitHub issues for one as it is issued; all within ten seconds, which the
 termination grace must cover. A token not revoked by then is logged and works until GitHub's
-expiry, as does every token when the custodian is killed rather than stopped. A stop also ends
-a token the gateway is using for a call in flight, which then fails. Each request writes one
-JSON line to the custodian's own record, with the revision it was checked against and never the
-token (a malformed request's line keeps its tool, and its team unless the team is what is
-malformed), and is counted on a metrics listener of its own. The gateway links the crate's
-client alone, its `client` feature: the code that reads the key, signs the App's JWTs, calls
-GitHub and serves the socket is the `server` feature, which the gateway's build leaves off. No
-demo deploys it: that needs a real App.
+expiry, as does one GitHub issues after then to a request still in flight, and every token when
+the custodian is killed rather than stopped. A stop also ends a token the gateway is using for
+a call in flight, which then fails. Each request writes one JSON line to the custodian's own
+record, with the revision it was checked against and never the token (a malformed request's
+line keeps its tool, and its team unless the team is what is malformed), and is counted on a
+metrics listener of its own. The gateway links the crate's client alone, its `client` feature:
+the code that reads the key, signs the App's JWTs, calls GitHub and serves the socket is the
+`server` feature, which the gateway's build leaves off. No demo deploys it: that needs a real
+App.
 
 **The GitHub connector as built** (#12, the crate `connector-github`). It runs in the
 gateway's own process and holds no key. For each call it asks the custodian for a token,
@@ -2376,10 +2378,11 @@ that removes the exception-list check.
   macOS: the socket is served to another UID than the test's. The registry's `[[connectors]]`
   states each built-in entry's permission set and tools. Not built: any deployment of the
   custodian. Left as they are: a token whose revocation GitHub keeps refusing, or does not
-  accept within the stop's deadline, and any token when the custodian is killed rather than
-  stopped, works until GitHub's expiry, an hour at most after it was issued; and a registry
-  file under a new revision that the loader accepts but the gateway's reload refuses makes the
-  custodian refuse every request as stale until the two agree.
+  accept within the stop's deadline, a token GitHub issues after that deadline to a request
+  still in flight, and any token when the custodian is killed rather than stopped, works until
+  GitHub's expiry, an hour at most after it was issued; and a registry file under a new
+  revision that the loader accepts but the gateway's reload refuses makes the custodian refuse
+  every request as stale until the two agree.
 
 - Built, as the crate `connector-github`: the GitHub connector and its first three read
   tools, `github__get_file`, `github__get_pr` and `github__get_issue` (section 13), with
