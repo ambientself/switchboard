@@ -10,9 +10,9 @@
 //! repositories, so for the whole installation, and for `metadata: read` alone, the permission
 //! every GitHub token carries and the least that lists the repositories. The custodian gives it
 //! only to a tool served by an entry the registry declares `reports_reach = true`, and the
-//! registry holds such an entry to that job: narrowed `none`, `read`, served only to named
-//! principals (the registry's own, on `registry-reach`). The connector serves this tool only on
-//! such an entry, and serves no other tool on one.
+//! registry holds such an entry to that job: narrowed `none`, `read`, served only on
+//! `registry-reach`, to one named principal, the registry's own identity. The connector serves
+//! this tool only on such an entry, and serves no other tool on one ([`crate::served`]).
 //!
 //! It takes no arguments. It reads every page, [`PER_PAGE`] repositories a page, up to
 //! [`MAX_REPORT_PAGES`]. An installation on more repositories than that is an error, never a
