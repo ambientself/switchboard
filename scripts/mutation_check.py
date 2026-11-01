@@ -6995,12 +6995,30 @@ mutate("github-proposal-token-not-narrowed", "a proposal tool's token is asked f
 mutate("github-attribution-other-tool", "a pull request is the caller's on a receipt of github__create_pr, not github__propose_change", GHP,
        "        let Ok(tool) = ToolName::parse(PROPOSE_CHANGE) else {",
        '        let Ok(tool) = ToolName::parse("github__create_pr") else {')
+mutate("github-attribution-other-principal", "a pull request is the caller's on a receipt another principal of the same issuer holds", GHP,
+       "            call.call().caller.principal.get().id.clone(),",
+       '            gateway_core::PrincipalId { issuer: call.call().caller.principal.get().id.issuer.clone(), subject: gateway_core::Subject::new("someone-else") },')
+mutate("github-proposal-symlink-mode-is-file", "a path the tree says is a symbolic link is written over as a regular file", GHP,
+       '        "120000" => Kind::Symlink,', '        "120000" => Kind::File,')
+mutate("github-proposal-submodule-mode-is-file", "a path the tree says is a submodule is written over as a regular file", GHP,
+       '        "160000" => Kind::Submodule,', '        "160000" => Kind::File,')
+mutate("github-proposal-directory-path-is-file", "a path the tree says is a directory is taken for a regular file", GHP,
+       "                    (Kind::File, true) => regular = true,",
+       "                    (Kind::File | Kind::Directory, true) => regular = true,")
+mutate("github-proposal-under-non-directory", "a path under a file, link or submodule is walked as if under a directory", GHP,
+       "                    (Kind::Directory, false) => directory.clone_from(&entry.sha),",
+       "                    (_, false) => directory.clone_from(&entry.sha),")
+mutate("github-proposal-truncated-listing-accepted", "a tree listing GitHub cut short is read as whole", GHP,
+       '        if found.get("truncated").and_then(Value::as_bool) != Some(false) {',
+       "        if false {")
 mutate("github-no-change-check-removed", "files the same as the base or the head are written, as a change", GHP,
        "            if !same_file(&found, &file.content) {", "            if true {")
 mutate("github-claims-fence-short", "a claim's fence is three backticks, which a claim holding three closes", GHP,
        '    "`".repeat(longest.max(2) + 1)', '    "`".repeat(3)')
 mutate("github-commit-parent-wrong", "a proposal's commit names the base's tree as its parent", GHP,
        "                    parents: [parent],", "                    parents: [base_tree],")
+mutate("github-propose-key-trailing-dot", "a key ending in \".\", which no branch name may, is taken", GHPC,
+       "        && !key.ends_with('.')\n", "")
 mutate("github-propose-branch-prefix", "a proposal's branch is the key alone, not under otto/", GHPC,
        '        format!("{BRANCH_PREFIX}{}", self.key)', "        self.key.clone()")
 mutate("github-propose-not-a-draft", "a proposal's pull request is opened ready for review", GHPC,
