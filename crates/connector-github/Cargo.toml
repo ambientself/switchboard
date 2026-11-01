@@ -21,8 +21,9 @@ hyper = { version = "1", features = ["client", "http1"] }
 # the deployment names is trusted. Its provider is ring, which this crate passes to the client.
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
-# The client the connector asks the key custodian with. Nothing in it reads the key.
-key-custodian = { path = "../key-custodian" }
+# The client the connector asks the key custodian with, and nothing else of the custodian: without
+# its default features the crate leaves out the server, which reads the key.
+key-custodian = { path = "../key-custodian", default-features = false, features = ["client"] }
 # A path and a ref are sent percent-encoded. Already in the build through the HTTP stack.
 percent-encoding = "2"
 # The token AGENTS.md is quoted with, from the operating system's random source.

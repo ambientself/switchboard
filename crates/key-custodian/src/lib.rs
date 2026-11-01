@@ -15,6 +15,15 @@
 //!   depend on it; nothing in the client reads the key.
 //! - `fake`, behind the `test-support` feature, is a fake GitHub App API for the tests.
 //!
+//! # Features
+//!
+//! `client` is the client and `server` the custodian itself: the key, the GitHub App client,
+//! the policy check, the socket, the record and the metrics. Both are on by default. The
+//! GitHub connector turns the defaults off and asks for `client` alone, so the gateway links
+//! the client and the wire protocol ([`protocol`]) and none of the server's code or
+//! dependencies (`tests/packaging.rs` checks the gateway's build). The `switchboard-custodian`
+//! binary needs `server`.
+//!
 //! # Where a tool's permission set is stated
 //!
 //! On its connector entry, not its approval: a built-in entry of system `github` in the
@@ -76,20 +85,32 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "client")]
 pub mod client;
+#[cfg(feature = "server")]
 pub mod clock;
 #[cfg(feature = "test-support")]
 pub mod fake;
+#[cfg(feature = "server")]
 pub mod github;
+#[cfg(feature = "server")]
 pub mod metrics;
+#[cfg(feature = "server")]
 pub mod policy;
 pub mod protocol;
+#[cfg(feature = "server")]
 pub mod rate;
+#[cfg(feature = "server")]
 pub mod record;
+#[cfg(feature = "server")]
 pub mod server;
+#[cfg(feature = "server")]
 pub mod start;
 
+#[cfg(feature = "client")]
 pub use client::{ClientError, CustodianClient, Token};
+#[cfg(feature = "server")]
 pub use policy::{CustodianPolicy, PolicyCell, PolicyError};
 pub use protocol::{Answer, Failure, MAX_REPOSITORIES, Refusal, Secret, TokenRequest};
+#[cfg(feature = "server")]
 pub use start::{Config, Running, StartError, start};
