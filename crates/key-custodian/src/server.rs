@@ -171,7 +171,7 @@ impl Custodian {
             }
         };
         if let Some(problem) = request.malformed() {
-            return self.refuse(line, Refusal::Malformed, problem);
+            return self.refuse(line.attribution(&request), Refusal::Malformed, problem);
         }
         let mut line = line.request(&request);
         if let Err((reason, message)) = policy.check(&request, &self.account) {
