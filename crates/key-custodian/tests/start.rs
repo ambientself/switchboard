@@ -7,8 +7,10 @@ mod common;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::PermissionsExt;
 
-use common::{World, my_uid, registry, write_file};
-use key_custodian::{Config, PolicyError, StartError};
+use common::{KEY, World, config, fake_app, files, my_uid, registry, scratch, write_file};
+use key_custodian::fake::FakeGitHub;
+use key_custodian::start::own_uid;
+use key_custodian::{Config, PolicyError, StartError, start_process};
 
 #[tokio::test]
 async fn no_key_refuses_to_start() {
@@ -156,6 +158,73 @@ async fn a_github_entry_listing_a_tool_of_another_system_refuses_to_start() {
         );
         assert!(!socket.exists(), "{tool}: no socket is made");
     }
+}
+
+#[tokio::test]
+async fn its_own_uid_as_the_peer_refuses_to_start_as_a_process() {
+    // A process running as the custodian could ask for tokens. The test's own process is the
+    // custodian here, and the one it would serve.
+    let dir = scratch();
+    files(&dir, &KEY);
+    let fake = FakeGitHub::start(fake_app()).await.unwrap();
+    let config = config(&dir, &fake);
+    assert_eq!(own_uid().unwrap(), my_uid());
+    assert_eq!(config.peer_uid, my_uid());
+    let error = start_process(config.clone(), Box::new(std::io::sink()))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(error, StartError::PeerIsOwnUid(uid) if uid == my_uid()),
+        "{error}"
+    );
+    assert!(!config.socket.exists(), "no socket is made");
+
+    // Another UID is served.
+    let mut other = config;
+    other.peer_uid = my_uid() + 1;
+    let running = start_process(other, Box::new(std::io::sink()))
+        .await
+        .unwrap();
+    running.stop().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_binary_refuses_its_own_uid_as_the_peer() {
+    let dir = scratch();
+    let socket = dir.join("c.sock");
+    let file = dir.join("custodian.toml");
+    write_file(
+        &file,
+        &format!(
+            r#"socket = "{}"
+peer_uid = {}
+registry = "{}"
+
+[github]
+api_url = "http://127.0.0.1:9"
+app_id = "4242"
+installation_id = 7
+account = "example-org"
+key_file = "{}"
+"#,
+            socket.display(),
+            my_uid(),
+            dir.join("registry.toml").display(),
+            dir.join("app-key.pem").display(),
+        ),
+        0o600,
+    );
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_switchboard-custodian"))
+        .arg(format!("--config={}", file.display()))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("the custodian's own UID"), "{stderr}");
+    assert!(!socket.exists(), "no socket is made");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]

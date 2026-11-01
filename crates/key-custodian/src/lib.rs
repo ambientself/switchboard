@@ -10,7 +10,8 @@
 //! limits the token's lifetime, and keeps its own record.
 //!
 //! - [`start()`] reads the configuration, the key and the registry file, and serves the socket
-//!   ([`server`]). The binary is `switchboard-custodian`.
+//!   ([`server`]). The binary is `switchboard-custodian`, which starts through
+//!   [`start_process`]: that also refuses a `peer_uid` that is the custodian's own UID.
 //! - [`CustodianClient`] is the client. It is in this crate so that the GitHub connector can
 //!   depend on it; nothing in the client reads the key.
 //! - `fake`, behind the `test-support` feature, is a fake GitHub App API for the tests.
@@ -113,4 +114,4 @@ pub use client::{ClientError, CustodianClient, Token};
 pub use policy::{CustodianPolicy, PolicyCell, PolicyError};
 pub use protocol::{Answer, Failure, MAX_REPOSITORIES, Refusal, Secret, TokenRequest};
 #[cfg(feature = "server")]
-pub use start::{Config, Running, StartError, start};
+pub use start::{Config, Running, StartError, start, start_process};

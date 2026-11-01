@@ -37,6 +37,11 @@
 //! - `api_url` is not https with a CA file, or plain http to a loopback address;
 //! - a limit is out of its range.
 //!
+//! [`start_process`], which the `switchboard-custodian` binary calls, also refuses a `peer_uid`
+//! that is the custodian's own UID: the one process served must be the gateway, and a peer of
+//! the custodian's UID could be any process running as the custodian. [`start`] alone does not
+//! check it, because a custodian started in the process of a test serves that same process.
+//!
 //! A socket left at `socket` by an earlier run is removed. The new one is set to `socket_mode`
 //! explicitly once bound, whatever the umask.
 
@@ -49,7 +54,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
@@ -246,6 +251,15 @@ pub enum StartError {
     /// `socket_mode` gives others some access.
     #[error("`socket_mode` is {0:o}; the socket must give others no access")]
     SocketMode(u32),
+    /// `peer_uid` is the custodian's own UID.
+    #[error(
+        "`peer_uid` is {0}, the custodian's own UID; it must be the gateway's, and the \
+         custodian must run as another UID"
+    )]
+    PeerIsOwnUid(u32),
+    /// The custodian's own UID could not be read.
+    #[error("could not read the custodian's own UID: {0}")]
+    OwnUid(String),
     /// Something other than a socket is at the socket's path.
     #[error("`{0}` exists and is not a socket")]
     SocketPathTaken(PathBuf),
@@ -357,7 +371,32 @@ impl Drop for Running {
     }
 }
 
-/// Starts the custodian `config` describes, writing its record to `record`.
+/// The UID this process runs as, as the kernel gives it to a peer: read from one end of a
+/// socket pair, as the custodian reads a peer's.
+pub fn own_uid() -> Result<u32, StartError> {
+    let (ours, _theirs) =
+        UnixStream::pair().map_err(|error| StartError::OwnUid(error.to_string()))?;
+    let credentials = ours
+        .peer_cred()
+        .map_err(|error| StartError::OwnUid(error.to_string()))?;
+    Ok(credentials.uid())
+}
+
+/// Starts the custodian `config` describes as its own process, writing its record to `record`:
+/// refuses a `peer_uid` that is the process's own UID, then [`start`]s it.
+pub async fn start_process(
+    config: Config,
+    record: Box<dyn Write + Send>,
+) -> Result<Running, StartError> {
+    let own = own_uid()?;
+    if config.peer_uid == own {
+        return Err(StartError::PeerIsOwnUid(own));
+    }
+    start(config, record).await
+}
+
+/// Starts the custodian `config` describes, writing its record to `record`. Serves
+/// `peer_uid` whatever it is; see [`start_process`].
 pub async fn start(config: Config, record: Box<dyn Write + Send>) -> Result<Running, StartError> {
     config.check()?;
     let key = read_key(&config.github.key_file)?;
