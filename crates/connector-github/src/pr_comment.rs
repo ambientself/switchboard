@@ -385,7 +385,9 @@ fn pull_failed(answered: Answered, call: &PrComment) -> ToolOutcome {
         ),
         Answered::Status { status, .. } if status == StatusCode::FORBIDDEN => (
             ErrorKind::VendorRefusal,
-            format!("GitHub refused to show pull request #{number} in {repository} to this App (HTTP 403)"),
+            format!(
+                "GitHub refused to show pull request #{number} in {repository} to this App (HTTP 403)"
+            ),
         ),
         Answered::Status { status, .. } => (
             ErrorKind::Other,
