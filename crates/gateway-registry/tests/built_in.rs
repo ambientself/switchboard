@@ -195,7 +195,8 @@ fn each_declaration_is_the_assurance_the_approval_states() {
 }
 
 /// A repository of the GitHub entry's reach.
-const ATLAS: &str = r#"{ system = "github", kind = "repository", identifier = "example-org/atlas" }"#;
+const ATLAS: &str =
+    r#"{ system = "github", kind = "repository", identifier = "example-org/atlas" }"#;
 
 /// A tool declared as its entry's reach names the whole reach on every call, so its entry must
 /// record one (decision 0011, section 1), as a proxied entry must; and a GitHub entry with a

@@ -5,8 +5,8 @@
 
 use gateway_core::{ConnectorName, ToolName};
 use gateway_registry::{
-    REACH_SURFACE, ReachReport, Registry, RegistryError, StatedResources,
-    built_in_binding_sha256, definition_sha256,
+    REACH_SURFACE, ReachReport, Registry, RegistryError, StatedResources, built_in_binding_sha256,
+    definition_sha256,
 };
 
 const REPORT_TOOL: &str = "github__list_installation_repositories";
@@ -51,7 +51,8 @@ const ONLY: &str = r#"{ only = [{ issuer = "https://workloads.example.test", sub
 /// The registry's identity and one more named principal.
 const TWO: &str = r#"{ only = [{ issuer = "https://workloads.example.test", subject = "system:serviceaccount:switchboard:registry" }, { issuer = "https://workloads.example.test", subject = "system:serviceaccount:team-a:agent" }] }"#;
 
-const FROM_ARGUMENTS: &str = r#"{ from_arguments = [{ from_argument = "repo", system = "github", kind = "repository" }] }"#;
+const FROM_ARGUMENTS: &str =
+    r#"{ from_arguments = [{ from_argument = "repo", system = "github", kind = "repository" }] }"#;
 
 impl Default for Case {
     fn default() -> Self {

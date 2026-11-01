@@ -170,7 +170,9 @@ mod tests {
              reading github repository from `owner`/`repo`"
         );
         assert_eq!(
-            stated.mismatch(&read(StatedResources::NoResources)).unwrap(),
+            stated
+                .mismatch(&read(StatedResources::NoResources))
+                .unwrap(),
             "is approved as `no_resources`, and its connector states `from_arguments`, reading \
              github repository from `owner`/`repo`"
         );
