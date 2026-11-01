@@ -551,7 +551,11 @@ fn the_baseline_kinds_are_refused_in_the_new_format() {
     for (name, grant, kind, signed) in cases {
         let failure = refused(&verifier, &grant);
         assert_eq!(failure.kind(), kind, "{name}");
-        assert_eq!(failure.digest().is_some(), signed, "{name}");
+        assert_eq!(
+            failure.digest().is_some(),
+            signed && carries_digest(kind),
+            "{name}"
+        );
     }
     // Two of the suite's cases differ here. `legacy_headers` sends no grant, which is the
     // request path's to refuse, not the verifier's. `qualified_tool` names a tool by its

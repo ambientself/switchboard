@@ -23,8 +23,9 @@
 //! `ERROR`, to be investigated, since an honest sandbox under a correct configuration never
 //! makes one. A lifetime failure (expired, not yet valid, or over the ceiling) is counted and
 //! never logged one by one, since honest sandboxes make them. Every other failure is logged at
-//! `WARN`. A failure's log line holds its kind and, only when its signature verified, the
-//! grant's digest: nothing from the grant's claims, which a [`GrantFailure`] does not carry.
+//! `WARN`. A failure's log line holds its kind and, only for a binding's failure (the audience
+//! or the pod, since a lifetime failure is not logged), the grant's digest: nothing from the
+//! grant's claims, which a [`GrantFailure`] does not carry.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -357,9 +358,9 @@ pub(crate) fn delegation_failure(kind: FailureKind) -> DelegationFailure {
 }
 
 /// The unverified delegation a failure of `kind` becomes: the core's failure, and `digest`,
-/// which the verifier gives only once the signature verified. The core records a digest only
-/// with a binding's failure (the audience, the lifetime or the pod), so a digest given with any
-/// other failure, such as claims that are malformed though signed, is not recorded.
+/// which the verifier gives only with a binding's failure (the audience, the lifetime or the
+/// pod), the only failure the core records one with. Should a digest come with any other
+/// failure, it is not recorded.
 pub(crate) fn unverified(kind: FailureKind, digest: Option<GrantDigest>) -> UnverifiedDelegation {
     let failure = delegation_failure(kind);
     digest

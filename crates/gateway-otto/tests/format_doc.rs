@@ -143,7 +143,7 @@ fn the_example_verifies() {
         );
     }
     // The last character of the signature part, likewise: the signature still verifies, and the
-    // grant is refused for its encoding, with its digest.
+    // grant is refused for its encoding, with no digest: only a binding's failure carries one.
     assert!(grant.ends_with('w'));
     for replacement in "xyz0123456789-_".chars() {
         let changed = format!("{}{replacement}", &grant[..grant.len() - 1]);
@@ -155,6 +155,6 @@ fn the_example_verifies() {
             gateway_otto::FailureKind::Encoding,
             "{replacement}"
         );
-        assert_eq!(failure.digest(), Some(GrantDigest::of(changed.as_bytes())));
+        assert_eq!(failure.digest(), None, "{replacement}");
     }
 }

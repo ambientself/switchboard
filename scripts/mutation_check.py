@@ -1586,6 +1586,14 @@ mutate("otto-grant-digest-dropped", "a failure after the signature verified carr
 mutate("otto-grant-digest-of-decoded-claims", "the digest is taken over the decoded claims, not the grant as presented", OV,
        "        let digest = GrantDigest::of(grant);",
        "        let digest = GrantDigest::of(&LENIENT.decode(claims).unwrap_or_default());")
+# Only a binding's failure carries the digest (#213): a signed grant refused for its encoding or
+# its claims' shape carries none. tests/forgery.rs, tests/format_doc.rs and the gateway's
+# tests/grant_logs.rs catch these.
+mutate("otto-grant-digest-on-encoding", "a signed grant refused for its encoding carries its digest", OV,
+       "            || CANONICAL.encode(&claims_bytes).as_bytes() != claims\n        {\n            return Err(refuse(FailureKind::Encoding));",
+       "            || CANONICAL.encode(&claims_bytes).as_bytes() != claims\n        {\n            return Err(bind(FailureKind::Encoding));")
+mutate("otto-grant-digest-on-malformed", "a signed grant whose claims are malformed carries its digest", OV,
+       "            .ok_or(refuse(FailureKind::Malformed))?;", "            .ok_or(bind(FailureKind::Malformed))?;")
 mutate("otto-grant-empty-tools-accepted", "a grant with no tools is accepted", OV,
        ".filter(|tools| !tools.is_empty() && tools.iter().all(|tool| !tool.is_empty()))?;",
        ".filter(|tools| tools.iter().all(|tool| !tool.is_empty()))?;")
