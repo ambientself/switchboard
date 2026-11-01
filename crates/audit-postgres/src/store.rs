@@ -536,15 +536,20 @@ fn pool_stats(pool: &Pool) -> PoolStats {
 }
 
 /// A finish that stopped without completing its row, which keeps an empty outcome. Decision
-/// 0009 makes each one a telemetry event naming the row and the outcome's kind. A row whose
-/// begin failed after its insert was executed, and which the store could not complete as
-/// `error`, is reported the same way, with the outcome `error`.
+/// 0009 makes each one a telemetry event naming the row and the outcome's kind; the report
+/// names the vendor's reference too, for a side effect whose connector reported one. A row
+/// whose begin failed after its insert was executed, and which the store could not complete
+/// as `error`, is reported the same way, with the outcome `error`.
 #[derive(Debug)]
 pub struct GivenUp<'a> {
     /// The row finish named.
     pub row: &'a AuditRowId,
     /// The outcome it was to record: `ok`, `error` or `refused`.
     pub outcome: &'static str,
+    /// The vendor's reference the finish was to keep on the row's receipt, for a side effect
+    /// whose connector reported one. `None` for any other finish, and for the completion of a
+    /// failed begin's row, which ran nothing.
+    pub reference: Option<&'a VendorReference>,
     /// Why it stopped: [`PgAuditError::Deadline`] when the deadline passed,
     /// [`PgAuditError::CompletedDifferently`] when the row already had another completion,
     /// [`PgAuditError::NoSuchRow`] when the row is not there,
@@ -603,6 +608,8 @@ struct Settle {
     report: Report,
     row: AuditRowId,
     outcome: &'static str,
+    /// The vendor's reference the finish was to keep, named in its report if it gives up.
+    reference: Option<VendorReference>,
     settled: bool,
 }
 
@@ -629,6 +636,7 @@ impl Settle {
         (self.report)(GivenUp {
             row: &self.row,
             outcome: self.outcome,
+            reference: self.reference.as_ref(),
             error,
         });
     }
@@ -1079,11 +1087,21 @@ impl PgAuditStore {
         };
         // A denial is a complete record, and a list row is written complete: neither is left
         // open.
-        if may_be_written
-            && let Insert::Call(call) | Insert::WithReceipt { row: call, .. } = &row
-            && call.decision == "allow"
-        {
-            self.complete_lost_begin(AuditRowId::new(call.id.clone()));
+        if may_be_written {
+            let (call, key) = match row {
+                Insert::Call(call) => (Some(call), None),
+                Insert::WithReceipt {
+                    row,
+                    receipt,
+                    request,
+                } => (Some(row), Some(BegunKey { receipt, request })),
+                Insert::List(_) => (None, None),
+            };
+            if let Some(call) = call
+                && call.decision == "allow"
+            {
+                self.complete_lost_begin(AuditRowId::new(call.id), key);
+            }
         }
         Err(failed)
     }
@@ -1123,12 +1141,17 @@ impl PgAuditStore {
     /// Completes `row`, whose begin failed after its insert was executed, as `error` of the kind
     /// `other` with a latency of 0, as the core gives up a guard, on a task of its own on the
     /// finish pool, until the finish deadline. Counted in flight until it ends.
-    fn complete_lost_begin(&self, row: AuditRowId) {
+    ///
+    /// `key` is the receipt a begin with a receipt asked for. That begin may have written its
+    /// row complete, with the answer to its reused key: a row found complete with the answer to
+    /// its own key holds what its begin wrote, and is settled, not given up (#203).
+    fn complete_lost_begin(&self, row: AuditRowId, key: Option<BegunKey>) {
         let settle = Settle {
             in_flight: InFlight::start(&self.counters),
             report: Arc::clone(&self.given_up),
             row: row.clone(),
             outcome: "error",
+            reference: None,
             settled: false,
         };
         let task = Retry {
@@ -1151,6 +1174,7 @@ impl PgAuditStore {
             attempt: self.budgets.answer,
             deadline: Instant::now() + self.budgets.finish_deadline,
             row_may_commit: true,
+            key,
         };
         tokio::spawn(async move {
             match task.run().await {
@@ -1177,6 +1201,7 @@ impl PgAuditStore {
             &mut client,
             row.as_str(),
             &FinishRow::from_completion(completion)?,
+            None,
         )
         .await
         .map(|_| ())
@@ -1210,6 +1235,7 @@ impl PgAuditStore {
             report: Arc::clone(&self.given_up),
             row: row.clone(),
             outcome: FinishRow::outcome_of(completion),
+            reference: reference.cloned(),
             settled: false,
         };
         let finish = match FinishRow::from_completion(completion)
@@ -1233,6 +1259,7 @@ impl PgAuditStore {
             attempt: self.budgets.answer,
             deadline: started + self.budgets.finish_deadline,
             row_may_commit: false,
+            key: None,
         };
         let (sender, receiver) = oneshot::channel();
         tokio::spawn(async move {
@@ -1315,6 +1342,13 @@ enum Insert {
     },
     /// A list row, complete.
     List(Box<ListRow>),
+}
+
+/// The receipt a begin with a receipt asked for, kept by the completion of that begin's row
+/// when the begin is lost, to tell the answer to its own key from a completion of another.
+struct BegunKey {
+    receipt: Box<ReceiptRow>,
+    request: Box<ReceiptRequest>,
 }
 
 /// Writes `row`, as begin, begin with a receipt, or list. Sets `sent` just before the insert,
@@ -1459,22 +1493,9 @@ async fn found(
         Some(_) => {}
     }
     if let Some(earlier) = earlier {
-        let outcome: Option<String> = stored.try_get(1)?;
-        let sentence: Option<String> = stored.try_get(2)?;
-        let latency_ms: Option<i64> = stored.try_get(3)?;
-        let duplicate_of: Option<String> = stored.try_get(4)?;
-        for reuse in answers(request, earlier) {
-            let answer = AnswerRow::from_reuse(&reuse)?;
-            if answer.is(
-                outcome.as_deref(),
-                sentence.as_deref(),
-                latency_ms,
-                duplicate_of.as_deref(),
-            ) {
-                return Ok(Reservation::Reused(reuse));
-            }
-        }
-        return Err(PgAuditError::AnsweredDifferently { row: id() });
+        return answered_with(&stored, request, earlier)?
+            .map(Reservation::Reused)
+            .ok_or_else(|| PgAuditError::AnsweredDifferently { row: id() });
     }
     let statement = transaction
         .prepare_cached(ReceiptRow::STATE_AS_READ)
@@ -1484,6 +1505,52 @@ async fn found(
         Some(own) if own.try_get::<_, &str>(0)? == "pending" => Ok(Reservation::Reserved),
         Some(_) => Err(PgAuditError::ReceiptSettled { row: id() }),
     }
+}
+
+/// The answer to `request`'s key from the receipt `earlier` that `stored`, a row read with
+/// [`BeginRow::STORED`], was written with: the one of the five for that receipt whose completion
+/// it holds, whatever has become of the receipt since. `None` when it holds none of them.
+fn answered_with(
+    stored: &tokio_postgres::Row,
+    request: &ReceiptRequest,
+    earlier: &Receipt,
+) -> Result<Option<gateway_core::Reuse>, PgAuditError> {
+    let outcome: Option<String> = stored.try_get(1)?;
+    let sentence: Option<String> = stored.try_get(2)?;
+    let latency_ms: Option<i64> = stored.try_get(3)?;
+    let duplicate_of: Option<String> = stored.try_get(4)?;
+    for reuse in answers(request, earlier) {
+        let answer = AnswerRow::from_reuse(&reuse)?;
+        if answer.is(
+            outcome.as_deref(),
+            sentence.as_deref(),
+            latency_ms,
+            duplicate_of.as_deref(),
+        ) {
+            return Ok(Some(reuse));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether the row `row`, found complete by the completion of its lost begin, holds the answer
+/// to its own key, `key`: the reuse check, read in `transaction`, finds the earlier receipt
+/// under another row, and the row's completion is one of the five answers from it
+/// ([`answered_with`]). Such a row was written complete by its begin, and nothing of it was
+/// lost.
+async fn holds_its_answer(
+    transaction: &Transaction<'_>,
+    row: &str,
+    key: &BegunKey,
+) -> Result<bool, PgAuditError> {
+    let Some(earlier) = reuse_check(transaction, &key.receipt, &key.request).await? else {
+        return Ok(false);
+    };
+    let statement = transaction.prepare_cached(BeginRow::STORED).await?;
+    let Some(stored) = transaction.query_opt(&statement, &[&row]).await? else {
+        return Ok(false);
+    };
+    Ok(answered_with(&stored, &key.request, &earlier)?.is_some())
 }
 
 /// Inserts the first half of a row under its identifier, unless that row is already stored.
@@ -1557,19 +1624,21 @@ async fn list_on(
 /// Writes the completion of `row` if it has none, and otherwise checks the one it has. When it
 /// writes it after the row's deadline, and reconciliation settled the row's receipt in another
 /// state than the finish's outcome settles it in, the state reconciliation settled it in.
+/// `key` is a lost begin's, as [`complete_in_transaction`] reads it.
 async fn complete_on(
     client: &mut ClientWrapper,
     row: &str,
     finish: &FinishRow,
+    key: Option<&BegunKey>,
 ) -> Result<Option<String>, PgAuditError> {
-    match complete_in_transaction(client, row, finish).await {
+    match complete_in_transaction(client, row, finish, key).await {
         // The row's deadline passed between the settle's own test of it and the trigger's, by
         // the database's clock, and the trigger refused the move. Made again, the settle finds
         // the deadline passed, and completes the row with its receipt left `pending`.
         Err(PgAuditError::Database(error))
             if error.code().map(|code| code.code()) == Some(RECEIPT_PAST_DEADLINE) =>
         {
-            complete_in_transaction(client, row, finish).await
+            complete_in_transaction(client, row, finish, key).await
         }
         completed => completed,
     }
@@ -1592,10 +1661,16 @@ async fn complete_on(
 /// `not_performed` is checked against reconciliation: when reconciliation settled the receipt
 /// in the other state, that state is returned, once the completion has committed. A retried
 /// finish that finds its own completion returns nothing, so one disagreement is counted once.
+///
+/// For the completion of a lost begin with a receipt, `key` is the receipt it asked for. A row
+/// found complete with another completion that is the answer to its own key was written so by
+/// that begin, as a reused key's row is: nothing was lost, and it is settled as found, as the
+/// in-memory store settles it (#203). Any other completion is refused, as for a finish.
 async fn complete_in_transaction(
     client: &mut ClientWrapper,
     row: &str,
     finish: &FinishRow,
+    key: Option<&BegunKey>,
 ) -> Result<Option<String>, PgAuditError> {
     let transaction = client.transaction().await?;
     let statement = transaction.prepare_cached(ReceiptRow::STATE).await?;
@@ -1693,9 +1768,12 @@ async fn complete_in_transaction(
         {
             Ok(None)
         }
-        Some(_) => Err(PgAuditError::CompletedDifferently {
-            row: row.to_owned(),
-        }),
+        Some(_) => match key {
+            Some(key) if holds_its_answer(&transaction, row, key).await? => Ok(None),
+            _ => Err(PgAuditError::CompletedDifferently {
+                row: row.to_owned(),
+            }),
+        },
         // The update and this select each see what had committed when they began, so a row
         // whose insert committed in between is seen here and was not seen by the update.
         None => Err(PgAuditError::NotCompleted {
@@ -1730,6 +1808,9 @@ struct Retry {
     /// one more at the deadline itself, which the deadline does not cut short. For a finish
     /// the row was begun, and a missing one is final.
     row_may_commit: bool,
+    /// For the completion of a failed begin with a receipt, the receipt it asked for: a row
+    /// found complete with the answer to its own key is settled ([`complete_in_transaction`]).
+    key: Option<BegunKey>,
 }
 
 impl Retry {
@@ -1785,7 +1866,11 @@ impl Retry {
         let mut client = timeout_at(by, self.pool.get())
             .await
             .map_err(|_| PgAuditError::AttemptTimedOut)??;
-        let completed = timeout_at(by, complete_on(&mut client, &self.row, &self.finish)).await;
+        let completed = timeout_at(
+            by,
+            complete_on(&mut client, &self.row, &self.finish, self.key.as_ref()),
+        )
+        .await;
         match completed {
             Ok(Err(error)) if error.is_transient() => {
                 // The next attempt makes a connection of its own. This one may be to a server

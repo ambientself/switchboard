@@ -442,6 +442,9 @@ struct State {
     records_failing: Failing,
     /// Late finishes that disagreed with the state reconciliation had settled their receipt in.
     late_finish_disagreements: u64,
+    /// Completions of a lost begin's row that the row refused, as the Postgres store gives up
+    /// and counts them.
+    lost_begins_given_up: u64,
 }
 
 impl State {
@@ -1140,6 +1143,13 @@ impl InMemoryAuditStore {
         self.state().records_failing = Failing::Always;
     }
 
+    /// How many completions of a lost begin's row the row refused, as the Postgres store gives
+    /// them up: of an allowed row, other than one written complete with the answer to its own
+    /// reused key, which lost nothing.
+    pub fn lost_begins_given_up(&self) -> u64 {
+        self.state().lost_begins_given_up
+    }
+
     /// How many late finishes disagreed with the state reconciliation had settled their
     /// receipt in: each completed its row and left the receipt as it was.
     pub fn late_finish_disagreements(&self) -> u64 {
@@ -1250,8 +1260,14 @@ impl InMemoryAuditStore {
                 // Only an allowed row is completed, and its receipt settled as `not_performed`
                 // with it. A denial is refused, and a row completed before, the answer to a
                 // reused key included, keeps its completion, as complete_once refuses and keeps
-                // them.
-                let _ = state.complete(row, &error, self.clock.now());
+                // them. The Postgres store tries no completion of a denial, and settles a row
+                // written complete with the answer to its own key, which lost nothing; it gives
+                // up and counts any other row that refuses the completion (#203).
+                let refused = state.complete(row, &error, self.clock.now()).is_err();
+                let answered = state.reused.iter().any(|(id, _)| id == row);
+                if refused && record.decision == DecisionKind::Allow && !answered {
+                    state.lost_begins_given_up += 1;
+                }
                 return Err(lost());
             }
             Ok(reservation)

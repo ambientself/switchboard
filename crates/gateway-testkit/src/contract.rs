@@ -31,8 +31,9 @@
 //! it; a begin retried after a lost confirmation finds its own receipt and runs once, but once
 //! its row's deadline has passed with the receipt still `pending` it is refused and runs
 //! nothing; a begin whose confirmation is lost on every attempt leaves its row `error` and its
-//! receipt `not_performed`; and each receipt state against each line of the reuse table. Both
-//! stores run every one of them.
+//! receipt `not_performed`, and one under a reused key leaves its row with its answer and gives
+//! nothing up; and each receipt state against each line of the reuse table. Both stores run
+//! every one of them.
 //!
 //! It covers reconciliation (decision 0009, "Reconciliation") with the functions under "Item
 //! 7", through the store's [`ReceiptQueue`]: a receipt records the vendor target its tool's
@@ -147,6 +148,11 @@ pub trait ContractStore {
     /// How many late finishes the store has counted as disagreeing with the state
     /// reconciliation settled their receipt in. For item 7's functions only.
     fn late_finish_disagreements(&self) -> u64;
+
+    /// How many completions of a lost begin's row the store has given up, once every completion
+    /// it has in flight has ended. The Postgres store counts them with every other finish it
+    /// gives up, so a function that asks gives up no other. For item 6's functions only.
+    fn lost_begins_given_up(&self) -> impl Future<Output = u64>;
 }
 
 /// The record a row holds.
@@ -2797,6 +2803,68 @@ pub async fn a_begin_whose_confirmation_is_lost_on_every_attempt_leaves_its_row_
         (receipt.state, receipt.established_by),
         (ReceiptState::NotPerformed, EstablishedBy::Call)
     );
+}
+
+/// A begin under a reused key whose confirmation was lost on every attempt leaves its row as its
+/// begin wrote it, complete with the answer to its key, and the store gives nothing up (#203).
+/// The completion the store then tries finds the row complete with the answer to its own key:
+/// nothing was lost, so that is settled, not a completion that failed. A duplicate and a
+/// refusal are each tried, and the earlier receipt is left as it was.
+pub async fn a_reused_keys_begin_whose_confirmation_is_lost_keeps_its_answer_and_gives_nothing_up(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let fixture = fixture();
+    let key = fresh_key();
+    let arguments = proposal("Done once.");
+    let first = row_start();
+    let guard = proposal_guard(store, &fixture, &first, &arguments, &key).await;
+    let connector = Answering::with(ToolOutcome::Completed(
+        json!({"draft": "d-1"}),
+        VendorReference::new("d-1"),
+    ));
+    let ran = audit::run(&connector, guard).await;
+    let finished = audit::finish(store, ran, 1).await;
+    assert!(finished.failure().is_none(), "{:?}", finished.failure());
+    let earlier = receipt_under(contract, &first.row).await;
+
+    contract.lose_every_begin_confirmation();
+    for (tool_use_id, expected) in [
+        (
+            key.as_str(),
+            Reuse::Duplicate {
+                key: key.clone(),
+                receipt: first.row.clone(),
+                reference: Some(VendorReference::new("d-1")),
+            },
+        ),
+        (
+            "toolu_another_call",
+            Reuse::DifferentCall { key: key.clone() },
+        ),
+    ] {
+        let start = row_start();
+        let begun = begin_keyed(
+            store,
+            &start,
+            keyed_proposal(&fixture, &arguments, Some(&key)),
+            &arguments,
+            Some(tool_use_id),
+        )
+        .await;
+        assert!(
+            begun.is_err(),
+            "{tool_use_id}: a begin whose confirmation was lost succeeded: {begun:?}"
+        );
+        assert_eq!(
+            stored(contract, &start.row).await.completion,
+            Some(expected.completion()),
+            "{tool_use_id}"
+        );
+    }
+    assert_eq!(receipts_for(contract, &key).await, vec![earlier]);
+    assert_eq!(contract.lost_begins_given_up().await, 0);
+    assert_eq!(connector.calls(), 1);
 }
 
 /// Each receipt state against each line of the reuse table (decision 0009, "Reuse"). For an

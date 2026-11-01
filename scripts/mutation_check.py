@@ -1973,7 +1973,15 @@ mutate("testkit-list-wrong-clock", "the in-memory store reads the system clock, 
 mutate("testkit-clock-ignored", "the in-memory store keeps its default clock, not the one it was given", A,
        "        self.clock = clock;\n        self\n", "        let _ = clock;\n        self\n")
 mutate("testkit-lost-confirmation-left-open", "an allowed row whose begin confirmation was lost is left open", A,
-       "                let _ = state.complete(row, &error, self.clock.now());", "                let _ = &error;")
+       "                let refused = state.complete(row, &error, self.clock.now()).is_err();",
+       "                let refused = {\n                    let _ = &error;\n                    false\n                };")
+# #203: as the Postgres store, the in-memory store counts a lost begin's completion that its row
+# refuses as given up, but not one of a row written with the answer to its own reused key. The
+# contract suite's a_reused_keys_begin_whose_confirmation_is_lost_keeps_its_answer_and_gives_nothing_up
+# catches this.
+mutate("testkit-lost-begin-own-answer-given-up", "a lost begin's row written with the answer to its own key is counted as given up", A,
+       "                if refused && record.decision == DecisionKind::Allow && !answered {",
+       "                if refused && record.decision == DecisionKind::Allow && answered | true {")
 mutate("testkit-lost-confirmation-ignored", "a begin told to lose its confirmation succeeds", A,
        "            if state.confirmation_lost.take() {\n                // As the Postgres store",
        "            if false {\n                // As the Postgres store")
@@ -4475,8 +4483,8 @@ mutate("pg-finish-same-again-refused", "the same completion written again is an 
        "        Some(outcome)\n            if finish.is(\n",
        "        Some(outcome)\n            if false && finish.is(\n")
 mutate("pg-finish-different-accepted", "a different second completion is accepted", PG_STORE,
-       "        Some(_) => Err(PgAuditError::CompletedDifferently {\n            row: row.to_owned(),\n        }),",
-       "        Some(_) => Ok(()),")
+       "            _ => Err(PgAuditError::CompletedDifferently {\n                row: row.to_owned(),\n            }),",
+       "            _ => Ok(None),")
 mutate("pg-finish-missing-row-accepted", "finishing a row that is not there succeeds", PG_STORE,
        "        return Err(PgAuditError::NoSuchRow {\n            row: row.to_owned(),\n        });",
        "        return Ok(());")
@@ -4686,8 +4694,11 @@ mutate("pg-retry-slow-attempt-final", "an attempt that ran out of time is not re
 mutate("pg-finish-given-up-not-counted", "a finish that gave up is not counted", PG_STORE,
        "        self.in_flight.0.given_up.count(error);\n", "")
 mutate("pg-finish-given-up-not-reported", "a finish that gave up is not reported", PG_STORE,
-       "        (self.report)(GivenUp {\n            row: &self.row,\n            outcome: self.outcome,\n            error,\n        });\n",
+       "        (self.report)(GivenUp {\n            row: &self.row,\n            outcome: self.outcome,\n"
+       "            reference: self.reference.as_ref(),\n            error,\n        });\n",
        "        let _ = error;\n")
+mutate("pg-given-up-reference-dropped", "a finish given up is reported without the vendor's reference it was to keep", PG_STORE,
+       "            reference: self.reference.as_ref(),\n", "            reference: None,\n")
 mutate("pg-finish-dropped-task-not-reported", "a finish dropped with its runtime is not counted or reported", PG_STORE,
        "        if !self.settled {", "        if false {")
 mutate("pg-finish-unstorable-not-settled", "a completion the row cannot hold is not counted or reported", PG_STORE,
@@ -4733,9 +4744,19 @@ mutate_all("pg-begin-retry-new-identifier", "begin is retried under a new identi
             "                call.id.replace_range(..1, first);\n"
             "            }\n        };"))
 mutate("pg-lost-confirmation-left-open", "a row whose begin confirmation was lost is left open", PG_STORE,
-       "            self.complete_lost_begin(AuditRowId::new(call.id.clone()));\n", "            let _ = call;\n")
+       "                self.complete_lost_begin(AuditRowId::new(call.id), key);\n", "                let _ = (call, key);\n")
 mutate("pg-lost-confirmation-for-denial", "a lost confirmation for a denial starts a completion", PG_STORE,
-       '            && call.decision == "allow"\n', "            && !call.decision.is_empty()\n")
+       '                && call.decision == "allow"\n', "                && !call.decision.is_empty()\n")
+# #203: a lost begin with a receipt whose row it finds complete with the answer to its own key is
+# settled, not given up, and any other completion it finds is given up. The contract suite's
+# a_reused_keys_begin_whose_confirmation_is_lost_keeps_its_answer_and_gives_nothing_up and
+# tests/receipts.rs's a_lost_begins_row_completed_otherwise_is_given_up catch these.
+mutate("pg-lost-begin-own-answer-given-up", "a lost begin's row found complete with the answer to its own key is given up", PG_STORE,
+       "            Some(key) if holds_its_answer(&transaction, row, key).await? => Ok(None),\n",
+       "            Some(key) if false && holds_its_answer(&transaction, row, key).await? => Ok(None),\n")
+mutate("pg-lost-begin-any-completion-settled", "a lost begin's row found complete with any completion is settled", PG_STORE,
+       "            Some(key) if holds_its_answer(&transaction, row, key).await? => Ok(None),\n",
+       "            Some(_key) => Ok(None),\n")
 mutate("pg-lost-confirmation-after-refusal", "a begin the database refused starts a completion of the row under its identifier", PG_STORE,
        "            may_be_written |= sent && unanswered;", "            may_be_written |= sent;")
 mutate("pg-lost-confirmation-forgotten-on-later-error", "a later attempt's error undoes an earlier lost confirmation", PG_STORE,
@@ -5146,6 +5167,12 @@ mutate("pg-finish-settles-past-deadline", "finish moves a receipt whatever its r
        "            AND NOT EXISTS (SELECT FROM switchboard_audit.call_rows c\n"
        "                            WHERE c.id = r.row_id AND c.deadline < clock_timestamp())\";",
        "        WHERE r.row_id = ($1::text)::uuid AND r.state = 'pending'\";")
+# #203: the deadline can pass between the settle's own test and the trigger's, which refuses with
+# SB001; the store completes the row again and leaves the receipt pending. tests/receipts.rs's
+# a_deadline_that_passes_during_the_settle_leaves_the_receipt_pending catches this.
+mutate("pg-settle-past-deadline-not-made-again", "a settle the trigger refuses as past the deadline fails the finish", PG_STORE,
+       "            if error.code().map(|code| code.code()) == Some(RECEIPT_PAST_DEADLINE) =>",
+       "            if false && error.code().map(|code| code.code()) == Some(RECEIPT_PAST_DEADLINE) =>")
 mutate("pg-check-receipt-trigger-skipped", "the boot check does not look for the receipt trigger", PG_CHECK,
        "    Trigger {\n        table: RECEIPTS,\n        name: \"receipt_moves\",\n"
        "        purpose: \"moves a receipt only as its state table allows, by the database's clock\",\n"
