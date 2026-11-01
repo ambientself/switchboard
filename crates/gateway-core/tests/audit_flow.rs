@@ -18,14 +18,15 @@ use gateway_core::audit::{
 };
 use gateway_core::receipt::EstablishedBy;
 use gateway_core::{
-    ApprovedTool, ArgumentDigest, AuditRecord, AuditStore, BoxFuture, CallContext, CallerContext,
-    Claimed, Classification, Connector, ConnectorEntry, ConnectorName, CredentialIdentity,
-    CredentialMode, Currency, CurrencyAnswer, Decision, Delegation, DelegationDigest,
-    DelegationFailure, Egress, EntryKind, IdempotencyKey, InstanceName, KeyScope, Narrowing,
-    PolicySnapshot, Principal, PrincipalId, PrincipalKind, PrincipalRestriction, Profile, Reason,
-    ReasonKind, Receipt, ReceiptState, RequestedTool, Resource, ResourceDeclaration,
-    ResourceLimits, ResourceProblem, Resources, Reuse, Settlement, SnapshotData, Surface, TeamId,
-    ToolCall, ToolOutcome, TurnId, UnverifiedDelegation, VendorReference, decide, list_tools,
+    ApprovedTool, ArgumentDigest, AuditRecord, AuditStore, BoxFuture, CallContext, CallKey,
+    CallerContext, Claimed, Classification, Connector, ConnectorEntry, ConnectorName,
+    CredentialIdentity, CredentialMode, Currency, CurrencyAnswer, Decision, Delegation,
+    DelegationDigest, DelegationFailure, Egress, EntryKind, IdempotencyKey, InstanceName, KeyScope,
+    Narrowing, PolicySnapshot, Principal, PrincipalId, PrincipalKind, PrincipalRestriction,
+    Profile, Reason, ReasonKind, Receipt, ReceiptState, RequestedTool, Resource,
+    ResourceDeclaration, ResourceLimits, ResourceProblem, Resources, Reuse, Settlement,
+    SnapshotData, Surface, TeamId, ToolCall, ToolOutcome, TurnId, UnverifiedDelegation,
+    VendorReference, decide, list_tools,
 };
 use serde_json::json;
 
@@ -187,7 +188,7 @@ fn call(tool: &str) -> CallContext {
         },
         tool: RequestedTool::new(tool),
         resources: Resources::Named(Vec::new()),
-        key: None,
+        key: CallKey::Absent,
         currency: Currency::NotAsked,
     }
 }
@@ -1363,7 +1364,7 @@ impl Connector for SlowConnector {
 fn allowed_proposing(store: &dyn AuditStore, tool: &str) -> gateway_core::AuditGuard {
     let mut context = call(tool);
     context.caller.profile = "proposers".into();
-    context.key = Some(common::fresh_key());
+    context.key = CallKey::Valid(common::fresh_key());
     match begin(store, decide(&snapshot(), &context)) {
         Begun::Allowed(guard) => guard,
         Begun::Denied(refusal) => panic!("expected a guard, got {refusal:?}"),
@@ -1492,7 +1493,7 @@ fn a_side_effect_runs_to_completion_though_its_caller_has_gone() {
 fn proposing(tool: &str, key: Option<&IdempotencyKey>) -> CallContext {
     let mut context = call(tool);
     context.caller.profile = "proposers".into();
-    context.key = key.cloned();
+    context.key = key.cloned().into();
     context
 }
 

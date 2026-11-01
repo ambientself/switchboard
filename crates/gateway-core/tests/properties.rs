@@ -14,13 +14,13 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use gateway_core::{
-    ApprovedTool, CallContext, CallerContext, Classification, ConnectorEntry, CredentialMode,
-    Currency, CurrencyAnswer, Decision, DeclaredFrom, Delegation, DelegationFailure, EntryKind,
-    GroupId, IdempotencyKey, Issuer, Narrowing, PodUid, PolicySnapshot, Principal, PrincipalId,
-    PrincipalKind, PrincipalRestriction, Profile, ProfileName, Reason, ReasonKind, Resource,
-    ResourceDeclaration, ResourceLimits, ResourceProblem, Resources, Settlement, SnapshotData,
-    Subject, Surface, SurfaceName, TeamId, ToolName, UnverifiedDelegation, Verdict, decide,
-    list_tools,
+    ApprovedTool, CallContext, CallKey, CallerContext, Classification, ConnectorEntry,
+    CredentialMode, Currency, CurrencyAnswer, Decision, DeclaredFrom, Delegation,
+    DelegationFailure, EntryKind, GroupId, IdempotencyKey, Issuer, Narrowing, PodUid,
+    PolicySnapshot, Principal, PrincipalId, PrincipalKind, PrincipalRestriction, Profile,
+    ProfileName, Reason, ReasonKind, Resource, ResourceDeclaration, ResourceLimits,
+    ResourceProblem, Resources, Settlement, SnapshotData, Subject, Surface, SurfaceName, TeamId,
+    ToolName, UnverifiedDelegation, Verdict, decide, list_tools,
 };
 
 use gateway_core::AuditRecord;
@@ -99,7 +99,7 @@ impl World {
             caller: self.caller(),
             tool: self.tool.clone().into(),
             resources: self.resources.clone(),
-            key: self.key.clone(),
+            key: self.key.clone().into(),
             currency: self.currency,
         }
     }
@@ -604,7 +604,7 @@ proptest! {
                 caller: caller.clone(),
                 tool: tool.clone().into(),
                 resources: Resources::Named(Vec::new()),
-                key: None,
+                key: CallKey::Absent,
                 currency: Currency::NotAsked,
             };
             let decision = decide(&snapshot, &call);
@@ -622,22 +622,28 @@ proptest! {
 
     /// A call of a tool not classified `read` that carries no key is never allowed, and the key
     /// check is last: without a key, a call is denied for the reason it is denied with one, and
-    /// a call allowed with one is denied with `KeyMissing` unless its tool is `read`.
+    /// a call allowed with one is denied with `KeyMissing` unless its tool is `read`. A call
+    /// that sent a key that is not valid carries none, and is decided as one that sent none,
+    /// except that its `KeyMissing` says the key was not valid.
     #[test]
-    fn a_side_effect_without_a_key_is_never_allowed_and_the_key_check_is_last(world in world()) {
+    fn a_side_effect_without_a_key_is_never_allowed_and_the_key_check_is_last(world in world(), invalid in any::<bool>()) {
         let snapshot = world.snapshot();
         let mut keyed = world.call();
-        keyed.key = Some(IdempotencyKey::parse(KEY).unwrap());
+        keyed.key = CallKey::Valid(IdempotencyKey::parse(KEY).unwrap());
         let mut unkeyed = keyed.clone();
-        unkeyed.key = None;
+        unkeyed.key = if invalid { CallKey::Invalid } else { CallKey::Absent };
         let with_key = decide(&snapshot, &keyed);
         let without_key = decide(&snapshot, &unkeyed);
         match with_key.tool() {
             Some(tool) if with_key.is_allowed() && tool.classification != Classification::Read => {
                 prop_assert!(!without_key.is_allowed());
                 prop_assert_eq!(
-                    without_key.reason().map(Reason::kind),
-                    Some(ReasonKind::KeyMissing)
+                    without_key.reason(),
+                    Some(&Reason::KeyMissing {
+                        tool: tool.name.clone(),
+                        classification: tool.classification,
+                        invalid,
+                    })
                 );
             }
             _ => {

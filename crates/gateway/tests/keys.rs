@@ -189,8 +189,9 @@ async fn the_header_is_ignored_on_a_profile_that_does_not_declare_it() {
 
 /// An explicit key that is not a valid key, whether a string or not, is dropped and leaves the
 /// call with no key: it is not passed over for the header or the tool-use identifier, so the
-/// side effect is denied for want of a key and nothing runs. The tool-use identifier is still
-/// recorded. A declared header that is not valid, or is sent twice, does the same.
+/// side effect is denied for want of a key and nothing runs. The denial says the key the call
+/// sent is not valid, not that it carried none, and does not repeat it. The tool-use identifier
+/// is still recorded. A declared header that is not valid, or is sent twice, does the same.
 #[tokio::test]
 async fn an_invalid_explicit_key_leaves_the_call_with_no_key() {
     let server = Server::start_configured(declaring).await;
@@ -244,10 +245,14 @@ async fn an_invalid_explicit_key_leaves_the_call_with_no_key() {
             request = request.header(IDEMPOTENCY_KEY_HEADER, value);
         }
         let unkeyed = request.send(&server).await;
+        let denial = unkeyed.denial();
         assert!(
-            unkeyed.denial().contains("carried none"),
+            denial.contains("The key this call sent is not valid"),
             "{case}: {unkeyed:?}"
         );
+        assert!(!denial.contains("carried none"), "{case}: {denial}");
+        assert!(!denial.contains("session:turn 7"), "{case}: {denial}");
+        assert!(!denial.contains("two words"), "{case}: {denial}");
         let row = server.store.row(index).unwrap();
         assert_eq!(row.reason, Some(ReasonKind::KeyMissing), "{case}");
         assert_eq!(row.tool_use_id.unwrap().as_str(), tool_use_id, "{case}");

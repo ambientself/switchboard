@@ -66,17 +66,47 @@ pub struct CallContext {
     pub tool: RequestedTool,
     /// The resources the call names, from the tool's resource adapter.
     pub resources: Resources,
-    /// The call's idempotency key, if it carries one (decision 0009, "The key"). The decision
-    /// reads only whether there is one: a call of a tool not classified `read` without one is
-    /// denied by the key check. [`audit::begin`](crate::audit::begin) takes the key from here,
+    /// The call's idempotency key, if it carries one, or whether it sent one that is not valid
+    /// (decision 0009, "The key"). The decision reads only whether there is one: a call of a
+    /// tool not classified `read` without one is denied by the key check, whose sentence says
+    /// which of the two it was. [`audit::begin`](crate::audit::begin) takes the key from here,
     /// through the decision, to reserve the call's receipt, so the key the decision saw is the
     /// key the receipt holds.
-    pub key: Option<IdempotencyKey>,
+    pub key: CallKey,
     /// Whether the control plane that issued the delegation says the call's turn is current
     /// (decision 0012, "Currency"). An adapter asks only for a tool not classified `read` under
     /// a profile that requires currency; one that does not ask leaves [`Currency::NotAsked`],
     /// which the currency check denies.
     pub currency: Currency,
+}
+
+/// What a call carries as its idempotency key (decision 0009, "The key").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CallKey {
+    /// A valid key: one the caller sent on purpose, or its tool-use identifier.
+    Valid(IdempotencyKey),
+    /// No key: no carrier held anything.
+    Absent,
+    /// The caller sent a key on purpose, and it is not a valid key. The call has no key: an
+    /// explicit key that is not valid is not passed over for the tool-use identifier.
+    Invalid,
+}
+
+impl CallKey {
+    /// The key, if the call carries a valid one.
+    pub fn key(&self) -> Option<&IdempotencyKey> {
+        match self {
+            CallKey::Valid(key) => Some(key),
+            CallKey::Absent | CallKey::Invalid => None,
+        }
+    }
+}
+
+impl From<Option<IdempotencyKey>> for CallKey {
+    /// A key if there is one, and otherwise none sent.
+    fn from(key: Option<IdempotencyKey>) -> Self {
+        key.map_or(CallKey::Absent, CallKey::Valid)
+    }
 }
 
 /// The call's currency: whether the control plane that issued its delegation says the turn is
@@ -223,6 +253,9 @@ pub enum Reason {
         tool: ToolName,
         /// The tool's classification, which is not `read`.
         classification: Classification,
+        /// Whether the call sent a key that is not valid, rather than none
+        /// ([`CallKey::Invalid`]). Its sentence then says so, rather than that it carried none.
+        invalid: bool,
     },
 }
 
@@ -447,7 +480,7 @@ pub fn decide(snapshot: &PolicySnapshot, call: &CallContext) -> Decision {
         Some(call.currency),
         Some(&call.resources),
     )
-    .and_then(|tool| key_is_carried(tool, call.key.as_ref()).map(|()| tool));
+    .and_then(|tool| key_is_carried(tool, &call.key).map(|()| tool));
     let verdict = match checked {
         Ok(tool) => Verdict::Allow(tool.clone()),
         Err(reason) => Verdict::Deny {
@@ -755,14 +788,17 @@ fn resources_are_within_limit(
 /// The key check, last (decision 0006, amended on 2026-10-07). A call of a tool not classified
 /// `read` must carry an idempotency key, so that a retry of its side effect is answered from
 /// its receipt rather than run again. A `read` tool needs none. Run only for a `tools/call`: a
-/// list request carries no key.
-fn key_is_carried(tool: &ApprovedTool, key: Option<&IdempotencyKey>) -> Result<(), Reason> {
+/// list request carries no key. A call that sent a key that is not valid carries none, and its
+/// denial says that is why.
+fn key_is_carried(tool: &ApprovedTool, carried: &CallKey) -> Result<(), Reason> {
+    let key = carried.key();
     if tool.classification == Classification::Read || key.is_some() {
         Ok(())
     } else {
         Err(Reason::KeyMissing {
             tool: tool.name.clone(),
             classification: tool.classification,
+            invalid: *carried == CallKey::Invalid,
         })
     }
 }

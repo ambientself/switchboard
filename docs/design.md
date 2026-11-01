@@ -1079,8 +1079,13 @@ receipt.
   text, is dropped with a warning and leaves the call with no key. It is not passed over for
   the next carrier: a call keyed by its tool-use identifier in place of the key its caller
   chose would lose that key's cover of a replay. A side effect is then denied for want of a
-  key, and its tool-use identifier is still recorded. A `_meta` value of `null` is read as no
-  key sent. A tool-use identifier outside that bound is dropped with a warning too.
+  key, with the reason kind `key_missing` and a sentence of its own: the key the call sent is
+  not valid, what a key is, and that the tool-use identifier is not used in its place; it does
+  not repeat what was sent. Its tool-use identifier is still recorded. The header is read only
+  when the `_meta` field holds nothing, so a header passed over for a `_meta` key is not read,
+  and its warning never says the call carries no key when the `_meta` key keys it. A `_meta`
+  value of `null` is read as no key sent. A tool-use identifier outside that bound is dropped
+  with a warning too.
 - **A key is scoped** to the proved principal and, when a delegation is present, to its
   identifying fields. For Otto those are agreed with Otto's owners; the session and the turn
   are recommended, and whether the execution is needed too is asked.
@@ -1917,10 +1922,17 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   first, and records the tool-use identifier beside it (#55; section 11); the profile setting
   `idempotency_key_header`, false unless a policy says so, is the declaration the header needs.
   An explicit key that is not valid leaves the call with no key, so a side effect is denied for
-  want of one. The core's docs say a side effect's `error` means its connector knows nothing
-  took effect, and the proxy connector reports every outcome of a side effect but a success as
-  `unknown` once its request may have been sent, its server's `4xx`, JSON-RPC errors and failed
-  tool results included, since no approval can yet say a proxied tool's errors are safe.
+  want of one; the call context says so (`CallKey::Invalid`), and the denial's sentence says the
+  key it sent is not valid rather than that it carried none (#204). The core's docs say a side
+  effect's `error` means its connector knows nothing took effect, and the proxy connector
+  reports every outcome of a side effect but a success as `unknown` once its request may have
+  been sent, its server's `4xx`, JSON-RPC errors and failed tool results included, since no
+  approval can yet say a proxied tool's errors are safe. Each such outcome is logged at `WARN`
+  as `proxied_side_effect_unknown`, naming the connector, the tool, the kind of answer that
+  came in place of a definite one (`status`, `rpc_error`, `tool_failed`, `not_mcp`,
+  `too_large`, `broken_off`, `timed_out` or `exchange_failed`), the HTTP status when an
+  answer's head arrived and a JSON-RPC error's code; never the server's body, a JSON-RPC
+  error's message or a failed tool result's text (#204).
   Receipts in Postgres and the signals for `unknown` receipts are built (#55, part 2; above, and
   #47 below), and so is reconciliation (#55, part 4; below). Not built: resolution records.
 - Reconciliation of `unknown` receipts: built (#55, part 4), up to where a person must settle
@@ -2264,7 +2276,8 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   policy's age (#132), and each server's drift polls, withdrawals, probe results and
   reach-check results (#166, #167, #176) are exported, labelled only by registry names. The
   late or oversized count is of reads only: a side effect's late or oversized answer is the
-  outcome `unknown` (#55), counted with the errors (the limits entry below).
+  outcome `unknown` (#55), counted under its own outcome, `unknown`, not with the errors
+  (#204; the limits entry below).
 
 **#11, the argument check against the approved schema.** Built (#122): the loader accepts a
 subset of JSON Schema 2020-12 and refuses anything else at load, including a `$schema` naming
@@ -2332,11 +2345,11 @@ checked; a schema that needs them cannot be approved yet.
   and calls to other servers, are not held up. `tests/limits.rs` shows it.
 - The metrics of section 9 that these give: built. `switchboard_calls_shed_total{scope}`, with
   `scope` one of `instance`, `server` and `team`; and, labelled by the server's name in the
-  registry only, `switchboard_proxied_calls_total{server,outcome}`,
-  `switchboard_proxied_call_seconds{server}` and
+  registry only, `switchboard_proxied_calls_total{server,outcome}`, `outcome` one of `ok`,
+  `error`, `refused` and `unknown`, `switchboard_proxied_call_seconds{server}` and
   `switchboard_proxied_late_or_oversized_total{server}`, the last from the error kind
-  `oversized_or_late_read`, so it counts reads only; a side effect's is the outcome `unknown`,
-  counted with the errors (#55). Both demos show overload and a hanging server (the
+  `oversized_or_late_read`, so it counts reads only; a side effect's is the outcome `unknown`
+  (#55), counted under `outcome="unknown"`, not with the errors (#204). Both demos show overload and a hanging server (the
   demonstrations entry under #11 above). The configurable audit pools and the row's size bound
   are in the #11 list above.
 

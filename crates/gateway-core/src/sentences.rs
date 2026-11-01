@@ -90,6 +90,11 @@ const RESOURCES_NONE_NAMED: &str = "Tool `{tool}` reaches resources the gateway 
 /// A call of a tool not classified `read` carried no idempotency key (decision 0009, "The key").
 const KEY_MISSING: &str = "Tool `{tool}` is classified `{classification}`, so a call to it must carry a key that identifies this one call: a retry under the same key is then answered without making the change again. This call carried none, so it was refused and nothing ran. Send the call with its tool-use identifier, which is its key, or with a key of its own in `_meta` under `switchboard/idempotencyKey`.";
 
+/// A call of a tool not classified `read` whose explicit key is not valid, which leaves it with
+/// no key (decision 0009, "The key"). Its own sentence, because the caller did send a key, which
+/// [`KEY_MISSING`] would say it had not. What it sent is not repeated: it was not a valid key.
+const KEY_INVALID: &str = "Tool `{tool}` is classified `{classification}`, so a call to it must carry a key that identifies this one call: a retry under the same key is then answered without making the change again. The key this call sent is not valid, so the call was refused and nothing ran: a key the call sends is never replaced by its tool-use identifier. A key is a single string of 1 to 128 printable ASCII characters other than space. Send the call with a valid key.";
+
 /// A key reused with a different tool-use identifier: what a key fixed in a client's
 /// configuration looks like (decision 0009, "Reuse").
 const KEY_REUSED_FOR_ANOTHER_CALL: &str = "The key `{key}` was already used by a different call, with another tool-use identifier, so this call was refused and nothing ran. A key identifies one call: send each call with a key of its own, never one fixed in configuration.";
@@ -147,7 +152,7 @@ pub const MAX_RENDERED: usize = 128;
 
 /// Every complete-sentence template, for the tests that check them all.
 #[cfg(test)]
-const SENTENCES: [&str; 30] = [
+const SENTENCES: [&str; 31] = [
     PROFILE_UNKNOWN,
     TOOL_NOT_AVAILABLE,
     INVALID_TOOL_NAME,
@@ -169,6 +174,7 @@ const SENTENCES: [&str; 30] = [
     AUDIT_FAILURE,
     CALLER_DISCONNECTED,
     KEY_MISSING,
+    KEY_INVALID,
     KEY_REUSED_FOR_ANOTHER_CALL,
     KEY_CONFLICT,
     DUPLICATE,
@@ -313,8 +319,9 @@ pub(crate) fn render(reason: &Reason) -> String {
         Reason::KeyMissing {
             tool,
             classification,
+            invalid,
         } => fill(
-            KEY_MISSING,
+            if *invalid { KEY_INVALID } else { KEY_MISSING },
             &[
                 ("tool", Text(tool.as_str())),
                 ("classification", Text(classification.as_str())),
@@ -521,6 +528,31 @@ mod tests {
         assert!(
             !IDENTITY_FAILURE.contains('{'),
             "the opaque sentence must not vary"
+        );
+    }
+
+    /// A side effect whose explicit key is not valid reads that its key is not valid, not that it
+    /// carried none, and the bound it gives is the key's own.
+    #[test]
+    fn an_invalid_key_reads_differently_from_a_missing_one() {
+        let reason = |invalid| Reason::KeyMissing {
+            tool: crate::ToolName::parse("docs__propose").unwrap(),
+            classification: Classification::Propose,
+            invalid,
+        };
+        let invalid = render(&reason(true));
+        let missing = render(&reason(false));
+        assert_eq!(
+            invalid,
+            "Tool `docs__propose` is classified `propose`, so a call to it must carry a key that identifies this one call: a retry under the same key is then answered without making the change again. The key this call sent is not valid, so the call was refused and nothing ran: a key the call sends is never replaced by its tool-use identifier. A key is a single string of 1 to 128 printable ASCII characters other than space. Send the call with a valid key."
+        );
+        assert!(missing.contains("This call carried none"), "{missing}");
+        assert!(
+            KEY_INVALID.contains(&format!(
+                "1 to {} printable",
+                crate::receipt::MAX_IDEMPOTENCY_KEY
+            )),
+            "the sentence's bound is not the key's"
         );
     }
 

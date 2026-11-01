@@ -119,7 +119,7 @@ impl Gateway {
             resources: FixtureConnector::resources_of(tool, &arguments),
             caller: Fixture::context_for(principal, surface),
             tool: RequestedTool::new(tool),
-            key: key.clone(),
+            key: key.clone().into(),
             currency: gateway_core::Currency::NotAsked,
         };
         let decision = decide(&self.fixture.policy, &call);

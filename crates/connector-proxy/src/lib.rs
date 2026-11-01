@@ -56,8 +56,8 @@ mod probe;
 mod transport;
 
 pub use connector::{
-    DEFAULT_DEADLINE, DEFAULT_MAX_RESPONSE_BYTES, PROTOCOL_VERSION, ProxyConnector, Upstream,
-    UpstreamError,
+    DEFAULT_DEADLINE, DEFAULT_MAX_RESPONSE_BYTES, PROTOCOL_VERSION, ProxyConnector,
+    SIDE_EFFECT_UNKNOWN_EVENT, Upstream, UpstreamError,
 };
 pub use credentials::{
     CredentialFileError, FileCredentials, MAX_CREDENTIAL_BYTES, ProbeCredential,

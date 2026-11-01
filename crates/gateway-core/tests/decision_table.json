@@ -228,6 +228,23 @@
         "sentence": "Tool `github__open_pull_request` is classified `propose`, so a call to it must carry a key that identifies this one call: a retry under the same key is then answered without making the change again. This call carried none, so it was refused and nothing ran. Send the call with its tool-use identifier, which is its key, or with a key of its own in `_meta` under `switchboard/idempotencyKey`." }
     },
     {
+      "name": "a proposal whose explicit key is not valid is denied, saying the key it sent is not valid",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "key_invalid": true,
+      "expect": { "decision": "deny", "reason": "key_missing",
+        "sentence": "Tool `github__open_pull_request` is classified `propose`, so a call to it must carry a key that identifies this one call: a retry under the same key is then answered without making the change again. The key this call sent is not valid, so the call was refused and nothing ran: a key the call sends is never replaced by its tool-use identifier. A key is a single string of 1 to 128 printable ASCII characters other than space. Send the call with a valid key." }
+    },
+    {
+      "name": "a read whose explicit key is not valid is allowed: a read needs no key",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "key_invalid": true,
+      "expect": { "decision": "allow" }
+    },
+    {
       "name": "an employee's proposal that carries no key is denied, asking for one",
       "snapshot": "base", "principal": "eng-user", "delegation": null,
       "profile": "employee", "surface": "employee", "tool": "jira__create_issue_as_user",

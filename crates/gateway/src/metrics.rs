@@ -34,8 +34,9 @@
 //!   `server` with the server's name in the registry, so there is one series per server and
 //!   nothing a caller chooses:
 //!   - `switchboard_proxied_calls_total{server,outcome}`, the calls the server's connector
-//!     completed, `outcome` one of `ok`, `error` and `refused`. A call refused by a cap is not
-//!     sent, and is counted under `switchboard_calls_shed_total` instead;
+//!     completed, `outcome` one of `ok`, `error`, `refused` and `unknown`. `unknown` is a side
+//!     effect whose server gave no definite answer, counted apart from `error`. A call refused
+//!     by a cap is not sent, and is counted under `switchboard_calls_shed_total` instead;
 //!   - `switchboard_proxied_call_seconds{server}`, a histogram of how long each took, with the
 //!     audit store's buckets;
 //!   - `switchboard_proxied_late_or_oversized_total{server}`, the calls that were an error of
@@ -531,14 +532,16 @@ fn proxied_signals(text: &mut Text, instance_shed: u64, servers: &[(ConnectorNam
     text.family(
         "switchboard_proxied_calls_total",
         "counter",
-        "Calls each proxied server's connector completed, by outcome. A call a cap refused is \
-         not sent and not counted here.",
+        "Calls each proxied server's connector completed, by outcome. unknown: a side effect \
+         with no definite answer, not counted as error. A call a cap refused is not sent and \
+         not counted here.",
     );
     for (server, counts) in servers {
         for (outcome, count) in [
             ("ok", counts.ok),
             ("error", counts.error),
             ("refused", counts.refused),
+            ("unknown", counts.unknown),
         ] {
             text.sample(
                 "switchboard_proxied_calls_total",
@@ -1144,6 +1147,29 @@ mod tests {
             text.0
                 .contains("# TYPE switchboard_resolver_question_seconds histogram\n")
         );
+    }
+
+    /// Each proxied server's calls are written by outcome from zero, `unknown` apart from
+    /// `error`.
+    #[test]
+    fn a_proxied_servers_unknown_calls_are_written_apart_from_its_errors() {
+        let counts = ServerCounts {
+            ok: 4,
+            error: 2,
+            unknown: 3,
+            ..ServerCounts::default()
+        };
+        let mut text = Text::default();
+        proxied_signals(&mut text, 0, &[(ConnectorName::new("docs"), counts)]);
+        let lines = lines(&text.0);
+        for expected in [
+            "switchboard_proxied_calls_total{server=\"docs\",outcome=\"ok\"} 4",
+            "switchboard_proxied_calls_total{server=\"docs\",outcome=\"error\"} 2",
+            "switchboard_proxied_calls_total{server=\"docs\",outcome=\"refused\"} 0",
+            "switchboard_proxied_calls_total{server=\"docs\",outcome=\"unknown\"} 3",
+        ] {
+            assert!(lines.contains(&expected), "{expected} not in {lines:#?}");
+        }
     }
 
     #[test]

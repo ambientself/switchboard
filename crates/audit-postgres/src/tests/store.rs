@@ -77,7 +77,7 @@ pub(super) async fn through_core(
             .unwrap_or_else(|| FixtureConnector::resources_of(call.tool, &call.arguments)),
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
         tool: RequestedTool::new(call.tool),
-        key: None,
+        key: gateway_core::CallKey::Absent,
         currency: gateway_core::Currency::NotAsked,
     };
     let decision = decide(&fixture.policy, &context);
@@ -381,7 +381,7 @@ async fn a_nul_in_a_value_refuses_the_record_and_writes_no_row() {
             resources: FixtureConnector::resources_of(call.tool, &call.arguments),
             caller: fixture.caller_context(call.caller, call.surface).unwrap(),
             tool: RequestedTool::new(call.tool),
-            key: None,
+            key: gateway_core::CallKey::Absent,
             currency: gateway_core::Currency::NotAsked,
         };
         let decision = decide(&fixture.policy, &context);
@@ -775,7 +775,7 @@ fn decided(fixture: &Fixture, call: &Call) -> gateway_core::Decision {
         resources: FixtureConnector::resources_of(call.tool, &call.arguments),
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
         tool: RequestedTool::new(call.tool),
-        key: None,
+        key: gateway_core::CallKey::Absent,
         currency: gateway_core::Currency::NotAsked,
     };
     decide(&fixture.policy, &context)
@@ -918,7 +918,7 @@ pub(super) async fn begun_row(store: &PgAuditStore, fixture: &Fixture) -> AuditR
         resources: FixtureConnector::resources_of(call.tool, &call.arguments),
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
         tool: RequestedTool::new(call.tool),
-        key: None,
+        key: gateway_core::CallKey::Absent,
         currency: gateway_core::Currency::NotAsked,
     };
     let decision = decide(&fixture.policy, &context);
@@ -1171,7 +1171,7 @@ async fn a_store_that_cannot_reach_its_database_refuses_the_call() {
         resources: FixtureConnector::resources_of(call.tool, &call.arguments),
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
         tool: RequestedTool::new(call.tool),
-        key: None,
+        key: gateway_core::CallKey::Absent,
         currency: gateway_core::Currency::NotAsked,
     };
     let decision = decide(&fixture.policy, &context);
