@@ -6570,15 +6570,15 @@ mutate("custodian-lifetime-not-capped", "a token is handed out until GitHub's ex
        "                let expires_at = issued.expires_at.min(now + self.lifetime.as_secs());",
        "                let expires_at = issued.expires_at.min(now + 3600);")
 mutate("custodian-not-revoked-at-lifetime", "a token is not revoked when its lifetime ends", KS,
-       "                    self.clone()\n                        .revoke_at(issued.token.clone(), expires_at, issued.expires_at);",
-       "                    let _ = &issued.token;")
+       "                let revoke_at = (expires_at < issued.expires_at).then_some(expires_at);",
+       "                let revoke_at = None::<u64>;")
 mutate("custodian-unissued-not-revoked", "a token GitHub widened is not revoked", KS,
        "                if let Some(unissued) = error.unissued {",
        "                if let Some(unissued) = error.unissued.filter(|_| false) {")
 mutate("custodian-revocation-not-retried", "a revocation GitHub fails is not tried again", KS,
-       "                if clock::now() + retry.as_secs() >= lapses_at {", "                if true {")
+       "            if clock::now() + retry.as_secs() >= lapses_at {", "            if true {")
 mutate("custodian-revocation-retried-past-expiry", "a failed revocation is tried again after GitHub's expiry", KS,
-       "                if clock::now() + retry.as_secs() >= lapses_at {", "                if false {")
+       "            if clock::now() + retry.as_secs() >= lapses_at {", "            if false {")
 mutate("custodian-key-file-open-accepted", "a key file its group or others can read is accepted", KT,
        "    if mode & 0o077 != 0 {", "    if false {")
 mutate("custodian-socket-mode-open-accepted", "a socket mode giving others access is accepted", KT,
@@ -6599,6 +6599,60 @@ mutate("custodian-reach-report-any-permission", "a reach report's installation-w
        "            && request.permissions.contains_key(REACH_REPORT_PERMISSION)\n")
 mutate("custodian-reach-report-repositories-sent", "an installation-wide request is sent to GitHub with an empty repository list, not none", KG,
        '            fields.remove("repositories");\n', "            let _ = fields;\n")
+# The custodian's own gaps (#219): its checks, the 401 that ends a revocation, the stop that revokes
+# what it keeps, and the client feature the gateway links alone. tests/start.rs, reload.rs,
+# issue.rs, refusals.rs, shutdown.rs and packaging.rs, and github.rs's unit tests, watch each.
+mutate("custodian-tool-outside-system-accepted", "a GitHub entry may list a tool of another system, which is then given GitHub tokens", KP,
+       "                .find(|tool| !under_system(tool, &entry.system))\n",
+       "                .find(|_| false)\n")
+mutate("custodian-tool-system-prefix-only", "a tool whose name only begins with the system's, such as githubber__read, counts as under it", KP,
+       '        .and_then(|rest| rest.strip_prefix("__"))\n', "")
+mutate("custodian-full-name-case-sensitive", "a token whose repositories GitHub names in another case is refused as widened", KG,
+       "            .map(|repository| repository.full_name.to_ascii_lowercase())\n",
+       "            .map(|repository| repository.full_name.clone())\n")
+mutate("custodian-full-name-unicode-folded", "a name GitHub answers is folded by Unicode's rules, so another repository's may match", KG,
+       "            .map(|repository| repository.full_name.to_ascii_lowercase())\n",
+       "            .map(|repository| repository.full_name.to_lowercase())\n")
+mutate("custodian-full-name-count-ignored", "an answer may list one repository twice in two cases", KG,
+       "        if given != asked || listed.len() != repositories.len() {",
+       "        if given != asked {")
+mutate("custodian-own-uid-served", "the custodian starts as a process serving its own UID", KT,
+       "    if config.peer_uid == own {", "    if false {")
+mutate("custodian-binary-skips-own-uid", "the binary starts without the own-UID check", KC + "bin/switchboard-custodian.rs",
+       "        Ok(config) => start_process(config, Box::new(std::io::stdout())).await,",
+       "        Ok(config) => key_custodian::start(config, Box::new(std::io::stdout())).await,")
+mutate("custodian-malformed-attribution-dropped", "a malformed request's record line loses its team and tool", KS,
+       "            return self.refuse(line.attribution(&request), Refusal::Malformed, problem);",
+       "            return self.refuse(line, Refusal::Malformed, problem);")
+mutate("custodian-malformed-team-kept", "a malformed team is written to the record", KC + "record.rs",
+       "        self.team = request.team_well_formed().then_some(request.team.as_str());",
+       "        self.team = Some(request.team.as_str());")
+mutate("custodian-revocation-401-not-done", "GitHub's 401 to a retried revocation is a failure, so the custodian keeps trying", KG,
+       "        if status == StatusCode::NO_CONTENT || status == StatusCode::UNAUTHORIZED {",
+       "        if status == StatusCode::NO_CONTENT {")
+mutate("custodian-not-revoked-at-stop", "a stop revokes nothing", KT,
+       "        let stopped = self.custodian.clone().revoke_outstanding(deadline).await;",
+       "        let stopped = Stopped::default();\n        let _ = deadline;")
+mutate("custodian-stop-revocations-unbounded", "a stop waits for every revocation, however long GitHub takes", KS,
+       "                () = &mut ends => break,",
+       "                () = &mut ends, if revoking.is_empty() => break,")
+mutate("custodian-stop-in-flight-unbounded", "a stop waits for every request in flight, however long GitHub takes", KS,
+       "                () = &mut ends => break,",
+       "                () = &mut ends, if settled => break,")
+mutate("custodian-stop-revokes-after-in-flight", "a stop revokes nothing until every request in flight is answered, so one slow request uses up its deadline", KS,
+       "                received = landed.recv(), if open => match received {",
+       "                received = landed.recv(), if open && settled => match received {")
+mutate("custodian-stop-landed-token-not-revoked", "a token issued for a request in flight when the stop began is not revoked by the stop", KS,
+       "        let token = match &kept.stopping {",
+       "        let token = match &None::<UnboundedSender<ToRevoke>> {")
+mutate("custodian-revoked-token-kept", "a token revoked at the end of its lifetime is revoked again at the stop", KS,
+       "            .tokens\n            .remove(&id);\n", "            .tokens\n            .len();\n")
+mutate("custodian-lapsed-token-revoked-at-stop", "a stop revokes a token already past GitHub's expiry", KS,
+       "        if each.lapses_at <= clock::now() {", "        if false {")
+mutate("custodian-gateway-links-server", "the GitHub connector, and so the gateway, links the custodian's server and key-reading code",
+       "crates/connector-github/Cargo.toml",
+       'key-custodian = { path = "../key-custodian", default-features = false, features = ["client"] }',
+       'key-custodian = { path = "../key-custodian" }')
 
 # --- connector-github ----------------------------------------------------------------------
 # The GitHub connector refuses another organization before any request, asks the key custodian for
@@ -6811,6 +6865,9 @@ READERS: list[tuple[str, frozenset[str]]] = [
     ("CONTRIBUTING.md", frozenset({"demo-checks"})),
     (".github/workflows/ci.yml", frozenset({"demo-checks"})),
     ("crates/audit-postgres/src/lib.rs", frozenset({"demo-checks"})),
+    # key-custodian/tests/packaging.rs asks cargo tree which of its features the gateway's build
+    # turns on, which connector-github's manifest decides.
+    ("crates/connector-github/Cargo.toml", frozenset({"key-custodian"})),
 ]
 
 

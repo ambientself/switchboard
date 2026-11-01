@@ -10,10 +10,20 @@
 //! limits the token's lifetime, and keeps its own record.
 //!
 //! - [`start()`] reads the configuration, the key and the registry file, and serves the socket
-//!   ([`server`]). The binary is `switchboard-custodian`.
+//!   ([`server`]). The binary is `switchboard-custodian`, which starts through
+//!   [`start_process`]: that also refuses a `peer_uid` that is the custodian's own UID.
 //! - [`CustodianClient`] is the client. It is in this crate so that the GitHub connector can
 //!   depend on it; nothing in the client reads the key.
 //! - `fake`, behind the `test-support` feature, is a fake GitHub App API for the tests.
+//!
+//! # Features
+//!
+//! `client` is the client and `server` the custodian itself: the key, the GitHub App client,
+//! the policy check, the socket, the record and the metrics. Both are on by default. The
+//! GitHub connector turns the defaults off and asks for `client` alone, so the gateway links
+//! the client and the wire protocol ([`protocol`]) and none of the server's code or
+//! dependencies (`tests/packaging.rs` checks the gateway's build). The `switchboard-custodian`
+//! binary needs `server`.
 //!
 //! # Where a tool's permission set is stated
 //!
@@ -52,7 +62,10 @@
 //!   one second up to a minute, until GitHub accepts or the token reaches GitHub's expiry. So
 //!   during an outage of GitHub's revoke endpoint the token works until the first attempt
 //!   after the outage ends.
-//! - The custodian stops. A token not yet revoked then is not revoked at all.
+//! - The custodian stops. A graceful stop revokes every token the custodian still keeps, within
+//!   a deadline, ten seconds by default (see [`server`]). A token whose revocation GitHub does
+//!   not accept by then is logged and works on; so does every token when the custodian is
+//!   killed rather than stopped.
 //!
 //! # Which revision a request carries
 //!
@@ -76,20 +89,34 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "client")]
 pub mod client;
+#[cfg(feature = "server")]
 pub mod clock;
 #[cfg(feature = "test-support")]
 pub mod fake;
+#[cfg(feature = "server")]
 pub mod github;
+#[cfg(feature = "server")]
 pub mod metrics;
+#[cfg(feature = "server")]
 pub mod policy;
 pub mod protocol;
+#[cfg(feature = "server")]
 pub mod rate;
+#[cfg(feature = "server")]
 pub mod record;
+#[cfg(feature = "server")]
 pub mod server;
+#[cfg(feature = "server")]
 pub mod start;
 
+#[cfg(feature = "client")]
 pub use client::{ClientError, CustodianClient, Token};
+#[cfg(feature = "server")]
 pub use policy::{CustodianPolicy, PolicyCell, PolicyError};
 pub use protocol::{Answer, Failure, MAX_REPOSITORIES, Refusal, Secret, TokenRequest};
-pub use start::{Config, Running, StartError, start};
+#[cfg(feature = "server")]
+pub use server::Stopped;
+#[cfg(feature = "server")]
+pub use start::{Config, Running, StartError, start, start_process};
