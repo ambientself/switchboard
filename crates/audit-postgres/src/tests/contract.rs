@@ -12,7 +12,7 @@ use gateway_testkit::contract::{self, ContractStore, StoredRecord, StoredRow};
 use serde_json::{Value, json};
 use tokio_postgres::Client;
 
-use super::{DELEGATION_COLUMNS, DelegationRead, TestDatabase};
+use super::{DELEGATION_COLUMNS, DelegationRead, EXCEPTION_COLUMN, TestDatabase};
 use crate::{Budgets, PgAuditStore, PoolSizes};
 
 /// Budgets other than the defaults, so a store that ignores the ones it was given is caught,
@@ -53,7 +53,7 @@ impl ContractStore for Postgres {
                         (extract(epoch FROM begun_at) * 1000000)::bigint AS begun_at_micros,
                         deadline IS NOT NULL AS deadline_set,
                         (extract(epoch FROM deadline - begun_at) * 1000000)::bigint
-                            AS deadline_micros, {DELEGATION_COLUMNS}
+                            AS deadline_micros, {DELEGATION_COLUMNS}, {EXCEPTION_COLUMN}
                  FROM switchboard_audit.call_rows WHERE id::text = $1"
                 ),
                 &[&row.as_str()],
@@ -146,6 +146,7 @@ impl ContractStore for Postgres {
                         "delegation": read.delegation,
                         "delegation_failure": read.failure,
                         "currency": read.currency,
+                        "allowed_by_exception": text(EXCEPTION_COLUMN),
                         "credential": credential,
                         "completion": completion,
                     }))
@@ -363,6 +364,7 @@ contract!(
     a_delegation_and_its_currency_are_stored_as_begin_was_given_them,
     an_unverified_delegation_denied_before_check_3_is_stored_as_that_denial_alone,
     a_delegation_of_the_wrong_shape_is_refused_and_leaves_no_row,
+    an_exception_is_stored_on_an_allowed_write_and_refused_elsewhere,
     a_repeated_begin_compares_the_decision_and_not_the_reach_or_credential,
     finish_completes_once_accepts_an_identical_repeat_and_refuses_a_different_one,
     finish_touches_only_the_completion,
@@ -393,6 +395,7 @@ contract!(
     a_receipt_settled_by_reconciliation_is_not_moved_by_a_late_finish,
     each_claim_is_counted_as_an_attempt,
     a_receipt_held_for_its_call_is_not_due_and_no_one_else_claims_it,
+    an_unknown_receipt_is_not_due_before_its_rows_deadline,
     // Attribution.
     an_attribution_read_finds_only_the_principals_completed_receipt_of_its_tool_target_and_reference,
 );

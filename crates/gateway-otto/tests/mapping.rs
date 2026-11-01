@@ -89,6 +89,33 @@ fn a_mapping_that_is_not_one_to_one_is_refused() {
     );
 }
 
+/// Read as a member of a larger document, the mapping is the same as from its own file, and a
+/// name given twice, or two names given one target, is refused the same way.
+#[test]
+fn a_mapping_read_inside_a_document_refuses_what_a_mapping_file_refuses() {
+    #[derive(serde::Deserialize)]
+    struct Document {
+        tool_mapping: ToolMapping,
+    }
+    let read = |mapping: &str| {
+        serde_json::from_str::<Document>(&format!(r#"{{"tool_mapping": {mapping}}}"#))
+            .map(|document| document.tool_mapping)
+            .map_err(|error| error.to_string())
+    };
+    let names = r#"{"github_get_pr": "github__get_pr", "jira_get_issue": "jira__get_issue"}"#;
+    assert_eq!(read(names), Ok(ToolMapping::from_json(names).unwrap()));
+    for refused in [
+        r#"{"github_get_pr": "github__get_pr", "github_get_pr": "github__other"}"#,
+        r#"{"github_get_pr": "github__get_pr", "github_pr": "github__get_pr"}"#,
+        r#"{"": "github__get_pr"}"#,
+        r#"{"github_get_pr": "not a tool name"}"#,
+    ] {
+        let message = ToolMapping::from_json(refused).unwrap_err().to_string();
+        let error = read(refused).unwrap_err();
+        assert!(error.starts_with(&message), "{refused}: {error}");
+    }
+}
+
 #[test]
 fn each_name_must_be_one() {
     assert_eq!(

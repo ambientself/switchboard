@@ -89,18 +89,23 @@ pub const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 12,
-        name: "held_and_counted_claims",
-        sql: include_str!("../sql/migrations/0012_held_and_counted_claims.sql"),
+        name: "exception",
+        sql: include_str!("../sql/migrations/0012_exception.sql"),
     },
     Migration {
         version: 13,
-        name: "receipt_team",
-        sql: include_str!("../sql/migrations/0013_receipt_team.sql"),
+        name: "held_and_counted_claims",
+        sql: include_str!("../sql/migrations/0013_held_and_counted_claims.sql"),
     },
     Migration {
         version: 14,
+        name: "receipt_team",
+        sql: include_str!("../sql/migrations/0014_receipt_team.sql"),
+    },
+    Migration {
+        version: 15,
         name: "receipts_by_reference",
-        sql: include_str!("../sql/migrations/0014_receipts_by_reference.sql"),
+        sql: include_str!("../sql/migrations/0015_receipts_by_reference.sql"),
     },
 ];
 

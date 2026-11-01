@@ -7,12 +7,12 @@
 -- before this migration reads NULL: a GitHub lookup of one fails, so it goes to a person once
 -- its attempts are used up.
 --
--- Additive: no column or row 0008 to 0012 made is changed. The trigger receipt_moves already
+-- Additive: no column or row 0008 to 0013 made is changed. The trigger receipt_moves already
 -- refuses an update of any column but the state, how it was established, the person, the
 -- reference, the lease, the hand-off and the claims, so the team is written once, at the
 -- insert.
 --
--- 0001 to 0012 are not edited: applied versions are recorded, and an edit to one would not
+-- 0001 to 0013 are not edited: applied versions are recorded, and an edit to one would not
 -- apply.
 
 ALTER TABLE switchboard_audit.receipts

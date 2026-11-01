@@ -388,7 +388,7 @@ async fn a_column_grant_beyond_its_own_is_refused() {
     );
 }
 
-/// The receipt's team (migration 0013) is a column the check requires, of its type, with the
+/// The receipt's team (migration 0014) is a column the check requires, of its type, with the
 /// gateway's role holding INSERT and SELECT on it and nothing more.
 #[tokio::test]
 async fn the_receipts_team_is_required_with_its_own_grants_and_no_wider_one() {

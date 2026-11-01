@@ -123,7 +123,7 @@ CHECK = {
     2: "    let tool = tool_is_approved_on_surface(snapshot, &caller.surface, tool)?;\n",
     3: "    delegation_agrees(caller, profile, principal)?;\n",
     4: "    delegation_lists_tool(caller.delegation.as_ref(), tool)?;\n",
-    5: "    classification_is_permitted(profile, tool)?;\n",
+    5: "    let exception = classification_is_permitted(profile, tool)?;\n",
     6: (
         "    if let Some(resources) = resources {\n"
         "        resources_are_within_limit(snapshot.limits(), principal, tool, resources)?;\n"
@@ -153,8 +153,11 @@ mutate(
     CHECK[3] + CHECK[4] + CHECK[5],
     CHECK[5] + CHECK[3] + CHECK[4],
 )
+# Removing check 5 leaves the exception it would have returned empty, so the rest compiles.
+REMOVED = {5: "    let exception = None;\n"}
 for number in (1, 3, 4, 5, 6):
-    mutate(f"check-{number}-removed", f"check {number} is not run", SRC + "decision.rs", CHECK[number], "")
+    mutate(f"check-{number}-removed", f"check {number} is not run", SRC + "decision.rs", CHECK[number],
+           REMOVED.get(number, ""))
 # The currency check after check 5 (decision 0012): a direct write is reported before currency.
 # tests/decision_table.json's order cases catch these.
 mutate("currency-before-check-5", "the currency check runs before check 5, so a direct write is reported as not current",
@@ -275,8 +278,8 @@ mutate(
     "tool-name-may-be-empty",
     "a tool name may be empty",
     SRC + "names.rs",
-    "        let valid = !value.is_empty()\n            && value.len()",
-    "        let valid = value.len()",
+    "        let valid = !value.is_empty()\n            && value.len() <= MAX_TOOL_NAME",
+    "        let valid = value.len() <= MAX_TOOL_NAME",
 )
 mutate(
     "tool-name-unchecked-conversion",
@@ -418,6 +421,38 @@ for id, description, replacement in [
     ),
 ]:
     mutate(id, description, SRC + "decision.rs", PROFILE_LISTS, f"    let permitted = {replacement};")
+# Decision 0011, section 9: check 5 lets a `write` tool past only when the calling profile's own
+# list of exceptions names it by its exact name, and every later check still runs; the decision
+# names the exception only on an allow, and the row records it. tests/decision_table.json's
+# exception cases, tests/properties.rs and policy.rs's own tests catch these.
+mutate("exception-list-ignored", "check 5 ignores the profile's list of exceptions, so no excepted tool is allowed",
+       SRC + "decision.rs", "    match profile.excepting(&tool.name) {", "    match None::<&ExceptionName> {")
+mutate("exception-list-of-any-profile", "check 5 lets a tool past when any profile of the snapshot excepts it",
+       SRC + "decision.rs", CHECK[5],
+       "    let exception = classification_is_permitted(profile, tool).or_else(|denied| {\n"
+       "        snapshot.profiles().find_map(|any| any.excepting(&tool.name)).map(Some).ok_or(denied)\n"
+       "    })?;\n")
+mutate("exception-by-prefix", "a profile excepts every tool whose name starts with one its list names",
+       SRC + "policy.rs", "            .find(|exception| exception.tools.contains(tool))",
+       "            .find(|exception| exception.tools.iter().any(|named| tool.as_str().starts_with(named.as_str())))")
+mutate("exception-skips-later-checks", "a call check 5 let past by an exception skips the currency check and check 6",
+       SRC + "decision.rs", CHECK[5],
+       CHECK[5] + "    if exception.is_some() {\n        return Ok((tool, exception));\n    }\n")
+mutate("exception-not-recorded", "an allowed call's row does not record the exception that allowed it",
+       SRC + "audit.rs", "        allowed_by_exception: exception,\n",
+       "        allowed_by_exception: { let _ = exception; None },\n")
+mutate("exception-recorded-on-denial", "a denial names the exception its profile's list holds for its tool",
+       SRC + "decision.rs", "            // A denial names no exception, whichever check denied it.\n            None,\n",
+       "            snapshot\n                .profile(&call.caller.profile)\n"
+       "                .and_then(|profile| call.tool.name().ok().and_then(|name| profile.excepting(&name).cloned())),\n")
+mutate("exception-list-required", "a policy that does not mention exceptions is refused, not read as none", SRC + "policy.rs",
+       "    #[serde(default)]\n    pub exceptions: Vec<Exception>,", "    pub exceptions: Vec<Exception>,")
+mutate("exception-name-any-case", "an exception's name may hold capitals", SRC + "names.rs",
+       "                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');",
+       "                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');")
+mutate("exception-name-uncapped", "an exception's name may be longer than 64 characters", SRC + "names.rs",
+       "            && value.len() <= MAX_EXCEPTION_NAME\n            && !value.starts_with('-')",
+       "            && !value.starts_with('-')")
 mutate(
     "classification-write-parses-as-propose",
     "`write` in configuration reads as propose, and `propose` is refused",
@@ -580,31 +615,38 @@ DECIDE_CHECKED = (
     "        Some(call.currency),\n"
     "        Some(&call.resources),\n"
     "    )\n"
-    "    .and_then(|tool| key_is_carried(tool, call.key.as_ref()).map(|()| tool));\n"
+    "    .and_then(|(tool, exception)| key_is_carried(tool, &call.key).map(|()| (tool, exception)));\n"
 )
 mutate("key-check-on-list", "tools/list runs the key check, so a proposal is never listed", SRC + "decision.rs",
        "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None, None).ok())",
-       "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None, None).and_then(|tool| key_is_carried(tool, None).map(|()| tool)).ok())")
+       "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None, None).and_then(|passed| key_is_carried(passed.0, &CallKey::Absent).map(|()| passed)).ok())")
 mutate("key-check-before-resources", "the key check runs before check 6, so a call outside its limit is asked for a key", SRC + "decision.rs",
        DECIDE_CHECKED,
        "    let checked = check(snapshot, &call.caller, &call.tool, Some(call.currency), None)\n"
-       "        .and_then(|tool| key_is_carried(tool, call.key.as_ref()).map(|()| tool))\n"
-       "        .and_then(|_| check(snapshot, &call.caller, &call.tool, Some(call.currency), Some(&call.resources)));\n")
+       "        .and_then(|(tool, _)| key_is_carried(tool, &call.key))\n"
+       "        .and_then(|()| check(snapshot, &call.caller, &call.tool, Some(call.currency), Some(&call.resources)));\n")
 mutate("key-check-before-currency", "the key check runs before the currency check, so a turn that is not current is asked for a key",
        SRC + "decision.rs", DECIDE_CHECKED,
        "    let checked = check(snapshot, &call.caller, &call.tool, None, None)\n"
-       "        .and_then(|tool| key_is_carried(tool, call.key.as_ref()).map(|()| tool))\n"
-       "        .and_then(|_| check(snapshot, &call.caller, &call.tool, Some(call.currency), Some(&call.resources)));\n")
+       "        .and_then(|(tool, _)| key_is_carried(tool, &call.key))\n"
+       "        .and_then(|()| check(snapshot, &call.caller, &call.tool, Some(call.currency), Some(&call.resources)));\n")
 mutate("key-check-first", "the key check runs before every other check, so a denied write is asked for a key", SRC + "decision.rs",
        DECIDE_CHECKED,
        "    let checked = call.tool.name().ok().and_then(|name| snapshot.tool(&name))\n"
-       "        .map_or(Ok(()), |tool| key_is_carried(tool, call.key.as_ref()))\n"
+       "        .map_or(Ok(()), |tool| key_is_carried(tool, &call.key))\n"
        "        .and_then(|()| check(snapshot, &call.caller, &call.tool, Some(call.currency), Some(&call.resources)));\n")
 KEY_CARRIED = "    if tool.classification == Classification::Read || key.is_some() {"
 mutate("key-check-removed", "a side effect with no key is allowed", SRC + "decision.rs",
        KEY_CARRIED, "    if true || tool.classification == Classification::Read || key.is_some() {")
 mutate("key-check-on-reads", "a read needs a key too", SRC + "decision.rs",
        KEY_CARRIED, "    if key.is_some() {")
+# A call that sent a key that is not valid carries none, and its denial says that is why, not
+# that it carried none (#204). The decision table, tests/properties.rs and the gateway's
+# tests/keys.rs catch these.
+mutate("key-invalid-reads-as-missing", "a call whose explicit key is not valid is denied as one that sent none", SRC + "decision.rs",
+       "            invalid: *carried == CallKey::Invalid,\n", "            invalid: false,\n")
+mutate("sentence-key-invalid-as-missing", "the sentence for a key that is not valid is the one for no key", SRC + "sentences.rs",
+       "            if *invalid { KEY_INVALID } else { KEY_MISSING },\n", "            KEY_MISSING,\n")
 mutate("key-bound-short", "a key of 128 characters is refused", SRC + "receipt.rs",
        "            && value.len() <= MAX_IDEMPOTENCY_KEY\n", "            && value.len() < MAX_IDEMPOTENCY_KEY\n")
 mutate("key-with-space-accepted", "a key may hold a space", SRC + "receipt.rs",
@@ -612,28 +654,33 @@ mutate("key-with-space-accepted", "a key may hold a space", SRC + "receipt.rs",
        "            && value.bytes().all(|byte| byte.is_ascii_graphic() || byte == b' ');")
 # The gateway fills the key from the caller's tool-use identifier, its first carrier.
 mutate("gw-key-not-from-tool-use-id", "the tool-use identifier never keys a call, so a proposal that sends only one is denied", "crates/gateway/src/path.rs",
-       "        Explicit::Absent => tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok()),\n",
-       "        Explicit::Absent => tool_use_id.and(None),\n")
+       "        Explicit::Absent => tool_use_id\n            .and_then(|id| IdempotencyKey::parse(id.as_str()).ok())\n",
+       "        Explicit::Absent => tool_use_id\n            .and(None)\n")
 # The other carriers (#55): a key sent on purpose comes first, in the _meta field, or else in
 # the Idempotency-Key header from a profile that declares its callers set it per request; the
 # tool-use identifier is recorded beside it. crates/gateway/tests/keys.rs catches these.
 mutate("gw-key-meta-ignored", "the gateway never reads a key from the switchboard/idempotencyKey _meta field", "crates/gateway/src/path.rs",
        "            meta_key(idempotency_key),", "            meta_key(None),")
 mutate("gw-key-header-from-any-profile", "the Idempotency-Key header keys a call under a profile that does not declare it", "crates/gateway/src/path.rs",
-       "            key_header.honoured(declares_header),", "            key_header.honoured(true || declares_header),")
+       "            || key_header.honoured(declares_header),", "            || key_header.honoured(true || declares_header),")
 mutate("gw-key-tool-use-id-first", "the tool-use identifier is preferred over an explicit key", "crates/gateway/src/path.rs",
-       "    match meta.or(header) {\n        Explicit::Valid(key) => Some(key),\n",
+       "    match meta.or_else(header) {\n        Explicit::Valid(key) => CallKey::Valid(key),\n",
        "    if let Some(key) = tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok()) {\n"
-       "        return Some(key);\n    }\n"
-       "    match meta.or(header) {\n        Explicit::Valid(key) => Some(key),\n")
+       "        return CallKey::Valid(key);\n    }\n"
+       "    match meta.or_else(header) {\n        Explicit::Valid(key) => CallKey::Valid(key),\n")
 # An explicit key that is not valid leaves the call with no key, so a side effect is denied; it
 # is not passed over for the tool-use identifier, which would lose the chosen key's cover of a
 # replayed turn. keys.rs catches this.
 mutate("gw-key-invalid-falls-back", "an explicit key that is not valid is passed over, and the call keyed by its tool-use identifier", "crates/gateway/src/path.rs",
-       "        Explicit::Invalid => None,\n",
-       "        Explicit::Invalid => tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok()),\n")
+       "        Explicit::Invalid => CallKey::Invalid,\n",
+       "        Explicit::Invalid => tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok()).into(),\n")
 mutate("gw-key-invalid-meta-passed-over", "a _meta key that is not valid is passed over for the header", "crates/gateway/src/path.rs",
-       "            Self::Absent => next,\n", "            Self::Absent | Self::Invalid => next,\n")
+       "            Self::Absent => next(),\n", "            Self::Absent | Self::Invalid => next(),\n")
+# The header is read only when the _meta field holds nothing, so a header passed over for a
+# _meta key never logs that the call carries no key (#204). path.rs's own tests catch this.
+mutate("gw-key-header-read-beside-meta", "the Idempotency-Key header is read even when the _meta field holds a key", "crates/gateway/src/path.rs",
+       "    match meta.or_else(header) {\n",
+       "    let header = header();\n    match meta.or_else(|| header) {\n")
 # A _meta key that is not a string is a key that is not valid, not an absent one, so it too
 # leaves the call with no key. keys.rs catches the first, the parse table the second.
 mutate("gw-key-non-string-meta-absent", "a _meta key that is not a string is read as no key sent, and the call keyed by its next carrier", "crates/gateway/src/path.rs",
@@ -674,6 +721,7 @@ for path, struct in [
     (SRC + "policy.rs", "ResourceLimits"),
     (SRC + "policy.rs", "Resource"),
     (SRC + "policy.rs", "ConnectorEntry"),
+    (SRC + "policy.rs", "Exception"),
     (SRC + "principal.rs", "PrincipalId"),
     (SRC + "audit.rs", "AuditRecord"),
     (SRC + "audit.rs", "RecordedResource"),
@@ -760,6 +808,39 @@ mutate("snapshot-settlement-undeclared-accepted", "the loader accepts an approva
        "                let _ = classification;\n")
 mutate("snapshot-settlement-on-read-accepted", "the loader accepts a read tool that declares a settlement", SRC + "policy.rs",
        "                return Err(SnapshotError::SettlementOnRead(tool.name.clone()));\n", "")
+# Decision 0011, section 9, and decision 0009, "Reconciliation": the loader's rules for a
+# profile's exceptions. tests/loader_rules.json has a refusing and a passing case for each.
+mutate("exception-without-currency-loads", "the loader accepts an exception on a profile that does not require currency",
+       SRC + "policy.rs", "            if !profile.requires_currency {\n                return Err(SnapshotError::ExceptionWithoutCurrency {",
+       "            if false {\n                return Err(SnapshotError::ExceptionWithoutCurrency {")
+mutate("exception-names-non-write-loads", "the loader accepts an exception naming a tool not classified write",
+       SRC + "policy.rs", "                if tool.classification != Classification::Write {", "                if false {")
+mutate("excepted-write-settled-by-person-loads", "the loader accepts an excepted write tool settled by a person",
+       SRC + "policy.rs", "                if tool.settlement == Some(Settlement::Person) {", "                if false {")
+mutate("exception-unapproved-tool-loads", "the loader accepts an exception naming a tool that is not approved",
+       SRC + "policy.rs",
+       "                let Some(tool) = snapshot.tools.get(name) else {\n"
+       "                    return Err(SnapshotError::ExceptionToolUnapproved {\n"
+       "                        profile: profile_name.clone(),\n"
+       "                        exception: exception_name.clone(),\n"
+       "                        tool: name.clone(),\n"
+       "                    });\n"
+       "                };\n",
+       "                let Some(tool) = snapshot.tools.get(name) else {\n                    continue;\n                };\n")
+mutate("exception-names-no-tool-loads", "the loader accepts an exception that names no tool",
+       SRC + "policy.rs",
+       "            let Some(first_tool) = exception.tools.first() else {\n"
+       "                return Err(SnapshotError::ExceptionNamesNoTool {\n"
+       "                    profile: profile_name.clone(),\n"
+       "                    exception: exception_name.clone(),\n"
+       "                });\n"
+       "            };\n",
+       "            let Some(first_tool) = exception.tools.first() else {\n                continue;\n            };\n")
+mutate("exception-duplicate-name-loads", "the loader accepts two exceptions of one profile with one name",
+       SRC + "policy.rs", "            if !names.insert(exception_name) {", "            if false && !names.insert(exception_name) {")
+mutate("exception-tool-twice-loads", "the loader accepts one tool in two exceptions of one profile",
+       SRC + "policy.rs", "                if let Some(first) = named.insert(tool, exception_name) {",
+       "                if let Some(first) = named.insert(tool, exception_name).filter(|_| false) {")
 
 # --- Principals and proof ------------------------------------------------------------------
 
@@ -931,6 +1012,29 @@ mutate("record-delegation-failure-on-earlier-denial",
        "a delegation's failure is recorded on a row denied before check 3", SRC + "audit.rs",
        "        delegation_failure.filter(|_| reason == Some(ReasonKind::DelegationUnverified));",
        "        delegation_failure.filter(|_| reason.is_some());")
+# The core's own test store refuses the delegation shapes the testkit's store and Postgres refuse
+# (migration 0010, #211), so the core's tests fail if it ever writes one. audit_flow.rs's
+# the_test_store_refuses_the_delegation_shapes_the_other_stores_refuse catches these.
+CORE_STORE = CRATE + "tests/common/mod.rs"
+mutate("core-store-failure-beside-claims", "the core's test store records a delegation's failure beside its claims", CORE_STORE,
+       "    if record.delegation.is_some()\n        || record.proved_delegation_team.is_some()\n        || record.claimed_acting_person.is_some()\n    {",
+       "    if false {")
+mutate("core-store-digest-without-binding", "the core's test store records a digest with a failure that is not a binding's", CORE_STORE,
+       "    if failure.digest.is_some() && !failure.failure.follows_signature() {", "    if false {")
+mutate("core-store-failure-on-any-row", "the core's test store records a delegation's failure on a row check 3 did not deny for it", CORE_STORE,
+       "    if !at_check_3 || record.decision != DecisionKind::Deny {", "    if false {")
+mutate("core-store-check-3-without-failure", "the core's test store writes a denial at check 3 that records no failure", CORE_STORE,
+       "        return if at_check_3 {\n            Err(violates(\"delegation_failure_shape\"))\n        } else {\n            Ok(())\n        };",
+       "        return Ok(());")
+mutate("core-store-delegation-without-team", "the core's test store records a verified delegation without its team or person", CORE_STORE,
+       "    if !(team && person) {", "    if false {")
+mutate("core-store-epoch-past-bigint", "the core's test store records a delegation's epoch past a Postgres bigint", CORE_STORE,
+       "    if i64::try_from(delegation.epoch).is_err() {", "    if false {")
+mutate("core-store-receipt-begin-unchecked", "the core's test store's begin with a receipt writes any delegation shape", CORE_STORE,
+       "        refused_shape(record)?;\n", "")
+mutate("core-store-list-unchecked", "the core's test store writes a list row with a verified delegation without its team or person", CORE_STORE,
+       "        } else if let Err(refused) = refused_delegation(\n            record.delegation.as_ref(),",
+       "        } else if let Err(refused) = refused_delegation(\n            None,")
 mutate("outcome-ok-renamed", "the Ok outcome is written as `success`", SRC + "audit.rs",
        "    Ok,\n    /// The ", "    #[serde(rename = \"success\")]\n    Ok,\n    /// The ")
 mutate("outcome-error-renamed", "the Error outcome is written as `failed`", SRC + "audit.rs",
@@ -1588,6 +1692,11 @@ mutate("otto-grant-s-unchecked", "a non-canonical S is left to the signature lib
        "        if !s_is_canonical(&signature_bytes) {", "        if false {")
 mutate("otto-grant-signature-unchecked", "a signature that does not verify is accepted", OV,
        "            .map_err(|_| refuse(FailureKind::Signature))?;", "            .ok();")
+# Strict verification (#211): tests/forgery.rs's grant whose R is of small order, which only the
+# lax check accepts, catches this.
+mutate_all("otto-grant-signature-lax", "the signature is verified with the lax check, which accepts a small-order R",
+           (OV, "use ed25519_dalek::Signature;\n", "use ed25519_dalek::{Signature, Verifier as _};\n"),
+           (OV, "            .verify_strict(\n", "            .verify(\n"))
 mutate("otto-grant-claims-before-signature", "the claims are decoded before the signature is checked", OV,
        "        // 3. The signature, before the claims are decoded.\n",
        "        LENIENT.decode(claims).ok().and_then(|bytes| Claims::parse(&bytes, false, false)).ok_or(refuse(FailureKind::Malformed))?;\n")
@@ -1607,6 +1716,14 @@ mutate("otto-grant-digest-dropped", "a failure after the signature verified carr
 mutate("otto-grant-digest-of-decoded-claims", "the digest is taken over the decoded claims, not the grant as presented", OV,
        "        let digest = GrantDigest::of(grant);",
        "        let digest = GrantDigest::of(&LENIENT.decode(claims).unwrap_or_default());")
+# Only a binding's failure carries the digest (#213): a signed grant refused for its encoding or
+# its claims' shape carries none. tests/forgery.rs, tests/format_doc.rs and the gateway's
+# tests/grant_logs.rs catch these.
+mutate("otto-grant-digest-on-encoding", "a signed grant refused for its encoding carries its digest", OV,
+       "            || CANONICAL.encode(&claims_bytes).as_bytes() != claims\n        {\n            return Err(refuse(FailureKind::Encoding));",
+       "            || CANONICAL.encode(&claims_bytes).as_bytes() != claims\n        {\n            return Err(bind(FailureKind::Encoding));")
+mutate("otto-grant-digest-on-malformed", "a signed grant whose claims are malformed carries its digest", OV,
+       "            .ok_or(refuse(FailureKind::Malformed))?;", "            .ok_or(bind(FailureKind::Malformed))?;")
 mutate("otto-grant-empty-tools-accepted", "a grant with no tools is accepted", OV,
        ".filter(|tools| !tools.is_empty() && tools.iter().all(|tool| !tool.is_empty()))?;",
        ".filter(|tools| tools.iter().all(|tool| !tool.is_empty()))?;")
@@ -1637,6 +1754,19 @@ mutate("otto-grant-unknown-key-falls-back", "an unknown key ID is verified with 
        "            .and_then(|id| self.keys.keys.get_key_value(id).or_else(|| self.keys.keys.iter().next()))\n")
 mutate("otto-grant-epoch-zero-accepted", "a grant with epoch 0 is accepted", OV,
        ".filter(|epoch| *epoch > 0)", ".filter(|epoch| *epoch >= 0)")
+# An integer is digits only (#211): `-0`, which JSON reads as a float, is not read as zero.
+# tests/forgery.rs catches this.
+mutate_all("otto-grant-negative-zero-read-as-zero", "iat is read through a float, so -0 and 1800000000.0 are read as integers",
+           (OV, '    #[serde(default, deserialize_with = "present")]\n    iat: Option<i64>,',
+            '    #[serde(default, deserialize_with = "through_float")]\n    iat: Option<i64>,'),
+           (OV, "/// A member that is present is its value, never `null`.",
+            "fn through_float<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<i64>, D::Error> {\n"
+            "    Ok(Some(f64::deserialize(deserializer)? as i64))\n}\n\n"
+            "/// A member that is present is its value, never `null`."))
+# One name for the lifetime failure (#213): the counter's label is the row's. tests/binding.rs,
+# tests/format_doc.rs, the gateway's grants.rs and tests/grant_logs.rs catch this.
+mutate("otto-grant-lifetime-label-short", "the lifetime failure is labelled `lifetime`, not the row's `lifetime_over_ceiling`", OV,
+       'FailureKind::LifetimeOverCeiling => "lifetime_over_ceiling",', 'FailureKind::LifetimeOverCeiling => "lifetime",')
 mutate("otto-grant-required-pod-optional", "a grant without pod is accepted when the issuer requires it", OV,
        "        if require_pod && claims.pod.is_none() {", "        if false {")
 mutate("otto-grant-required-egress-optional", "a grant without egress is accepted when the issuer requires it", OV,
@@ -1726,6 +1856,11 @@ mutate("otto-mapping-last-one-wins", "a mapping file's repeated name keeps only 
 mutate("otto-mapping-unmapped-kept", "a name the mapping lacks is kept when it is a valid tool name", OT,
        ".filter_map(|name| self.get(name).cloned())",
        ".filter_map(|name| self.get(name).cloned().or_else(|| ToolName::parse(name).ok()))")
+# The mapping read as a member of the JSON configuration (#213) refuses a name given twice, as a
+# mapping file does. tests/mapping.rs and the gateway's grants.rs and tests/grants.rs catch this.
+mutate("otto-mapping-member-last-one-wins", "a mapping read inside the JSON configuration keeps only the last of a repeated name", OT,
+       "        let entries = Entries::<String>::deserialize(deserializer)?;\n        Self::from_pairs(entries.0)",
+       "        let entries = BTreeMap::<String, String>::deserialize(deserializer)?;\n        Self::from_pairs(entries)")
 
 # The resolver client (decisions 0003 and 0012, #22): the one-second budget enforced by the
 # client, no cache, a bounded answer, the version and the echo checked, and every failure read
@@ -1862,7 +1997,7 @@ mutate("fake-audit-error-kind-repeat-unchecked", "a repeated finish with an erro
        "                    || (matches!(written.outcome, Outcome::Error { .. })\n"
        "                        && matches!(completion.outcome, Outcome::Error { .. })\n"
        "                        && written.latency_ms == completion.latency_ms) =>\n"
-       "            {\n                Ok(())\n            }")
+       "            {\n                Ok(false)\n            }")
 mutate("testkit-lost-list-confirmation-ignored", "a list told to lose its confirmation succeeds", A,
        "            if state.confirmation_lost.take() {\n                return Err(lost());", "            if false {\n                return Err(lost());")
 mutate("testkit-lost-confirmation-before-write", "a lost confirmation writes no row", A,
@@ -1938,6 +2073,10 @@ mutate("testkit-failure-on-any-row", "the in-memory store records a delegation's
        "    if !at_check_3 || record.decision != DecisionKind::Deny {", "    if false {")
 mutate("testkit-delegation-without-team", "the in-memory store records a verified delegation without its team or person", A,
        "    if delegation && !(team && person) {", "    if false && delegation && !(team && person) {")
+# Migration 0012's allowed_by_exception_shape: the contract suite's
+# an_exception_is_stored_on_an_allowed_write_and_refused_elsewhere catches this.
+mutate("testkit-exception-shape-unchecked", "the in-memory store records an exception on a denial, a read or a proposal", A,
+       "    refused_exception(id, record)?;\n", "")
 mutate("testkit-outcome-sentence-uncapped", "the in-memory store writes a refusal's sentence of any length at finish", A,
        "        refuse_long_sentence(sentence)?;\n", "        let _ = refuse_long_sentence(sentence);\n")
 mutate("testkit-outcome-sentence-refused-at-cap", "the in-memory store refuses a refusal's sentence of exactly the cap", ROW_BOUND,
@@ -2007,6 +2146,11 @@ mutate("testkit-late-finish-disagreement-not-counted", "a late finish that disag
        "            self.late_finish_disagreements += 1;\n", "")
 mutate("testkit-late-finish-agreement-counted", "a late finish that agrees with reconciliation is counted as a disagreement", A,
        "        && receipt.state != settled\n", "")
+# No receipt is due before its row's deadline, so a late side effect whose first hold is not
+# written has until then to hold it (#217). tests/reconcile.rs and the contract suite catch it.
+mutate("testkit-due-before-deadline", "a receipt answered unknown is due before its row's deadline", A,
+       "        self.past_deadline(&receipt.row, now)\n            && self.reads_as_unknown(receipt, now)\n",
+       "        self.reads_as_unknown(receipt, now)\n")
 
 C = TESTKIT_SRC + "credentials.rs"
 NEXT_FAILURE = "            Refusing::Next(failure) => {\n                state.refusing = Refusing::Never;\n                Some(failure)\n            }"
@@ -3098,6 +3242,12 @@ mutate("gw-bulkhead-before-argument-check", "the caps are taken before the argum
        "                drop(self.inner.run(call));\n"
        "                Box::pin(std::future::ready(outcome))\n"
        "            }\n")
+# A side effect with no definite answer is counted under outcome="unknown", not "error" (#204).
+# bulkhead.rs's and metrics.rs's own tests, and tests/limits.rs, catch these.
+mutate("gw-bulkhead-unknown-as-error", "a proxied call whose outcome is unknown is counted as an error", GW_BULKHEAD,
+       "            ToolOutcome::Unknown => &self.unknown,\n", "            ToolOutcome::Unknown => &self.error,\n")
+mutate("gw-metrics-unknown-not-written", "the proxied calls whose outcome is unknown are not written", GW + "metrics.rs",
+       "            (\"unknown\", counts.unknown),\n", "")
 mutate("gw-shed-not-counted", "a call a server's or a team's cap refused is not counted as shed", GW_BULKHEAD,
        "        counter.fetch_add(1, Ordering::Relaxed);\n        tracing::warn!(\n            event = \"call_shed\",\n",
        "        let _ = counter;\n        tracing::warn!(\n            event = \"call_shed\",\n")
@@ -3152,12 +3302,22 @@ mutate("gw-in-process-size-bound-removed", "a result of any size from a connecto
 # up meanwhile; shutting down waits for it; and each breach is logged once (#217).
 # tests/reconcile.rs, tests/in_process.rs and tests/in_process_logs.rs catch these.
 mutate("gw-late-side-effect-unheld", "a late side effect is answered before its receipt is held, so another instance may look it up while it runs", GW_BOUND,
-       "                if let Some(holding) = &holding {\n                    holding.hold(&row, &connector, &late_tool).await;\n                }\n", "")
+       "                    Some(holding) => holding.hold(&row, &connector, &late_tool, true).await,\n",
+       "                    Some(_) => true,\n")
 mutate("gw-late-side-effect-hold-not-renewed", "a late side effect holds its receipt once, so a lookup comes a lease later while it still runs", GW_BOUND,
-       "                tokio::time::sleep(every).await;\n                self.hold(row, connector, tool).await;\n",
-       "                tokio::time::sleep(every).await;\n")
+       "                held = self.hold(row, connector, tool, held).await;\n",
+       "                let _ = self.hold(row, connector, tool, held);\n")
 mutate("gw-late-side-effect-not-held-at-its-end", "a late side effect's receipt is not held again as it ends, so a lookup may come at once", GW_BOUND,
-       "        self.hold(row, connector, tool).await;\n        outcome\n", "        outcome\n")
+       "        self.hold(row, connector, tool, held).await;\n        outcome\n", "        outcome\n")
+mutate("gw-late-side-effect-hold-retried-a-quarter-lease-later", "a late side effect's hold that was not written is tried again only at the next renewal, leaving its receipt claimable meanwhile", GW_BOUND,
+       "                tokio::time::sleep(if held { every } else { HOLD_RETRY }).await;\n",
+       "                tokio::time::sleep(every).await;\n")
+mutate("gw-late-side-effect-unheld-logged-each-time", "every hold of a late side effect's receipt not written is logged, not once for each run of them", GW_BOUND,
+       "        if !held_before {\n            return false;\n        }\n", "")
+mutate("gw-late-call-row-kept", "a late side effect's receipt is still counted as running here after it ends, so this instance never looks it up", GW_BOUND,
+       "                    rows.remove(&self.1);\n", "")
+mutate("gw-reconciler-claims-its-own-late-call", "this instance's reconciler claims a receipt whose late side effect still runs here, though its hold was not written", GW_RECONCILE,
+       "        if self.late.runs(&due.row) {\n            return;\n        }\n", "")
 mutate("gw-reconciler-holds-nothing", "making the reconciler does not tell late side effects where to hold their receipts", BOOT,
        "        self.late.hold_in(\n", "        let _ = (\n")
 mutate("gw-late-call-wait-returns-at-once", "shutting down does not wait for a late side effect", GW_BOUND,
@@ -3554,17 +3714,17 @@ mutate("proxy-deadline-not-applied", "a call is never abandoned", PC,
 # side effect may have been sent, the server's own refusal or failure included, since no approval
 # can yet say a proxied tool's errors are safe; a failure before anything was sent stays an error.
 mutate("proxy-late-read-kind-other", "an oversized or late answer from a read is recorded as other", PC,
-       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence)",
-       "        self.without_answer(ErrorKind::Other, sentence)")
+       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence, unanswered)",
+       "        self.without_answer(ErrorKind::Other, sentence, unanswered)")
 mutate("proxy-late-non-read-kind-late", "an oversized or late answer from a propose tool is recorded as a late read", PC,
        "        let sent = if tool.classification == Classification::Read {",
        "        let sent = if true || tool.classification == Classification::Read {")
 mutate("proxy-late-side-effect-as-error", "a side effect's answer too large, too late or broken off is reported as an error, settling its receipt not_performed", PC,
-       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence)",
-       "        if self == Sent::SideEffect {\n            return ToolOutcome::error(ErrorKind::Other, sentence);\n        }\n"
-       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence)")
+       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence, unanswered)",
+       "        if matches!(self, Sent::SideEffect { .. }) {\n            return ToolOutcome::error(ErrorKind::Other, sentence);\n        }\n"
+       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence, unanswered)")
 mutate("proxy-side-effect-unanswered-as-error", "every failure without a definite answer from a side effect is reported as an error", PC,
-       "            Sent::SideEffect => ToolOutcome::Unknown,", "            Sent::SideEffect => ToolOutcome::error(kind, sentence),")
+       "                ToolOutcome::Unknown\n", "                ToolOutcome::error(kind, sentence)\n")
 mutate("proxy-unconnected-side-effect-unknown", "a side effect whose connection could not be made is reported unknown, though nothing was sent", PC,
        "            } else if error.is_connect() {", "            } else if false && error.is_connect() {")
 mutate("proxy-side-effect-4xx-error", "a side effect the server answered with a 4xx is reported as an error, settling its receipt not_performed", PC,
@@ -3574,10 +3734,26 @@ mutate("proxy-side-effect-4xx-error", "a side effect the server answered with a 
        "        }\n"
        "        if status != StatusCode::OK {\n")
 mutate("proxy-side-effect-401-error", "a side effect the server answered with a 401 is reported as an error, settling its receipt not_performed", PC,
-       "            return Err(sent.without_answer(ErrorKind::Other, outcome::CREDENTIAL_REJECTED));",
+       "            return Err(sent.without_answer(\n                ErrorKind::Other,\n"
+       "                outcome::CREDENTIAL_REJECTED,\n                unanswered,\n            ));",
        "            return Err(ToolOutcome::error(ErrorKind::Other, outcome::CREDENTIAL_REJECTED));")
-mutate("proxy-side-effect-tool-error-not-performed", "a side effect's JSON-RPC error or isError result is reported as an error, settling its receipt not_performed", PC,
-       "                    Ok(ToolOutcome::Error(kind, sentence)) => sent.without_answer(kind, &sentence),\n", "")
+mutate_all("proxy-side-effect-tool-error-not-performed", "a side effect's JSON-RPC error or isError result is reported as an error, settling its receipt not_performed",
+           (PC, "sent.without_answer(ErrorKind::Other, &sentence, Unanswered::RpcError(code))",
+            "ToolOutcome::error(ErrorKind::Other, &sentence)"),
+           (PC, "sent.without_answer(ErrorKind::Other, &sentence, Unanswered::ToolFailed)",
+            "ToolOutcome::error(ErrorKind::Other, &sentence)"))
+# A side effect that becomes unknown is logged with what came in place of an answer and its HTTP
+# status, and never the server's text (#204). tests/unknown_logs.rs catches these.
+mutate("proxy-unknown-not-logged", "a side effect whose outcome becomes unknown is not logged", PC,
+       "                tracing::warn!(\n                    event = SIDE_EFFECT_UNKNOWN_EVENT,\n",
+       "                tracing::trace!(\n                    event = SIDE_EFFECT_UNKNOWN_EVENT,\n")
+mutate("proxy-unknown-logs-body", "the line logged for a side effect's unknown outcome holds the server's text", PC,
+       "                    rpc_code = unanswered.rpc_code(),\n",
+       "                    rpc_code = unanswered.rpc_code(),\n                    sentence,\n")
+mutate("proxy-unknown-status-dropped", "the line logged for a side effect's unknown outcome does not name the HTTP status", PC,
+       "            Unanswered::Status(status) => Some(status),\n", "            Unanswered::Status(_) => None,\n")
+mutate("proxy-unknown-kind-wrong", "a JSON-RPC error is logged as a failed tool result", PC,
+       "            Unanswered::RpcError(_) => \"rpc_error\",\n", "            Unanswered::RpcError(_) => \"tool_failed\",\n")
 mutate("proxy-default-deadline-longer", "the default deadline is 30 s", PC,
        "Duration = Duration::from_secs(5);", "Duration = Duration::from_secs(30);")
 mutate("proxy-default-cap-larger", "the default cap is 1 MiB", PC, "usize = 64 * 1024;", "usize = 1024 * 1024;")
@@ -3592,7 +3768,7 @@ mutate("proxy-declared-length-off-by-one", "a declared length of exactly the cap
        "            .is_some_and(|length| length > self.max_response_bytes as u64)",
        "            .is_some_and(|length| length >= self.max_response_bytes as u64)")
 mutate("proxy-broken-body-read-as-complete", "a body that breaks off is read as if complete", PC,
-       "            let frame = frame.map_err(|_| sent.late(outcome::BROKEN_OFF))?;",
+       "            let frame = frame.map_err(|_| sent.late(outcome::BROKEN_OFF, Unanswered::BrokenOff))?;",
        "            let Ok(frame) = frame else { break };")
 # What is sent, and to whom.
 mutate("proxy-credential-not-sent", "the request carries no credential", PC,
@@ -3620,13 +3796,14 @@ mutate("proxy-401-not-named", "a rejected credential is reported as a bare statu
        "        if status == StatusCode::UNAUTHORIZED {", "        if false {")
 # A 403 is the vendor's refusal (#61): from a read, an error of the kind vendor_refusal, not a
 # connector's refusal; from a side effect, unknown (#55).
-PROXY_403 = "            return Err(sent.without_answer(ErrorKind::VendorRefusal, outcome::UPSTREAM_REFUSED));"
+PROXY_403 = ("            return Err(sent.without_answer(\n                ErrorKind::VendorRefusal,\n"
+             "                outcome::UPSTREAM_REFUSED,\n                unanswered,\n            ));")
 mutate("proxy-403-is-refused", "the server's 403 is recorded as a connector's refusal, not as an error", PC,
        PROXY_403, "            return Err(ToolOutcome::Refused(outcome::UPSTREAM_REFUSED.to_owned()));")
 mutate("proxy-403-kind-other", "the server's 403 is recorded as another error, not a vendor refusal", PC,
        PROXY_403, PROXY_403.replace("ErrorKind::VendorRefusal", "ErrorKind::Other"))
 mutate("proxy-side-effect-403-error", "a side effect the server answered with a 403 is reported as a vendor refusal, settling its receipt not_performed", PC,
-       PROXY_403, PROXY_403.replace("sent.without_answer(", "ToolOutcome::error("))
+       PROXY_403, PROXY_403.replace("sent.without_answer(", "ToolOutcome::error(").replace("                unanswered,\n", ""))
 mutate("proxy-any-status-read", "a body is read whatever the status", PC,
        "        if status != StatusCode::OK {", "        if false {")
 # Reading the answer.
@@ -3838,6 +4015,10 @@ mutate("registry-currency-ignored", "a registry file's requires_currency is not 
        "            requires_currency: profile.requires_currency,", "            requires_currency: false,")
 mutate("registry-currency-setting-required", "a registry file that does not mention requires_currency is refused", RF,
        "    #[serde(default)]\n    pub requires_currency: bool,", "    pub requires_currency: bool,")
+mutate("registry-exceptions-ignored", "a registry file's profile exceptions are not carried to the profile", RR,
+       "            exceptions: profile.exceptions,", "            exceptions: Vec::new(),")
+mutate("registry-exceptions-required", "a registry file whose profile does not mention exceptions is refused", RF,
+       "    #[serde(default)]\n    pub exceptions: Vec<Exception>,", "    pub exceptions: Vec<Exception>,")
 mutate("registry-empty-text-accepted", "required text may be empty", RR,
        "    if value.is_empty() {\n        Err(RegistryError::EmptyField {", "    if false {\n        Err(RegistryError::EmptyField {")
 mutate("registry-limit-identifier-empty", "a limit or a reach may name the empty identifier", RR,
@@ -4285,7 +4466,7 @@ mutate("pg-session-search-path-kept", "sessions look names up in the schemas a d
 mutate("pg-session-options-caller-last", "the caller's session options override the store's", PG_STORE,
        'format!("{existing} {SESSION_OPTIONS}")', 'format!("{SESSION_OPTIONS} {existing}")')
 mutate("pg-begin-no-on-conflict", "a retried begin inserts again and fails on its own row", PG_COLUMNS,
-       '$37, $38\n        ) ON CONFLICT (id) DO NOTHING";', '$37, $38\n        )";')
+       '$37, $38, $39\n        ) ON CONFLICT (id) DO NOTHING";', '$37, $38, $39\n        )";')
 mutate("pg-begin-decision-not-compared", "a begin with a known identifier and another decision succeeds", PG_STORE,
        "    if decision == row.decision {", "    if true {")
 mutate("pg-columns-id-unchecked", "an identifier that is not a lowercase UUID is sent to the database", PG_COLUMNS,
@@ -4928,10 +5109,10 @@ mutate("pg-check-cascade-references-call-rows-refused", "a cascading foreign key
 # third trigger, and the count of receipts in unknown. tests/receipts.rs, the contract suite's
 # item 6 on Postgres (tests/contract.rs) and tests/check.rs catch these.
 PG_RECEIPTS = PG + "sql/migrations/0008_receipts.sql"
-# Migration 0009 replaced receipt_moves, and 0012 replaces it again, so the trigger's moves are
-# mutated in 0012's copy, which is in force; 0009's lookup_appends is still 0009's.
+# Migration 0009 replaced receipt_moves, and 0013 replaces it again, so the trigger's moves are
+# mutated in 0013's copy, which is in force; 0009's lookup_appends is still 0009's.
 PG_RECONCILIATION = PG + "sql/migrations/0009_reconciliation.sql"
-PG_HELD = PG + "sql/migrations/0012_held_and_counted_claims.sql"
+PG_HELD = PG + "sql/migrations/0013_held_and_counted_claims.sql"
 mutate("pg-receipt-trigger-back-to-pending", "the receipt trigger lets reconciliation or a person move an unknown receipt back to pending", PG_HELD,
        "        WHEN OLD.state = 'unknown'\n            THEN NEW.state IN ('completed', 'not_performed')\n",
        "        WHEN OLD.state = 'unknown'\n            THEN NEW.state IN ('completed', 'not_performed', 'pending')\n")
@@ -4985,11 +5166,15 @@ mutate("pg-claim-ignores-lease", "a claim is granted whatever lease another hold
        "         AND (r.lease_until IS NULL OR r.lease_until <= clock_timestamp())\n     RETURNING \",",
        "     RETURNING \",")
 # A call holds its receipt's lease, each claim is counted as an attempt, and a late finish that
-# disagrees with reconciliation is counted (migration 0012; #206, #217). The contract suite's
+# disagrees with reconciliation is counted (migration 0013; #206, #217). The contract suite's
 # reconciliation cases on Postgres and tests/reconcile.rs catch these.
 mutate("pg-hold-ignores-other-holder", "a call holds its receipt whatever lease another holder has", PG + "src/reconcile.rs",
        "        AND (r.lease_until IS NULL OR r.lease_until <= clock_timestamp() OR r.lease_holder = $2)\";",
        "        AND true\";")
+mutate("pg-due-before-deadline", "the queue lists a receipt answered unknown before its row's deadline", PG + "src/reconcile.rs",
+       "     WHERE \",\n    past_deadline!(),\n", "     WHERE \",\n    \"true\",\n")
+mutate("pg-claim-before-deadline", "a receipt answered unknown is claimed before its row's deadline", PG + "src/reconcile.rs",
+       "c.id = r.row_id AND \",\n    past_deadline!(),\n", "c.id = r.row_id AND \",\n    \"true\",\n")
 mutate("pg-claim-not-counted", "a claim is not counted on its receipt, so a lookup whose save fails uses up no attempt", PG + "src/reconcile.rs",
        "             lease_until = clock_timestamp() + $3::bigint * interval '1 microsecond',\n             claims = r.claims + 1\n",
        "             lease_until = clock_timestamp() + $3::bigint * interval '1 microsecond'\n")
@@ -5163,7 +5348,28 @@ mutate("pg-columns-failure-digest-not-written", "a failure's digest is not writt
        "            delegation_digest: failure\n                .and_then(|failure| failure.digest)\n",
        "            delegation_digest: failure\n                .and_then(|_| None::<gateway_core::DelegationDigest>)\n")
 mutate("pg-check-misses-currency", "the boot check does not require the currency column", PG_CHECK,
-       '    ("currency", "text"),\n];', "];")
+       '    ("currency", "text"),\n    ("allowed_by_exception", "text"),\n];', '    ("allowed_by_exception", "text"),\n];')
+
+# Migration 0012: the exception that allowed a call, in a column of its own (decision 0011,
+# section 9; #12, #56). The schema test
+# the_exception_column_holds_an_allowed_writes_exception_and_nothing_else and the contract
+# suite's an_exception_is_stored_on_an_allowed_write_and_refused_elsewhere catch the
+# constraints and the grant against Postgres; the columns' own tests catch the write without a
+# server.
+PG_EXCEPTION = PG + "sql/migrations/0012_exception.sql"
+mutate("pg-exception-shape-loosened", "an exception may be stored on a denial, a read or a proposal", PG_EXCEPTION,
+       "        OR coalesce(kind = 'call' AND decision = 'allow'\n            AND classification IN ('write', 'destructive'), false)",
+       "        OR coalesce(kind = 'call', false)")
+mutate("pg-exception-name-unchecked", "an exception's name may be any text of 1 to 64 characters", PG_EXCEPTION,
+       "        AND allowed_by_exception ~ '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'\n", "")
+mutate("pg-exception-grant-missing", "the gateway's role may not insert the exception", PG_EXCEPTION,
+       "GRANT INSERT (allowed_by_exception) ON switchboard_audit.call_rows TO switchboard_gateway;\n", "")
+mutate("pg-columns-exception-not-written", "begin writes no exception", PG_COLUMNS,
+       "            allowed_by_exception: record\n                .allowed_by_exception\n                .as_ref()\n"
+       "                .map(|exception| exception.as_str().to_owned()),\n",
+       "            allowed_by_exception: { let _ = &record.allowed_by_exception; None },\n")
+mutate("pg-check-misses-exception", "the boot check does not require the exception column", PG_CHECK,
+       '    ("allowed_by_exception", "text"),\n];', "];")
 
 # Migration 0011: what a tool that checks its own scope reached replaces the row's unknown
 # resources in finish's own statement (decision 0011, #12). The schema test
@@ -5181,14 +5387,14 @@ mutate("pg-reached-replaces-named", "complete_once lets a completion replace nam
        "            true,")
 mutate("pg-reached-grant-missing", "the gateway's role cannot write what a tool reached", PG_REACHED,
        "GRANT UPDATE (resources, resources_omitted) ON switchboard_audit.call_rows TO switchboard_gateway;\n", "")
-# The receipt's team (migration 0013): written at reservation, required by the boot check.
-PG_TEAM = PG + "sql/migrations/0013_receipt_team.sql"
+# The receipt's team (migration 0014): written at reservation, required by the boot check.
+PG_TEAM = PG + "sql/migrations/0014_receipt_team.sql"
 mutate("pg-receipt-team-not-recorded", "the Postgres store reserves a receipt without its principal's team", PG_COLUMNS,
        '            team: optional("team", request.team().map(TeamId::as_str))?,',
        '            team: optional("team", request.team().map(TeamId::as_str).filter(|_| false))?,')
 mutate("pg-check-receipt-team-unrequired", "the boot check accepts a database whose receipts have no team column, or one of another type", PG_CHECK,
        '    ("claims", "integer"),\n    ("team", "text"),\n', '    ("claims", "integer"),\n')
-# The attribution read (migration 0014's index): the contract suite's attribution case catches
+# The attribution read (migration 0015's index): the contract suite's attribution case catches
 # these against Postgres.
 PG_RECONCILE = PG + "src/reconcile.rs"
 mutate("pg-attribution-any-principal", "the Postgres store answers an attribution query with another principal's receipt", PG_RECONCILE,
@@ -6655,15 +6861,15 @@ mutate("custodian-lifetime-not-capped", "a token is handed out until GitHub's ex
        "                let expires_at = issued.expires_at.min(now + self.lifetime.as_secs());",
        "                let expires_at = issued.expires_at.min(now + 3600);")
 mutate("custodian-not-revoked-at-lifetime", "a token is not revoked when its lifetime ends", KS,
-       "                    self.clone()\n                        .revoke_at(issued.token.clone(), expires_at, issued.expires_at);",
-       "                    let _ = &issued.token;")
+       "                let revoke_at = (expires_at < issued.expires_at).then_some(expires_at);",
+       "                let revoke_at = None::<u64>;")
 mutate("custodian-unissued-not-revoked", "a token GitHub widened is not revoked", KS,
        "                if let Some(unissued) = error.unissued {",
        "                if let Some(unissued) = error.unissued.filter(|_| false) {")
 mutate("custodian-revocation-not-retried", "a revocation GitHub fails is not tried again", KS,
-       "                if clock::now() + retry.as_secs() >= lapses_at {", "                if true {")
+       "            if clock::now() + retry.as_secs() >= lapses_at {", "            if true {")
 mutate("custodian-revocation-retried-past-expiry", "a failed revocation is tried again after GitHub's expiry", KS,
-       "                if clock::now() + retry.as_secs() >= lapses_at {", "                if false {")
+       "            if clock::now() + retry.as_secs() >= lapses_at {", "            if false {")
 mutate("custodian-key-file-open-accepted", "a key file its group or others can read is accepted", KT,
        "    if mode & 0o077 != 0 {", "    if false {")
 mutate("custodian-socket-mode-open-accepted", "a socket mode giving others access is accepted", KT,
@@ -6684,6 +6890,60 @@ mutate("custodian-reach-report-any-permission", "a reach report's installation-w
        "            && request.permissions.contains_key(REACH_REPORT_PERMISSION)\n")
 mutate("custodian-reach-report-repositories-sent", "an installation-wide request is sent to GitHub with an empty repository list, not none", KG,
        '            fields.remove("repositories");\n', "            let _ = fields;\n")
+# The custodian's own gaps (#219): its checks, the 401 that ends a revocation, the stop that revokes
+# what it keeps, and the client feature the gateway links alone. tests/start.rs, reload.rs,
+# issue.rs, refusals.rs, shutdown.rs and packaging.rs, and github.rs's unit tests, watch each.
+mutate("custodian-tool-outside-system-accepted", "a GitHub entry may list a tool of another system, which is then given GitHub tokens", KP,
+       "                .find(|tool| !under_system(tool, &entry.system))\n",
+       "                .find(|_| false)\n")
+mutate("custodian-tool-system-prefix-only", "a tool whose name only begins with the system's, such as githubber__read, counts as under it", KP,
+       '        .and_then(|rest| rest.strip_prefix("__"))\n', "")
+mutate("custodian-full-name-case-sensitive", "a token whose repositories GitHub names in another case is refused as widened", KG,
+       "            .map(|repository| repository.full_name.to_ascii_lowercase())\n",
+       "            .map(|repository| repository.full_name.clone())\n")
+mutate("custodian-full-name-unicode-folded", "a name GitHub answers is folded by Unicode's rules, so another repository's may match", KG,
+       "            .map(|repository| repository.full_name.to_ascii_lowercase())\n",
+       "            .map(|repository| repository.full_name.to_lowercase())\n")
+mutate("custodian-full-name-count-ignored", "an answer may list one repository twice in two cases", KG,
+       "        if given != asked || listed.len() != repositories.len() {",
+       "        if given != asked {")
+mutate("custodian-own-uid-served", "the custodian starts as a process serving its own UID", KT,
+       "    if config.peer_uid == own {", "    if false {")
+mutate("custodian-binary-skips-own-uid", "the binary starts without the own-UID check", KC + "bin/switchboard-custodian.rs",
+       "        Ok(config) => start_process(config, Box::new(std::io::stdout())).await,",
+       "        Ok(config) => key_custodian::start(config, Box::new(std::io::stdout())).await,")
+mutate("custodian-malformed-attribution-dropped", "a malformed request's record line loses its team and tool", KS,
+       "            return self.refuse(line.attribution(&request), Refusal::Malformed, problem);",
+       "            return self.refuse(line, Refusal::Malformed, problem);")
+mutate("custodian-malformed-team-kept", "a malformed team is written to the record", KC + "record.rs",
+       "        self.team = request.team_well_formed().then_some(request.team.as_str());",
+       "        self.team = Some(request.team.as_str());")
+mutate("custodian-revocation-401-not-done", "GitHub's 401 to a retried revocation is a failure, so the custodian keeps trying", KG,
+       "        if status == StatusCode::NO_CONTENT || status == StatusCode::UNAUTHORIZED {",
+       "        if status == StatusCode::NO_CONTENT {")
+mutate("custodian-not-revoked-at-stop", "a stop revokes nothing", KT,
+       "        let stopped = self.custodian.clone().revoke_outstanding(deadline).await;",
+       "        let stopped = Stopped::default();\n        let _ = deadline;")
+mutate("custodian-stop-revocations-unbounded", "a stop waits for every revocation, however long GitHub takes", KS,
+       "                () = &mut ends => break,",
+       "                () = &mut ends, if revoking.is_empty() => break,")
+mutate("custodian-stop-in-flight-unbounded", "a stop waits for every request in flight, however long GitHub takes", KS,
+       "                () = &mut ends => break,",
+       "                () = &mut ends, if settled => break,")
+mutate("custodian-stop-revokes-after-in-flight", "a stop revokes nothing until every request in flight is answered, so one slow request uses up its deadline", KS,
+       "                received = landed.recv(), if open => match received {",
+       "                received = landed.recv(), if open && settled => match received {")
+mutate("custodian-stop-landed-token-not-revoked", "a token issued for a request in flight when the stop began is not revoked by the stop", KS,
+       "        let token = match &kept.stopping {",
+       "        let token = match &None::<UnboundedSender<ToRevoke>> {")
+mutate("custodian-revoked-token-kept", "a token revoked at the end of its lifetime is revoked again at the stop", KS,
+       "            .tokens\n            .remove(&id);\n", "            .tokens\n            .len();\n")
+mutate("custodian-lapsed-token-revoked-at-stop", "a stop revokes a token already past GitHub's expiry", KS,
+       "        if each.lapses_at <= clock::now() {", "        if false {")
+mutate("custodian-gateway-links-server", "the GitHub connector, and so the gateway, links the custodian's server and key-reading code",
+       "crates/connector-github/Cargo.toml",
+       'key-custodian = { path = "../key-custodian", default-features = false, features = ["client"] }',
+       'key-custodian = { path = "../key-custodian" }')
 
 # --- connector-github ----------------------------------------------------------------------
 # The GitHub connector refuses another organization before any request, asks the key custodian for
@@ -7109,6 +7369,9 @@ READERS: list[tuple[str, frozenset[str]]] = [
     ("CONTRIBUTING.md", frozenset({"demo-checks"})),
     (".github/workflows/ci.yml", frozenset({"demo-checks"})),
     ("crates/audit-postgres/src/lib.rs", frozenset({"demo-checks"})),
+    # key-custodian/tests/packaging.rs asks cargo tree which of its features the gateway's build
+    # turns on, which connector-github's manifest decides.
+    ("crates/connector-github/Cargo.toml", frozenset({"key-custodian"})),
 ]
 
 

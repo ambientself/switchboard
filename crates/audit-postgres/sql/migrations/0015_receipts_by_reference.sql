@@ -9,10 +9,10 @@
 -- a refusal, an error, an `unknown` and an answer that made nothing record none. So the index
 -- is partial, and costs nothing for those.
 --
--- Additive: no column, row or grant 0008 to 0013 made is changed. The gateway's role already
+-- Additive: no column, row or grant 0008 to 0014 made is changed. The gateway's role already
 -- reads every column the query names.
 --
--- 0001 to 0013 are not edited: applied versions are recorded, and an edit to one would not
+-- 0001 to 0014 are not edited: applied versions are recorded, and an edit to one would not
 -- apply.
 
 CREATE INDEX receipts_by_reference

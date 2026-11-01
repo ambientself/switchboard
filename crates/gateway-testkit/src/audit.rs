@@ -9,9 +9,9 @@ use gateway_core::audit::{
 };
 use gateway_core::receipt::{EstablishedBy, ReceiptRequest, Reservation, may_move};
 use gateway_core::{
-    AttributionQuery, AuditRecord, AuditStore, BoxFuture, IdempotencyKey, InstanceName,
-    LeaseHolder, LookupAnswer, LookupRecord, ReasonKind, Receipt, ReceiptAttribution, ReceiptQueue,
-    ReceiptState, Recorded, Reuse, VendorReference,
+    AttributionQuery, AuditRecord, AuditStore, BoxFuture, Classification, IdempotencyKey,
+    InstanceName, LeaseHolder, LookupAnswer, LookupRecord, ReasonKind, Receipt, ReceiptAttribution,
+    ReceiptQueue, ReceiptState, Recorded, Reuse, VendorReference,
 };
 use gateway_identity::Clock;
 use rand_core::{OsRng, RngCore};
@@ -269,6 +269,7 @@ fn refused_at_begin(
         record.claimed_acting_person.is_some(),
     )?;
     refused_failure(id, record)?;
+    refused_exception(id, record)?;
     Ok(allowance)
 }
 
@@ -311,6 +312,22 @@ fn refused_failure(id: &AuditRowId, record: &AuditRecord) -> Result<(), StoreErr
     }
     if failure.digest.is_some() && !failure.failure.follows_signature() {
         return Err(violates(id, "delegation_digest_shape"));
+    }
+    Ok(())
+}
+
+/// Why the Postgres store would refuse a call record's exception, if it would, as its table's
+/// `allowed_by_exception_shape` says (migration 0012): an exception is recorded only on an
+/// allowed call of a `write` or `destructive` tool, never on a denial, a read or a proposal.
+fn refused_exception(id: &AuditRowId, record: &AuditRecord) -> Result<(), StoreError> {
+    let side_effect_check_5_denies = matches!(
+        record.classification,
+        Some(Classification::Write | Classification::Destructive)
+    );
+    if record.allowed_by_exception.is_some()
+        && !(record.decision == DecisionKind::Allow && side_effect_check_5_denies)
+    {
+        return Err(violates(id, "allowed_by_exception_shape"));
     }
     Ok(())
 }
@@ -421,6 +438,7 @@ struct State {
     leases: Vec<(AuditRowId, LeaseHolder, SystemTime)>,
     claim_gate: Option<Gate>,
     claims_failing: Failing,
+    holds_failing: Failing,
     records_failing: Failing,
     /// Late finishes that disagreed with the state reconciliation had settled their receipt in.
     late_finish_disagreements: u64,
@@ -644,10 +662,12 @@ impl State {
             .any(|(leased, by, until)| leased == row && by == holder && *until > now)
     }
 
-    /// Whether `receipt` is due at `now`: it reads as `unknown`, was not handed to a person,
-    /// and its lease is free.
+    /// Whether `receipt` is due at `now`: its row's deadline has passed, it reads as
+    /// `unknown`, was not handed to a person, and its lease is free. One answered `unknown`
+    /// within its row's deadline is not due until the deadline, as Postgres's `DUE` reads it.
     fn due(&self, receipt: &Receipt, now: SystemTime) -> bool {
-        self.reads_as_unknown(receipt, now)
+        self.past_deadline(&receipt.row, now)
+            && self.reads_as_unknown(receipt, now)
             && receipt.handed_to_person.is_none()
             && self.lease_free(&receipt.row, now)
     }
@@ -1104,6 +1124,16 @@ impl InMemoryAuditStore {
         self.state().claims_failing = Failing::Next;
     }
 
+    /// The next [`hold`](ReceiptQueue::hold) fails, writing nothing, and later ones work.
+    pub fn fail_next_hold(&self) {
+        self.state().holds_failing = Failing::Next;
+    }
+
+    /// Every [`hold`](ReceiptQueue::hold) from here on fails, writing nothing.
+    pub fn fail_all_holds(&self) {
+        self.state().holds_failing = Failing::Always;
+    }
+
     /// Every [`record_lookup`](ReceiptQueue::record_lookup) from here on fails, writing
     /// nothing, as a store that cannot save lookups would.
     pub fn fail_all_lookup_records(&self) {
@@ -1337,17 +1367,7 @@ impl AuditStore for InMemoryAuditStore {
     }
 }
 
-/// The queue of `unknown` receipts as the Postgres store keeps it (decision 0009,
-/// "Reconciliation"), by this store's clock: a receipt is due when it reads as `unknown`, was
-/// not handed to a person and its lease is free; a claim sets a lease only on a receipt still
-/// due, and counts itself in the receipt's claims; a hold sets a lease on a receipt `pending`
-/// or `unknown`, not handed to a person, whose lease is free or already the holder's, and
-/// counts no claim; a lookup is appended, never changed, and moves the receipt as the core's
-/// [`LookupAnswer::settles`] says, or hands it to a person on its last attempt; and nothing is
-/// written for a holder whose lease has ended. A claim can be held at a gate
-/// ([`hold_claims`](InMemoryAuditStore::hold_claims)) or told to fail
-/// ([`fail_next_claim`](InMemoryAuditStore::fail_next_claim)), and every record of a lookup
-/// told to fail ([`fail_all_lookup_records`](InMemoryAuditStore::fail_all_lookup_records)).
+/// The attribution read: the first receipt reserved that the query matches.
 impl ReceiptAttribution for InMemoryAuditStore {
     fn completed<'a>(
         &'a self,
@@ -1366,6 +1386,19 @@ impl ReceiptAttribution for InMemoryAuditStore {
     }
 }
 
+/// The queue of `unknown` receipts as the Postgres store keeps it (decision 0009,
+/// "Reconciliation"), by this store's clock: a receipt is due when its row's deadline has
+/// passed, it reads as `unknown`, was not handed to a person and its lease is free; a claim
+/// sets a lease only on a receipt still due, and counts itself in the receipt's claims; a hold
+/// sets a lease on a receipt `pending` or `unknown`, not handed to a person, whose lease is
+/// free or already the holder's, and counts no claim; a lookup is appended, never changed, and
+/// moves the receipt as the core's [`LookupAnswer::settles`] says, or hands it to a person on
+/// its last attempt; and nothing is written for a holder whose lease has ended. A claim can be
+/// held at a gate ([`hold_claims`](InMemoryAuditStore::hold_claims)) or told to fail
+/// ([`fail_next_claim`](InMemoryAuditStore::fail_next_claim)), a hold told to fail
+/// ([`fail_next_hold`](InMemoryAuditStore::fail_next_hold),
+/// [`fail_all_holds`](InMemoryAuditStore::fail_all_holds)), and every record of a lookup told
+/// to fail ([`fail_all_lookup_records`](InMemoryAuditStore::fail_all_lookup_records)).
 impl ReceiptQueue for InMemoryAuditStore {
     fn due<'a>(&'a self, limit: usize) -> BoxFuture<'a, Result<Vec<Receipt>, StoreError>> {
         Box::pin(async move {
@@ -1433,6 +1466,9 @@ impl ReceiptQueue for InMemoryAuditStore {
         Box::pin(async move {
             let now = self.clock.now();
             let mut state = self.state();
+            if state.holds_failing.take() {
+                return Err(down());
+            }
             let open = state.receipts.iter().any(|receipt| {
                 receipt.row == *row
                     && matches!(receipt.state, ReceiptState::Pending | ReceiptState::Unknown)

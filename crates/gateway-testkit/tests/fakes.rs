@@ -46,7 +46,7 @@ fn guard_for(
         tool: RequestedTool::new(tool),
         resources,
         // A key of its own, which a tool not classified `read` needs and a read ignores.
-        key: Some(fresh_key()),
+        key: gateway_core::CallKey::Valid(fresh_key()),
         currency: gateway_core::Currency::NotAsked,
     };
     let decision = decide(&fixture.policy, &call);
@@ -235,7 +235,7 @@ fn a_row_keeps_its_count_of_omitted_resources_through_begin_and_finish() {
         caller: fixture.team_a_workload(SURFACE_ALL).unwrap(),
         tool: RequestedTool::new(READ_TOOL),
         resources: Resources::Named(named),
-        key: None,
+        key: gateway_core::CallKey::Absent,
         currency: gateway_core::Currency::NotAsked,
     };
     let decision = decide(&fixture.policy, &call);
@@ -268,7 +268,7 @@ fn a_failed_begin_writes_nothing_and_the_next_one_works() {
         caller: fixture.team_a_workload(SURFACE_ALL).unwrap(),
         tool: RequestedTool::new(READ_TOOL),
         resources: FixtureConnector::resources_of(READ_TOOL, &json!({"document": "team-a-notes"})),
-        key: None,
+        key: gateway_core::CallKey::Absent,
         currency: gateway_core::Currency::NotAsked,
     };
     let decision = decide(&fixture.policy, &call);
@@ -309,7 +309,7 @@ fn every_begin_fails_until_told_to_stop() {
                 READ_TOOL,
                 &json!({"document": "team-a-notes"}),
             ),
-            key: None,
+            key: gateway_core::CallKey::Absent,
             currency: gateway_core::Currency::NotAsked,
         };
         block_on(audit::begin(
@@ -419,7 +419,7 @@ fn a_held_begin_writes_no_row_until_released() {
         caller: fixture.team_a_workload(SURFACE_ALL).unwrap(),
         tool: RequestedTool::new(READ_TOOL),
         resources: FixtureConnector::resources_of(READ_TOOL, &json!({"document": "team-a-notes"})),
-        key: None,
+        key: gateway_core::CallKey::Absent,
         currency: gateway_core::Currency::NotAsked,
     };
     let decision = decide(&fixture.policy, &call);
@@ -482,7 +482,7 @@ fn a_failure_setting_is_not_consumed_by_a_held_call_until_it_is_released() {
         caller: fixture.team_a_workload(SURFACE_ALL).unwrap(),
         tool: RequestedTool::new(READ_TOOL),
         resources: FixtureConnector::resources_of(READ_TOOL, &json!({"document": "team-a-notes"})),
-        key: None,
+        key: gateway_core::CallKey::Absent,
         currency: gateway_core::Currency::NotAsked,
     };
     let mut begin = pin!(audit::begin(
@@ -511,7 +511,7 @@ fn begin_as(
         caller: fixture.team_a_workload(SURFACE_ALL).unwrap(),
         tool: RequestedTool::new(tool),
         resources: FixtureConnector::resources_of(tool, &arguments),
-        key: None,
+        key: gateway_core::CallKey::Absent,
         currency: gateway_core::Currency::NotAsked,
     };
     block_on(audit::begin(
@@ -1654,7 +1654,7 @@ fn scoped(rig: &Rig, caller: Caller, document: &str) -> Answer {
         caller: rig.fixture.caller_context(caller, surface).unwrap(),
         tool: RequestedTool::new(SCOPED_READ_TOOL),
         resources: FixtureConnector::resources_of(SCOPED_READ_TOOL, &arguments),
-        key: None,
+        key: gateway_core::CallKey::Absent,
         currency: gateway_core::Currency::NotAsked,
     };
     let decision = decide(&rig.fixture.policy, &call);

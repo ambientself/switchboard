@@ -6,7 +6,8 @@
 //!
 //! Reads the configuration file (see [`key_custodian::start`](mod@key_custodian::start)), the
 //! App's private key and the registry file, binds the socket and serves token requests until
-//! interrupted or terminated.
+//! interrupted or terminated. It refuses to start when the configuration's `peer_uid` is its
+//! own UID.
 //! The record, one JSON line per request, goes to standard output; logs go to standard error
 //! as JSON lines, and a refusal to start to standard error as plain text as well.
 //!
@@ -16,7 +17,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use key_custodian::{Config, start};
+use key_custodian::{Config, start_process};
 
 const USAGE: &str = "usage: switchboard-custodian --config=FILE";
 
@@ -59,7 +60,7 @@ async fn main() -> ExitCode {
         )
         .init();
     let started = match Config::load(&path) {
-        Ok(config) => start(config, Box::new(std::io::stdout())).await,
+        Ok(config) => start_process(config, Box::new(std::io::stdout())).await,
         Err(error) => Err(error),
     };
     let running = match started {
@@ -72,6 +73,12 @@ async fn main() -> ExitCode {
     };
     terminated().await;
     tracing::info!("shutting down");
-    running.stop().await;
+    let stopped = running.stop().await;
+    tracing::info!(
+        revoked = stopped.revoked,
+        not_revoked = stopped.not_revoked,
+        in_flight = stopped.in_flight,
+        "stopped"
+    );
     ExitCode::SUCCESS
 }

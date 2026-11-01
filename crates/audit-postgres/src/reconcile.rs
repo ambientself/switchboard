@@ -6,9 +6,9 @@
 //! for the connection to the answer; past it, the store asks the server to cancel what is
 //! running, and the statement fails. Every time is the database's.
 //!
-//! - [`due`](ReceiptQueue::due) reads the receipts that read as `unknown` (the state `unknown`,
-//!   or `pending` past the row's deadline), not handed to a person, whose lease is free, and
-//!   their lookups. It reads only.
+//! - [`due`](ReceiptQueue::due) reads the receipts whose row's deadline has passed that read as
+//!   `unknown` (the state `unknown`, or `pending`), not handed to a person, whose lease is free,
+//!   and their lookups. It reads only.
 //! - [`claim`](ReceiptQueue::claim) sets a lease and counts the claim in one statement,
 //!   committed when it returns, and only on a receipt still due: of two claims at once, the
 //!   second waits for the first's row lock, finds the lease taken, and claims nothing. No lock
@@ -66,14 +66,25 @@ macro_rules! reads_as_unknown {
     };
 }
 
-/// The receipts due, the longest reserved first: reading as `unknown`, not handed to a person,
-/// with a free lease. `$1` is the limit.
+/// A receipt's row's deadline has passed, by the database's clock: before it, a receipt the
+/// call answered `unknown` may still have its call running, a side effect whose first hold of
+/// the lease is not written yet. `c` is the row.
+macro_rules! past_deadline {
+    () => {
+        "c.deadline < clock_timestamp()"
+    };
+}
+
+/// The receipts due, the longest reserved first: past their row's deadline, reading as
+/// `unknown`, not handed to a person, with a free lease. `$1` is the limit.
 pub(crate) const DUE: &str = concat!(
     "SELECT ",
     receipt_columns!(),
     " FROM switchboard_audit.receipts r
          JOIN switchboard_audit.call_rows c ON c.id = r.row_id
      WHERE ",
+    past_deadline!(),
+    " AND ",
     reads_as_unknown!(),
     " AND r.handed_to_person_at IS NULL
          AND (r.lease_until IS NULL OR r.lease_until <= clock_timestamp())
@@ -90,6 +101,8 @@ pub(crate) const CLAIM: &str = concat!(
              claims = r.claims + 1
      FROM switchboard_audit.call_rows c
      WHERE r.row_id = ($1::text)::uuid AND c.id = r.row_id AND ",
+    past_deadline!(),
+    " AND ",
     reads_as_unknown!(),
     " AND r.handed_to_person_at IS NULL
          AND (r.lease_until IS NULL OR r.lease_until <= clock_timestamp())
