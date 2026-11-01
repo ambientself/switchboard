@@ -1838,7 +1838,7 @@ mutate("fake-audit-error-kind-repeat-unchecked", "a repeated finish with an erro
        "                    || (matches!(written.outcome, Outcome::Error { .. })\n"
        "                        && matches!(completion.outcome, Outcome::Error { .. })\n"
        "                        && written.latency_ms == completion.latency_ms) =>\n"
-       "            {\n                Ok(())\n            }")
+       "            {\n                Ok(false)\n            }")
 mutate("testkit-lost-list-confirmation-ignored", "a list told to lose its confirmation succeeds", A,
        "            if state.confirmation_lost.take() {\n                return Err(lost());", "            if false {\n                return Err(lost());")
 mutate("testkit-lost-confirmation-before-write", "a lost confirmation writes no row", A,
