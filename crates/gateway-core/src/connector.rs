@@ -6,6 +6,7 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditRowId;
+use crate::classification::Classification;
 use crate::decision::CallContext;
 use crate::names::PolicyRevision;
 use crate::policy::{ApprovedTool, Resource};
@@ -90,6 +91,15 @@ impl ToolCall {
     /// `unknown` runs on past its deadline ([`ReceiptQueue::hold`](crate::ReceiptQueue::hold)).
     pub fn row(&self) -> &AuditRowId {
         &self.granted.row
+    }
+
+    /// The receipt the call reserved, which is its row: `Some` exactly for a tool not
+    /// classified `read`, whose allowed call [`audit::begin`](crate::audit::begin) hands out a
+    /// guard for only once its receipt is reserved, and `None` for a read, which has none. A
+    /// side-effecting connector attaches it to what it sends as the marker a lookup finds the
+    /// effect by (decision 0009, "Reconciliation"), and sends nothing without one.
+    pub fn receipt(&self) -> Option<&AuditRowId> {
+        (self.tool.classification != Classification::Read).then_some(&self.granted.row)
     }
 
     /// The decided call: who is calling, under which profile, on which surface.

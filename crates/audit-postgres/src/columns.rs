@@ -27,7 +27,7 @@ use gateway_core::audit::{
 use gateway_core::receipt::ReceiptRequest;
 use gateway_core::{
     ArgumentDigest, CredentialIdentity, CredentialMode, Principal, PrincipalKind, Receipt,
-    ReceiptState, Reuse, ToolName, ToolUseId, VendorReference,
+    ReceiptState, Reuse, TeamId, ToolName, ToolUseId, VendorReference,
 };
 use serde_json::{Value, json};
 use tokio_postgres::types::ToSql;
@@ -1293,6 +1293,8 @@ pub(crate) struct ReceiptRow {
     pub target_system: Option<String>,
     pub target_kind: Option<String>,
     pub target_identifier: Option<String>,
+    /// The proved principal's team, or none for a person.
+    pub team: Option<String>,
 }
 
 impl ReceiptRow {
@@ -1302,8 +1304,8 @@ impl ReceiptRow {
     pub const RESERVE: &'static str = "INSERT INTO switchboard_audit.receipts (
             row_id, principal_issuer, principal_subject, delegation_scope, idempotency_key,
             tool, tool_use_id, digest, resources, resources_omitted, target_system, target_kind,
-            target_identifier
-        ) VALUES (($1::text)::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            target_identifier, team
+        ) VALUES (($1::text)::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         ON CONFLICT DO NOTHING";
 
     /// The reuse check for a key with no delegation scope: the receipt for the key `$3` of the
@@ -1384,11 +1386,12 @@ impl ReceiptRow {
                 "target_identifier",
                 target.map(|target| target.identifier.as_str()),
             )?,
+            team: optional("team", request.team().map(TeamId::as_str))?,
         })
     }
 
     /// The values for [`RESERVE`](Self::RESERVE), in order.
-    pub fn parameters(&self) -> [&(dyn ToSql + Sync); 13] {
+    pub fn parameters(&self) -> [&(dyn ToSql + Sync); 14] {
         [
             &self.row_id,
             &self.principal_issuer,
@@ -1403,6 +1406,7 @@ impl ReceiptRow {
             &self.target_system,
             &self.target_kind,
             &self.target_identifier,
+            &self.team,
         ]
     }
 

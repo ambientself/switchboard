@@ -16,14 +16,16 @@
 //!    or not that call's hold was written ([`LateCalls::runs`]).
 //! 2. Hands it to a person at once when there is nothing to look in: its tool is settled by a
 //!    person, so its receipt recorded no vendor target, or the call named no single resource of
-//!    the declared kind; or its tool's connector registered no [`Lookup`] (no connector does
-//!    until #12), or the tool is no longer approved; or its attempts are used up. Each claim is
+//!    the declared kind; or its tool's connector registered no [`Lookup`] (the GitHub connector
+//!    registers one for each entry serving a tool not classified `read`), or the tool is no
+//!    longer approved; or its attempts are used up. Each claim is
 //!    an attempt, whether or not the lookup made under it was recorded, so a store that fails
 //!    to save lookups still lets a receipt be looked up at most `reconciliation.attempts`
 //!    times.
-//! 3. Otherwise asks the connector's lookup for the receipt's marker in its target, with half the
-//!    lease to answer, so the lookup ends while the lease is held. A lookup that takes longer is
-//!    a failed one. The lookup is not a tool call and writes no audit row.
+//! 3. Otherwise asks the connector's lookup for the receipt's marker in its target, with the team
+//!    the receipt recorded and the policy revision in force, and half the lease to answer, so
+//!    the lookup ends while the lease is held. A lookup that takes longer is a failed one. The
+//!    lookup is not a tool call and writes no audit row.
 //! 4. Records the answer on the receipt, which the store moves only as
 //!    [`LookupAnswer::settles`] says: a found effect settles it `completed` with the vendor's
 //!    reference, an authoritative search that found nothing settles it `not_performed`, and any
@@ -432,11 +434,16 @@ impl Reconciler {
                 .hand_off(&claimed, HandOff::AttemptsUsedUp, report)
                 .await;
         }
+        // The revision in force: a lookup that asks a custodian for its read credential sends
+        // it, and the custodian checks it against its own copy, as it does a call's.
+        let revision = self.policy.current().revision().clone();
         let request = LookupRequest {
             marker: &claimed.row,
             target,
             tool: &claimed.tool,
             resources: &claimed.resources,
+            team: claimed.team.as_ref(),
+            revision: &revision,
         };
         let answer = tokio::time::timeout(self.settings.lookup_deadline(), lookup.look(request))
             .await

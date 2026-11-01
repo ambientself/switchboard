@@ -2314,7 +2314,8 @@ async fn receipt_under(contract: &impl ContractStore, row: &AuditRowId) -> Recei
 
 /// A receipt is reserved with its row or not at all (decision 0009, "How it is tested", item
 /// 6). An allowed side effect's begin stores its row open and a `pending` receipt under it,
-/// holding the scope, key, tool, tool-use identifier, digest and resources of the call. A
+/// holding the scope, the proved principal's team, the key, tool, tool-use identifier, digest
+/// and resources of the call. A
 /// begin the store refuses writes neither. A denial writes its row and reserves nothing, even
 /// with a key, and so uses up no key; nor does a read.
 pub async fn a_receipt_is_reserved_with_its_row_or_not_at_all(contract: &impl ContractStore) {
@@ -2348,6 +2349,7 @@ pub async fn a_receipt_is_reserved_with_its_row_or_not_at_all(contract: &impl Co
                 principal,
                 delegation: None,
             },
+            team: Some(TEAM_A.into()),
             key: key.clone(),
             tool: DRAFT_TOOL.parse().expect("a valid tool name"),
             tool_use_id: Some(ToolUseId::new(key.as_str())),
@@ -3231,7 +3233,8 @@ async fn recorded(
 
 /// A receipt records the vendor target its tool's settlement takes from the call: the one
 /// document a proposal names, when the draft tool is settled by a lookup in documents, and
-/// none when it is settled by a person. The queue gives it back with the receipt.
+/// none when it is settled by a person. The queue gives it back with the receipt, and with the
+/// team the receipt recorded, which a lookup asks for its read credential for.
 pub async fn a_receipt_records_the_vendor_target_its_settlement_takes(
     contract: &impl ContractStore,
 ) {
@@ -3250,6 +3253,8 @@ pub async fn a_receipt_records_the_vendor_target_its_settlement_takes(
     contract.pass_deadline(&start.row).await;
     let claimed = claimed(contract, &start.row, &holder("a")).await;
     assert_eq!(claimed.target, Some(document(TEAM_A_DOCUMENT)));
+    // The team a lookup asks for its read credential for, as the receipt recorded it at begin.
+    assert_eq!(claimed.team, Some(TEAM_A.into()));
 
     let by_person = unknown_receipt(contract).await;
     assert_eq!(receipt_under(contract, &by_person).await.target, None);

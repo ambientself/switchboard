@@ -29,7 +29,7 @@ use thiserror::Error;
 
 use crate::audit::{AuditRowId, Completion, Outcome, RecordedResources};
 use crate::canonical::canonical;
-use crate::names::{Person, ToolName, ToolUseId};
+use crate::names::{Person, TeamId, ToolName, ToolUseId};
 use crate::policy::Resource;
 use crate::principal::PrincipalId;
 use crate::reconcile::LookupRecord;
@@ -333,6 +333,11 @@ pub struct Receipt {
     pub row: AuditRowId,
     /// Where its key is unique.
     pub scope: KeyScope,
+    /// The proved principal's team when the call was begun: `Some` for a workload, `None` for a
+    /// person, and for a receipt reserved before receipts recorded it. A lookup asks for its
+    /// read credential for this team (decision 0009, "Reconciliation").
+    #[serde(default)]
+    pub team: Option<TeamId>,
     /// The key the call carried.
     pub key: IdempotencyKey,
     /// The tool the call ran.
@@ -381,6 +386,7 @@ impl Receipt {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReceiptRequest {
     scope: KeyScope,
+    team: Option<TeamId>,
     key: IdempotencyKey,
     tool: ToolName,
     tool_use_id: Option<ToolUseId>,
@@ -391,8 +397,10 @@ pub struct ReceiptRequest {
 }
 
 impl ReceiptRequest {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         scope: KeyScope,
+        team: Option<TeamId>,
         key: IdempotencyKey,
         tool: ToolName,
         tool_use_id: Option<ToolUseId>,
@@ -402,6 +410,7 @@ impl ReceiptRequest {
     ) -> Self {
         Self {
             scope,
+            team,
             key,
             tool,
             tool_use_id,
@@ -415,6 +424,11 @@ impl ReceiptRequest {
     /// Where the key is unique.
     pub fn scope(&self) -> &KeyScope {
         &self.scope
+    }
+
+    /// The proved principal's team: `Some` for a workload, `None` for a person.
+    pub fn team(&self) -> Option<&TeamId> {
+        self.team.as_ref()
     }
 
     /// The key.
@@ -453,6 +467,7 @@ impl ReceiptRequest {
         Receipt {
             row: row.clone(),
             scope: self.scope.clone(),
+            team: self.team.clone(),
             key: self.key.clone(),
             tool: self.tool.clone(),
             tool_use_id: self.tool_use_id.clone(),
@@ -808,6 +823,7 @@ mod tests {
                 },
                 delegation: None,
             },
+            Some(TeamId::from("payments")),
             IdempotencyKey::parse("key-1").unwrap(),
             ToolName::parse(tool).unwrap(),
             tool_use_id.map(ToolUseId::from),

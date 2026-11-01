@@ -43,7 +43,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 # answers only tokens the key custodian's fake App API issued.
 [features]
 loopback = []
-test-support = ["loopback", "dep:axum", "key-custodian/test-support", "tokio/net", "tokio/rt"]
+test-support = ["loopback", "dep:axum", "key-custodian/test-support", "tokio/net", "tokio/rt", "tokio/sync"]
 
 [dev-dependencies]
 connector-github = { path = ".", features = ["test-support"] }

@@ -182,6 +182,7 @@ pub fn definitions() -> Vec<Definition> {
             assurance: repository_read(),
         },
         crate::search::definition(),
+        crate::create_pr::definition(),
     ];
     definitions.extend(crate::reads::definitions());
     definitions.sort_by_key(|definition| definition.name);
@@ -253,7 +254,7 @@ pub(crate) fn object(arguments: &Value) -> Result<&Map<String, Value>, String> {
         .ok_or_else(|| "the arguments are not an object".to_owned())
 }
 
-fn text(arguments: &Map<String, Value>, name: &str) -> Result<Option<String>, String> {
+pub(crate) fn text(arguments: &Map<String, Value>, name: &str) -> Result<Option<String>, String> {
     match arguments.get(name) {
         None => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.clone())),
@@ -261,7 +262,7 @@ fn text(arguments: &Map<String, Value>, name: &str) -> Result<Option<String>, St
     }
 }
 
-fn required(arguments: &Map<String, Value>, name: &str) -> Result<String, String> {
+pub(crate) fn required(arguments: &Map<String, Value>, name: &str) -> Result<String, String> {
     text(arguments, name)?.ok_or_else(|| format!("{name} is required"))
 }
 
@@ -396,12 +397,17 @@ pub(crate) fn bounded(text: &str, max: usize) -> (&str, bool) {
     (&text[..end], true)
 }
 
-/// The `provenance` every result carries.
+/// The `provenance` every read's result carries.
 pub(crate) fn provenance(tool: &str) -> Value {
+    provenance_as(tool, Classification::Read)
+}
+
+/// The `provenance` a result of `tool`, approved as `classification`, carries.
+pub(crate) fn provenance_as(tool: &str, classification: Classification) -> Value {
     json!({
         "tool": tool,
         "source": crate::SYSTEM,
-        "classification": "read",
+        "classification": classification.as_str(),
         "trust": "untrusted-external",
     })
 }
@@ -654,9 +660,10 @@ mod tests {
         assert!(parse("github__other", &json!({})).is_none());
     }
 
-    /// Each tool states what its code gives: the search checks its own scope, every other read
-    /// reaches the repository its `owner` and `repo` name, and each is `read`. A reach-report
-    /// entry serves the report's tool alone, and any other entry every tool but that one.
+    /// Each tool states what its code gives: the search checks its own scope, every other tool
+    /// reaches the repository its `owner` and `repo` name, and each is `read` but
+    /// `github__create_pr`, which is `propose`. A reach-report entry serves the report's tool
+    /// alone, and any other entry every tool but that one.
     #[test]
     fn each_entry_serves_its_tools_as_their_code_states_them() {
         let entry = |reports_reach: bool| gateway_registry::BuiltInEntry {
@@ -676,7 +683,11 @@ mod tests {
                 _ => repository_read().resources,
             };
             assert_eq!(tool.assurance.resources, want, "{}", tool.name);
-            assert_eq!(tool.assurance.classification, Classification::Read);
+            let classification = match tool.name.as_str() {
+                crate::create_pr::CREATE_PR => Classification::Propose,
+                _ => Classification::Read,
+            };
+            assert_eq!(tool.assurance.classification, classification);
             assert_ne!(
                 tool.name.as_str(),
                 crate::report::LIST_INSTALLATION_REPOSITORIES
@@ -709,10 +720,9 @@ mod tests {
 
     #[test]
     fn each_definition_names_a_tool_this_connector_parses() {
-        for definition in definitions()
-            .into_iter()
-            .filter(|definition| definition.name != crate::search::SEARCH)
-        {
+        for definition in definitions().into_iter().filter(|definition| {
+            ![crate::search::SEARCH, crate::create_pr::CREATE_PR].contains(&definition.name)
+        }) {
             assert!(
                 parse(definition.name, &json!({})).is_some(),
                 "{}",
