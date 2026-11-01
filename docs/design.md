@@ -1687,8 +1687,9 @@ refuses to be built, naming the entry. Before anything is asked of the custodian
   bytes at most); or a body that with the marker line is over 65,536 characters, GitHub's own
   bound, which the schema keeps the caller's body within by allowing it 65,000;
 - an owner other than the organization is `refused` with Otto's sentence; so is a title or body
-  whose first word, after any leading whitespace, is `atlantis` in any case, which Atlantis
-  would read as a command (Otto's comment rule, applied to a proposal's text); and so is a
+  that Atlantis would read as a command, by the shared command-text guard below (a first word
+  of `atlantis`, `@atlantis` or `/atlantis` in any case, past leading whitespace and format
+  characters; broader than Otto's comment rule, applied to a proposal's text); and so is a
   title or body that holds `switchboard-receipt` in any case, the marker's text.
 
 Then one token is asked for, narrowed to the call's one repository with the tool's own set,
