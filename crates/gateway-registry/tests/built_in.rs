@@ -9,7 +9,10 @@ use gateway_core::{
     Classification, ConnectorName, CredentialMode, DeclaredFrom, EntryKind, Narrowing, Resource,
     ResourceDeclaration, Resources, SnapshotError, ToolName,
 };
-use gateway_registry::{RegistryError, built_in_binding_sha256, definition_sha256};
+use gateway_registry::{
+    Assurance, RegistryError, ResourceSource, StatedResources, built_in_binding_sha256,
+    definition_sha256,
+};
 use serde_json::json;
 use toml::Table;
 
@@ -66,6 +69,21 @@ fn a_built_in_tool_loads_with_its_definition_adapter_and_entry() {
     assert!(
         !registry.routes().contains_key(&name_),
         "nothing is forwarded"
+    );
+
+    // What the approval declares the tool is, for the gateway to compare with what its
+    // connector's code states.
+    assert_eq!(
+        registry.built_in_assurances()[&name_],
+        Assurance {
+            classification: Classification::Read,
+            resources: StatedResources::FromArguments(vec![ResourceSource {
+                from_argument: "repo".into(),
+                qualified_by: Some("owner".into()),
+                system: "github".into(),
+                kind: "repository".into(),
+            }]),
+        }
     );
 
     let approved = registry.snapshot().tool(&name_).unwrap();
@@ -149,6 +167,94 @@ fn a_built_in_tool_may_check_its_own_scope() {
     let approved = registry.snapshot().tool(&tool("github__get_file")).unwrap();
     assert_eq!(approved.resources, ResourceDeclaration::ChecksOwnScope);
     assert_eq!(approved.declared_from, None);
+    assert_eq!(
+        registry.built_in_assurances()[&tool("github__get_file")].resources,
+        StatedResources::ChecksOwnScope
+    );
+}
+
+/// Each declaration an approval can make is what the registry gives the gateway to compare with
+/// the connector's statement, and no other. `as_reach` is in tests/reach_report.rs, since its
+/// entry needs a reach report.
+#[test]
+fn each_declaration_is_the_assurance_the_approval_states() {
+    for (resources, stated) in [
+        (r#""no_resources""#, StatedResources::NoResources),
+        (r#""checks_own_scope""#, StatedResources::ChecksOwnScope),
+    ] {
+        let registry = load(&registry(DECLARED, "read", resources)).unwrap();
+        assert_eq!(
+            registry.built_in_assurances()[&tool("github__get_file")],
+            Assurance {
+                classification: Classification::Read,
+                resources: stated,
+            },
+            "{resources}"
+        );
+    }
+}
+
+/// A repository of the GitHub entry's reach.
+const ATLAS: &str = r#"{ system = "github", kind = "repository", identifier = "example-org/atlas" }"#;
+
+/// A tool declared as its entry's reach names the whole reach on every call, so its entry must
+/// record one (decision 0011, section 1), as a proxied entry must; and a GitHub entry with a
+/// reach must name the reach report it is checked against (decision 0011, section 4).
+#[test]
+fn a_reach_that_is_required_cannot_be_left_out() {
+    let missing = || RegistryError::ReachMissing {
+        tool: tool("github__get_file"),
+        connector: name("github-read"),
+    };
+    // No reach at all, and a reach that is empty.
+    let empty = format!("{DECLARED}\nreach = []");
+    for declared in [DECLARED.to_owned(), empty] {
+        let got = load(&registry(&declared, "read", r#""as_reach""#))
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(got, missing(), "{declared}");
+        assert_eq!(
+            got.to_string(),
+            "built-in tool `github__get_file` is declared as the reach of connector \
+             `github-read`, which declares no reach; record the entry's reach, as a proxied \
+             entry records its own"
+        );
+    }
+    // A GitHub entry with a reach and no reach report, whatever its tools declare.
+    let unchecked = format!("{DECLARED}\nreach = [{ATLAS}]");
+    for resources in [r#""as_reach""#, FROM_ARGUMENTS] {
+        let got = load(&registry(&unchecked, "read", resources))
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            got,
+            RegistryError::ReachReportMissing(name("github-read")),
+            "{resources}"
+        );
+    }
+    // The entry alone, with no approval, is refused too.
+    let mut table = base();
+    let entry = format!(
+        r#"[{{ name = "github-read", system = "github", permissions = {{ contents = "read" }}, tools = ["github__get_file"], {} }}]"#,
+        unchecked.replace('\n', ", ")
+    );
+    set(&mut table, "", "connectors", value(&entry));
+    assert_eq!(
+        load(&table).map(|_| ()).unwrap_err(),
+        RegistryError::ReachReportMissing(name("github-read"))
+    );
+    // An entry of a system whose vendor report is not built may declare a reach without one.
+    let mut table = base();
+    set(
+        &mut table,
+        "",
+        "connectors",
+        value(&format!(
+            r#"[{{ name = "jira-read", system = "jira", permissions = {{ read = "read" }}, tools = ["jira__get_issue"], {}, reach = [{{ system = "jira", kind = "site", identifier = "example.atlassian.net" }}] }}]"#,
+            DECLARED.replace('\n', ", ")
+        )),
+    );
+    load(&table).unwrap();
 }
 
 #[test]
@@ -369,10 +475,10 @@ fn the_built_in_binding_covers_the_entry_but_not_its_name_or_tools() {
     };
     let read = r#"{ contents = "read" }"#;
     let tools = r#"["github__get_file"]"#;
-    let base = binding(DECLARED, read, "github-read", tools);
-    assert_eq!(base, binding(DECLARED, read, "github-other", tools));
+    let unchanged = binding(DECLARED, read, "github-read", tools);
+    assert_eq!(unchanged, binding(DECLARED, read, "github-other", tools));
     assert_eq!(
-        base,
+        unchanged,
         binding(
             DECLARED,
             read,
@@ -381,11 +487,11 @@ fn the_built_in_binding_covers_the_entry_but_not_its_name_or_tools() {
         )
     );
     assert_ne!(
-        base,
+        unchanged,
         binding(DECLARED, r#"{ contents = "write" }"#, "github-read", tools)
     );
     assert_ne!(
-        base,
+        unchanged,
         binding(
             DECLARED,
             r#"{ contents = "read", issues = "read" }"#,
@@ -398,14 +504,29 @@ fn the_built_in_binding_covers_the_entry_but_not_its_name_or_tools() {
         DECLARED.replace("\"read\"", "\"propose\""),
         DECLARED.replace("switchboard-github-app", "another-app"),
         DECLARED.replace("team_service_identity", "gateway_token"),
-        format!(
-            "{DECLARED}\nreach = [{{ system = \"github\", kind = \"repository\", identifier = \"example-org/atlas\" }}]"
-        ),
     ] {
         assert_ne!(
-            base,
+            unchanged,
             binding(&changed, read, "github-read", tools),
             "{changed}"
         );
     }
+    // A GitHub entry with a reach loads only with a reach report beside it, so the reach is
+    // given to the entry as loaded.
+    let mut table = base();
+    let entry = format!(
+        r#"[{{ name = "github-read", system = "github", permissions = {read}, tools = {tools}, {} }}]"#,
+        DECLARED.replace('\n', ", ")
+    );
+    set(&mut table, "", "connectors", value(&entry));
+    let mut entry = load(&table).unwrap().connectors()[&name("github-read")].clone();
+    assert_eq!(built_in_binding_sha256(&entry).unwrap(), unchanged);
+    if let Some(declaration) = entry.declaration.as_mut() {
+        declaration.reach.insert(Resource {
+            system: "github".into(),
+            kind: "repository".into(),
+            identifier: "example-org/atlas".into(),
+        });
+    }
+    assert_ne!(built_in_binding_sha256(&entry).unwrap(), unchanged);
 }

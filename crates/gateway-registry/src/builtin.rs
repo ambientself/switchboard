@@ -28,8 +28,8 @@
 //! `reports_reach = true`. The loader holds such an entry to its one job: it declares its
 //! credential, narrowed `none` (it reads the whole installation), permitting `read`, with no
 //! reach of its own and no reach report; every tool approved on it is `read`; and those tools
-//! are served only on surfaces restricted to named principals (the registry's own, on
-//! `registry-reach`). The key custodian gives such an entry's tool, and no other, an
+//! are served only on [`REACH_SURFACE`], `registry-reach`, restricted to one named principal,
+//! the registry's own identity. The key custodian gives such an entry's tool, and no other, an
 //! installation-wide token, for `metadata: read` alone (see `key_custodian::policy`).
 //!
 //! An entry whose reach is checked that way names the report's tool in `reach_report`. It
@@ -37,6 +37,11 @@
 //! what the report lists. The tool must be one a reach-report entry of the same system lists,
 //! and approved while any of the entry's own tools is, so that nothing is served under a
 //! credential whose reach is never checked. The drift pass makes the check (`gateway::drift`).
+//!
+//! The check is required, not chosen: an entry of [`REPORTED_SYSTEM`], `github`, that declares a
+//! reach must name a reach report, as a proxied entry with a reach must name a reach check. An
+//! entry of another system may declare a reach without one, since no other vendor's report is
+//! built.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -87,8 +92,8 @@ pub struct BuiltInEntry {
     /// the system's credentials reach (decision 0011, section 4). The loader holds such an
     /// entry to that one job: it declares its credential, narrowed `none`, permitting `read`,
     /// with no reach or reach report of its own; every tool approved on it is `read`; and its
-    /// tools are served only on surfaces restricted to named principals. The key custodian gives
-    /// its tools alone an installation-wide token, for `metadata: read` alone.
+    /// tools are served only on [`REACH_SURFACE`], restricted to one named principal. The key
+    /// custodian gives its tools alone an installation-wide token, for `metadata: read` alone.
     pub reports_reach: bool,
     /// The reach report this entry's reach is checked against, if it is.
     pub reach_report: Option<ReachReport>,
@@ -97,6 +102,14 @@ pub struct BuiltInEntry {
 /// The kind of resource a reach report lists, and so of every resource in the reach of an entry
 /// checked against one: GitHub's report lists an installation's repositories.
 pub const REPORTED_KIND: &str = "repository";
+
+/// The system whose vendor report is built: GitHub's. An entry of this system that declares a
+/// reach must name a reach report.
+pub const REPORTED_SYSTEM: &str = "github";
+
+/// The one surface a reach report's tool may be served on: the registry's own, restricted to
+/// one named principal, the registry's identity (decision 0011, section 4).
+pub const REACH_SURFACE: &str = "registry-reach";
 
 /// The reach report an entry's reach is checked against (decision 0011, section 4): the tool,
 /// served by a reach-report entry of the same system, that reads the vendor's report.
@@ -243,6 +256,15 @@ pub(crate) fn built_in(
             reach_report,
         };
         reach_report_shape(&built)?;
+        // A GitHub entry's reach is checked against GitHub's report, or it is not served: the
+        // check is not left to the entry to choose (decision 0011, section 4).
+        let reaches = built
+            .declaration
+            .as_ref()
+            .is_some_and(|declaration| !declaration.reach.is_empty());
+        if built.system == REPORTED_SYSTEM && reaches && built.reach_report.is_none() {
+            return Err(RegistryError::ReachReportMissing(built.name));
+        }
         checked.insert(built.name.clone(), built);
     }
     for entry in checked.values() {

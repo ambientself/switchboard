@@ -5,7 +5,8 @@
 
 use gateway_core::{ConnectorName, ToolName};
 use gateway_registry::{
-    ReachReport, Registry, RegistryError, built_in_binding_sha256, definition_sha256,
+    REACH_SURFACE, ReachReport, Registry, RegistryError, StatedResources,
+    built_in_binding_sha256, definition_sha256,
 };
 
 const REPORT_TOOL: &str = "github__list_installation_repositories";
@@ -19,8 +20,12 @@ struct Case {
     report: &'static str,
     /// The report tool's classification.
     classification: &'static str,
+    /// The name of the surface that serves the report tool.
+    surface: &'static str,
     /// The `principals` of the surface that serves the report tool.
     principals: &'static str,
+    /// How the checked entry's tool's resources are known.
+    read_resources: &'static str,
     /// Whether the report tool is approved.
     report_approved: bool,
     /// Whether the checked entry's tool is approved.
@@ -43,13 +48,20 @@ reports_reach = true"#;
 
 const ONLY: &str = r#"{ only = [{ issuer = "https://workloads.example.test", subject = "system:serviceaccount:switchboard:registry" }] }"#;
 
+/// The registry's identity and one more named principal.
+const TWO: &str = r#"{ only = [{ issuer = "https://workloads.example.test", subject = "system:serviceaccount:switchboard:registry" }, { issuer = "https://workloads.example.test", subject = "system:serviceaccount:team-a:agent" }] }"#;
+
+const FROM_ARGUMENTS: &str = r#"{ from_arguments = [{ from_argument = "repo", system = "github", kind = "repository" }] }"#;
+
 impl Default for Case {
     fn default() -> Self {
         Self {
             checked: CHECKED,
             report: REPORT,
             classification: "read",
+            surface: REACH_SURFACE,
             principals: ONLY,
+            read_resources: FROM_ARGUMENTS,
             report_approved: true,
             read_approved: true,
         }
@@ -102,17 +114,21 @@ teams = ["team-a"]
 principals = "any_in_teams_and_groups"
 
 [[surfaces]]
-name = "registry-reach"
+name = "{surface}"
 tools = {report_surface}
 teams = ["registry"]
 principals = {principals}
 
 [limits.teams]
-team-a = [{{ system = "github", kind = "repository", identifier = "example-org/atlas" }}]
+team-a = [
+  {{ system = "github", kind = "repository", identifier = "example-org/atlas" }},
+  {{ system = "github", kind = "repository", identifier = "example-org/borealis" }},
+]
 registry = []
 "#,
         checked = case.checked,
         report = case.report,
+        surface = case.surface,
         principals = case.principals,
         read_surface = tools(case.read_approved, READ_TOOL),
         report_surface = tools(case.report_approved, REPORT_TOOL),
@@ -175,7 +191,7 @@ fn text(case: &Case) -> String {
                     "properties": {"repo": {"type": "string"}},
                 }),
             ),
-            r#"{ from_arguments = [{ from_argument = "repo", system = "github", kind = "repository" }] }"#,
+            case.read_resources,
         ));
     }
     if case.report_approved {
@@ -324,10 +340,70 @@ reach_report = { tool = "github__list_installation_repositories" }"#,
                 tool: tool(REPORT_TOOL),
             },
         ),
+        (
+            "a reach report's tool served on registry-reach to a second named principal",
+            Case {
+                principals: TWO,
+                ..Case::default()
+            },
+            RegistryError::ReachReportSurface {
+                surface: "registry-reach".into(),
+                tool: tool(REPORT_TOOL),
+            },
+        ),
+        (
+            "a reach report's tool served on another surface restricted to its one principal",
+            Case {
+                surface: "reach-elsewhere",
+                ..Case::default()
+            },
+            RegistryError::ReachReportSurface {
+                surface: "reach-elsewhere".into(),
+                tool: tool(REPORT_TOOL),
+            },
+        ),
     ];
     for (what, case, want) in cases {
         assert_eq!(load(&case).unwrap_err(), want, "{what}");
     }
+}
+
+/// The refusal of a reach report's tool on any surface but the registry's own says where it may
+/// be served.
+#[test]
+fn a_reach_reports_tool_is_served_on_registry_reach_alone() {
+    let refused = load(&Case {
+        surface: "reach-elsewhere",
+        ..Case::default()
+    })
+    .unwrap_err();
+    assert_eq!(
+        refused.to_string(),
+        format!(
+            "surface `reach-elsewhere` serves `{REPORT_TOOL}`, a reach report's tool; serve it \
+             only on `registry-reach`, restricted to one named principal, the registry's own \
+             identity"
+        )
+    );
+}
+
+/// A tool declared as its entry's reach loads on an entry that records one and names its reach
+/// report, and its approval states it is declared as the reach.
+#[test]
+fn a_tool_declared_as_a_checked_reach_loads() {
+    let registry = load(&Case {
+        read_resources: r#""as_reach""#,
+        ..Case::default()
+    })
+    .unwrap();
+    assert_eq!(
+        registry.built_in_assurances()[&tool(READ_TOOL)].resources,
+        StatedResources::AsReach
+    );
+    assert_eq!(
+        registry.built_in_assurances()[&tool(REPORT_TOOL)].resources,
+        StatedResources::NoResources
+    );
 }
 
 #[test]
