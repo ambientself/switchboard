@@ -388,6 +388,67 @@ async fn a_column_grant_beyond_its_own_is_refused() {
     );
 }
 
+/// The receipt's team (migration 0013) is a column the check requires, of its type, with the
+/// gateway's role holding INSERT and SELECT on it and nothing more.
+#[tokio::test]
+async fn the_receipts_team_is_required_with_its_own_grants_and_no_wider_one() {
+    for (sql, problem) in [
+        (
+            format!("GRANT UPDATE (team) ON switchboard_audit.receipts TO {GATEWAY_ROLE}"),
+            extra("UPDATE", "switchboard_audit.receipts.team"),
+        ),
+        (
+            format!("REVOKE SELECT (team) ON switchboard_audit.receipts FROM {GATEWAY_ROLE}"),
+            Problem::Missing {
+                privilege: "SELECT".into(),
+                object: "switchboard_audit.receipts.team".into(),
+            },
+        ),
+        (
+            format!("REVOKE INSERT (team) ON switchboard_audit.receipts FROM {GATEWAY_ROLE}"),
+            Problem::Missing {
+                privilege: "INSERT".into(),
+                object: "switchboard_audit.receipts.team".into(),
+            },
+        ),
+        (
+            "ALTER TABLE switchboard_audit.receipts ALTER COLUMN team TYPE varchar(64)".to_owned(),
+            Problem::ColumnType {
+                table: "receipts",
+                column: "team",
+                found: "character varying(64)".into(),
+                expected: "text",
+            },
+        ),
+    ] {
+        let Some(db) = TestDatabase::create().await else {
+            return;
+        };
+        db.admin().await.batch_execute(&sql).await.unwrap();
+        assert_eq!(
+            problems(&db.store(PoolSizes::default())).await,
+            vec![problem],
+            "{sql}"
+        );
+    }
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    db.admin()
+        .await
+        .batch_execute("ALTER TABLE switchboard_audit.receipts DROP COLUMN team")
+        .await
+        .unwrap();
+    let found = problems(&db.store(PoolSizes::default())).await;
+    assert!(
+        found.contains(&Problem::ColumnMissing {
+            table: "receipts",
+            column: "team"
+        }),
+        "{found:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_grant_the_store_needs_and_lacks_is_refused() {
     let Some(db) = TestDatabase::create().await else {
