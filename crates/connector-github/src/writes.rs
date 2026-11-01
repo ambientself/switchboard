@@ -136,8 +136,8 @@ fn format_character(c: char) -> bool {
 /// The sentence a proposal tool refuses command text in `field` with.
 pub(crate) fn command_text_sentence(field: &str) -> String {
     format!(
-        "the {field} begins with \"atlantis\", which Atlantis would read as a command; a proposal \
-         may not carry one"
+        "the {field} begins with a word Atlantis would read as a command addressed to it \
+         (\"atlantis\", \"@atlantis\" or \"/atlantis\"); a proposal may not carry one"
     )
 }
 
