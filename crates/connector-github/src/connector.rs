@@ -62,6 +62,32 @@ pub enum SettingsError {
     /// A job log host was refused.
     #[error("the job log host `{0}` was refused: {1}")]
     JobLogHost(String, ApiError),
+    /// An entry serves a write tool and is not narrowed `call`: a write's token is for the one
+    /// repository its call names, never the caller's whole limit.
+    #[error(
+        "connector `{entry}` serves `{tool}`, which writes, and is not narrowed \"call\"; a \
+         write's token is narrowed to the one repository its call names"
+    )]
+    WriteNotNarrowedToTheCall {
+        /// The entry.
+        entry: ConnectorName,
+        /// The tool.
+        tool: String,
+    },
+    /// An entry serves a write tool whose permission set it does not hold, at the level the
+    /// tool asks for, so the key custodian would refuse every token the tool asks for.
+    #[error(
+        "connector `{entry}` serves `{tool}`, which asks for `{permission}`, and the entry does \
+         not state it"
+    )]
+    WritePermissionNotStated {
+        /// The entry.
+        entry: ConnectorName,
+        /// The tool.
+        tool: String,
+        /// The permission and level the entry does not state, such as `pull_requests: write`.
+        permission: String,
+    },
     /// An entry serves a tool whose permission set it does not hold, so the key custodian
     /// would refuse every token the tool asks for.
     #[error(
@@ -133,6 +159,7 @@ impl GitHubConnector {
                 return Err(SettingsError::NotNarrowed(entry.name.clone()));
             }
             crate::reads::check_entry(entry)?;
+            crate::writes::check_entry(entry, declaration.narrowing)?;
             served.insert(
                 entry.name.clone(),
                 EntryCredential {
@@ -170,10 +197,23 @@ impl GitHubConnector {
         )
     }
 
+    /// The one organization every call must name as its owner.
+    pub(crate) fn organization(&self) -> &str {
+        &self.organization
+    }
+
+    /// How `entry`'s tokens are narrowed, if the connector was built with it.
+    pub(crate) fn narrowing(&self, entry: &ConnectorName) -> Option<Narrowing> {
+        self.entries.get(entry).map(|entry| entry.narrowing)
+    }
+
     async fn call(&self, call: ToolCall) -> ToolOutcome {
         let tool = call.tool().name.clone();
         if tool.as_str() == report::LIST_INSTALLATION_REPOSITORIES {
             return self.report(&call).await;
+        }
+        if tool.as_str() == crate::create_pr::CREATE_PR {
+            return self.create_pr(&call).await;
         }
         if tool.as_str() == search::SEARCH {
             return self.search(&call).await;
@@ -664,9 +704,10 @@ fn custodian_sentence(team: &TeamId, kind: ErrorKind) -> String {
              was sent to GitHub"
         ),
         ErrorKind::VendorRefusal => {
-            "GitHub refused to issue a token for this call, so nothing was read".to_owned()
+            "GitHub refused to issue a token for this call, so nothing was sent to GitHub"
+                .to_owned()
         }
-        _ => "no GitHub token could be had for this call, so nothing was read".to_owned(),
+        _ => "no GitHub token could be had for this call, so nothing was sent to GitHub".to_owned(),
     }
 }
 
@@ -735,6 +776,68 @@ mod tests {
         let mut undeclared = entry(Narrowing::None, false);
         undeclared.declaration = None;
         GitHubConnector::new(&settings("example-org"), [&undeclared]).unwrap();
+    }
+
+    /// An entry serving `github__create_pr` must be narrowed `call` and state `contents` and
+    /// `pull_requests: write`, or the connector refuses to be built, naming the entry.
+    #[test]
+    fn an_entry_serving_a_write_is_narrowed_to_the_call_and_states_its_permissions() {
+        let writing = |narrowing: Narrowing, permissions: &[(&str, Access)]| {
+            let mut entry = entry(narrowing, false);
+            entry.name = "github-write".into();
+            entry.tools = BTreeSet::from([crate::create_pr::CREATE_PR.parse().unwrap()]);
+            entry.permissions = permissions
+                .iter()
+                .map(|(permission, access)| ((*permission).to_owned(), *access))
+                .collect();
+            entry
+        };
+        let stated = [
+            ("contents", Access::Write),
+            ("pull_requests", Access::Write),
+        ];
+        GitHubConnector::new(
+            &settings("example-org"),
+            [&writing(Narrowing::Call, &stated)],
+        )
+        .unwrap();
+        let narrowed = GitHubConnector::new(
+            &settings("example-org"),
+            [&writing(Narrowing::Limit, &stated)],
+        )
+        .unwrap_err();
+        assert_eq!(
+            narrowed,
+            SettingsError::WriteNotNarrowedToTheCall {
+                entry: "github-write".into(),
+                tool: crate::create_pr::CREATE_PR.into(),
+            }
+        );
+        assert!(
+            narrowed.to_string().contains("`github-write`"),
+            "{narrowed}"
+        );
+        for (permissions, missing) in [
+            (
+                vec![("contents", Access::Write), ("pull_requests", Access::Read)],
+                "pull_requests: write",
+            ),
+            (vec![("pull_requests", Access::Write)], "contents: read"),
+        ] {
+            let refused = GitHubConnector::new(
+                &settings("example-org"),
+                [&writing(Narrowing::Call, &permissions)],
+            )
+            .unwrap_err();
+            assert_eq!(
+                refused,
+                SettingsError::WritePermissionNotStated {
+                    entry: "github-write".into(),
+                    tool: crate::create_pr::CREATE_PR.into(),
+                    permission: missing.into(),
+                }
+            );
+        }
     }
 
     /// The organization is a GitHub account name: 1 to 39 letters, digits and hyphens.
