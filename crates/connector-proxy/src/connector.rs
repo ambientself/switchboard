@@ -22,7 +22,7 @@ use thiserror::Error;
 use crate::credentials::{FileCredentials, ProbeCredential, Secret};
 use crate::destination::{self, Destination, Loopback, Refusal};
 use crate::list::{ListError, ListedTool, tool_list};
-use crate::outcome::{self, NOT_MCP, NotMcp};
+use crate::outcome::{self, Answered, NOT_MCP, NotMcp};
 use crate::probe::{ProbeBounds, ProbeReport};
 use crate::transport::{CaFault, Transport};
 
@@ -178,7 +178,9 @@ pub enum UpstreamError {
 /// made, any status other than `200`, `4xx` included, a `200` that is not MCP, a JSON-RPC
 /// error and a tool result marked `isError`. The server's own refusal or failure does not
 /// establish that it did nothing. The deadline counts as sent even when it passed before the
-/// connection was made, which the connector cannot tell apart.
+/// connection was made, which the connector cannot tell apart. Each is logged as
+/// [`SIDE_EFFECT_UNKNOWN_EVENT`], with what came in place of an answer and its HTTP status, and
+/// never the server's text.
 ///
 /// Before anything is sent, a failure is an error whatever the tool, and its receipt is
 /// settled as `not_performed`: a credential that could not be had or a request that could not
@@ -304,18 +306,28 @@ impl ProxyConnector {
         let sent = if tool.classification == Classification::Read {
             Sent::Read
         } else {
-            Sent::SideEffect
+            Sent::SideEffect {
+                connector: &self.connector,
+                tool: &tool.name,
+            }
         };
         match tokio::time::timeout(self.deadline, self.exchange(request, sent)).await {
-            Err(_elapsed) => sent.late(outcome::TIMED_OUT),
+            Err(_elapsed) => sent.late(outcome::TIMED_OUT, Unanswered::TimedOut),
             Ok(Err(failed)) => failed,
             Ok(Ok(received)) => {
                 match outcome::interpret(received.content_type.as_deref(), &received.body, id) {
+                    Ok(Answered::Result(result)) => ToolOutcome::Ok(result),
                     // The server's JSON-RPC error or failed tool result: from a side effect it
                     // does not establish that nothing took effect.
-                    Ok(ToolOutcome::Error(kind, sentence)) => sent.without_answer(kind, &sentence),
-                    Ok(answered) => answered,
-                    Err(NotMcp) => sent.without_answer(ErrorKind::Other, NOT_MCP),
+                    Ok(Answered::RpcError { code, sentence }) => {
+                        sent.without_answer(ErrorKind::Other, &sentence, Unanswered::RpcError(code))
+                    }
+                    Ok(Answered::ToolFailed(sentence)) => {
+                        sent.without_answer(ErrorKind::Other, &sentence, Unanswered::ToolFailed)
+                    }
+                    Err(NotMcp) => {
+                        sent.without_answer(ErrorKind::Other, NOT_MCP, Unanswered::NotMcp)
+                    }
                 }
             }
         }
@@ -351,7 +363,7 @@ impl ProxyConnector {
     async fn exchange(
         &self,
         request: Request<Full<Bytes>>,
-        sent: Sent,
+        sent: Sent<'_>,
     ) -> Result<Received, ToolOutcome> {
         let response = self.transport.request(request).await.map_err(|error| {
             if destination::refused(&error) {
@@ -361,21 +373,38 @@ impl ProxyConnector {
                 ToolOutcome::error(ErrorKind::Other, outcome::UNREACHABLE)
             } else {
                 // The connection was made, and the request may have gone out on it.
-                sent.without_answer(ErrorKind::Other, outcome::UNREACHABLE)
+                sent.without_answer(
+                    ErrorKind::Other,
+                    outcome::UNREACHABLE,
+                    Unanswered::ExchangeFailed,
+                )
             }
         })?;
         // Any status but `200` is the call's outcome. The server's refusal, a `4xx`, is an error
         // from a read. From a side effect it does not establish that nothing took effect, so it
         // is `unknown`, as a server error, a redirect or a success that is not an answer is.
         let status = response.status();
+        let unanswered = Unanswered::Status(status.as_u16());
         if status == StatusCode::UNAUTHORIZED {
-            return Err(sent.without_answer(ErrorKind::Other, outcome::CREDENTIAL_REJECTED));
+            return Err(sent.without_answer(
+                ErrorKind::Other,
+                outcome::CREDENTIAL_REJECTED,
+                unanswered,
+            ));
         }
         if status == StatusCode::FORBIDDEN {
-            return Err(sent.without_answer(ErrorKind::VendorRefusal, outcome::UPSTREAM_REFUSED));
+            return Err(sent.without_answer(
+                ErrorKind::VendorRefusal,
+                outcome::UPSTREAM_REFUSED,
+                unanswered,
+            ));
         }
         if status != StatusCode::OK {
-            return Err(sent.without_answer(ErrorKind::Other, &outcome::status(status.as_u16())));
+            return Err(sent.without_answer(
+                ErrorKind::Other,
+                &outcome::status(status.as_u16()),
+                unanswered,
+            ));
         }
         self.read(response, sent).await
     }
@@ -386,9 +415,9 @@ impl ProxyConnector {
     async fn read(
         &self,
         response: Response<Incoming>,
-        sent: Sent,
+        sent: Sent<'_>,
     ) -> Result<Received, ToolOutcome> {
-        let too_large = || sent.late(outcome::TOO_LARGE);
+        let too_large = || sent.late(outcome::TOO_LARGE, Unanswered::TooLarge);
         if declared_length(response.headers())
             .is_some_and(|length| length > self.max_response_bytes as u64)
         {
@@ -402,7 +431,7 @@ impl ProxyConnector {
         let mut body = response.into_body();
         let mut received = Vec::new();
         while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(|_| sent.late(outcome::BROKEN_OFF))?;
+            let frame = frame.map_err(|_| sent.late(outcome::BROKEN_OFF, Unanswered::BrokenOff))?;
             if let Ok(data) = frame.into_data() {
                 if received.len() + data.len() > self.max_response_bytes {
                     return Err(too_large());
@@ -515,12 +544,19 @@ impl Connector for ProxyConnector {
     }
 }
 
+/// The `event` field of the warning logged when a side effect's outcome becomes `unknown`
+/// because its server gave no definite answer. It names the `connector`, the `tool`, the
+/// `kind` of answer it got in place of one, the HTTP `status` when an answer's head arrived,
+/// and a JSON-RPC error's `rpc_code`. Never the server's body: a JSON-RPC error's message and a
+/// failed tool result's text are the server's own words, and stay out of the log.
+pub const SIDE_EFFECT_UNKNOWN_EVENT: &str = "proxied_side_effect_unknown";
+
 /// What a call comes to once its request may have been sent, unless it succeeded: a timeout,
 /// an answer too large or broken off, an exchange that failed after its connection was made,
 /// any status other than `200`, a `200` that is not MCP, a JSON-RPC error or a tool result
 /// marked `isError`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Sent {
+enum Sent<'a> {
     /// From a tool classified `read`, an error: of its own kind when the answer was too large
     /// or too late, and otherwise as the failure says.
     Read,
@@ -528,21 +564,103 @@ enum Sent {
     /// may have acted on the request, so the call must not be settled as `not_performed`, and
     /// the caller must not repeat it. A proxied tool's error is `unknown` unless its approval
     /// says its errors are safe, and no approval can say so yet, so this holds for the
-    /// server's own refusal or failure too.
-    SideEffect,
+    /// server's own refusal or failure too. Logged as [`SIDE_EFFECT_UNKNOWN_EVENT`], naming the
+    /// connector and the tool, since the caller and the row are told only `unknown`.
+    SideEffect {
+        connector: &'a ConnectorName,
+        tool: &'a ToolName,
+    },
 }
 
-impl Sent {
+impl Sent<'_> {
     /// An answer too large, too late or broken off, with `sentence` for a read.
-    fn late(self, sentence: &str) -> ToolOutcome {
-        self.without_answer(ErrorKind::OversizedOrLateRead, sentence)
+    fn late(self, sentence: &str, unanswered: Unanswered) -> ToolOutcome {
+        self.without_answer(ErrorKind::OversizedOrLateRead, sentence, unanswered)
     }
 
-    /// Any other outcome but a success, of `kind` with `sentence` for a read.
-    fn without_answer(self, kind: ErrorKind, sentence: &str) -> ToolOutcome {
+    /// Any other outcome but a success, of `kind` with `sentence` for a read. From a side
+    /// effect, logs what came in place of an answer, never the sentence: it can hold the
+    /// server's text.
+    fn without_answer(
+        self,
+        kind: ErrorKind,
+        sentence: &str,
+        unanswered: Unanswered,
+    ) -> ToolOutcome {
         match self {
             Sent::Read => ToolOutcome::error(kind, sentence),
-            Sent::SideEffect => ToolOutcome::Unknown,
+            Sent::SideEffect { connector, tool } => {
+                tracing::warn!(
+                    event = SIDE_EFFECT_UNKNOWN_EVENT,
+                    %connector,
+                    %tool,
+                    kind = unanswered.as_str(),
+                    status = unanswered.status(),
+                    rpc_code = unanswered.rpc_code(),
+                    "a side effect's server gave no definite answer, so its outcome is unknown"
+                );
+                ToolOutcome::Unknown
+            }
+        }
+    }
+}
+
+/// What a call that may have been sent got in place of a definite answer, as the line logged
+/// for a side effect's `unknown` outcome names it. Nothing here is the server's text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unanswered {
+    /// No answer, or no complete one, by the deadline. Whether an answer's head had arrived
+    /// is not known.
+    TimedOut,
+    /// The exchange failed after its connection was made, before an answer began.
+    ExchangeFailed,
+    /// An HTTP status other than `200`.
+    Status(u16),
+    /// A `200` whose body was larger than the cap.
+    TooLarge,
+    /// A `200` whose body broke off.
+    BrokenOff,
+    /// A `200` that is not one JSON-RPC response to the request.
+    NotMcp,
+    /// A `200` holding a JSON-RPC error, with its code.
+    RpcError(i64),
+    /// A `200` holding a tool result marked `isError`.
+    ToolFailed,
+}
+
+impl Unanswered {
+    /// How the log names it.
+    fn as_str(self) -> &'static str {
+        match self {
+            Unanswered::TimedOut => "timed_out",
+            Unanswered::ExchangeFailed => "exchange_failed",
+            Unanswered::Status(_) => "status",
+            Unanswered::TooLarge => "too_large",
+            Unanswered::BrokenOff => "broken_off",
+            Unanswered::NotMcp => "not_mcp",
+            Unanswered::RpcError(_) => "rpc_error",
+            Unanswered::ToolFailed => "tool_failed",
+        }
+    }
+
+    /// The HTTP status the server answered with, when an answer's head arrived.
+    fn status(self) -> Option<u16> {
+        match self {
+            Unanswered::TimedOut | Unanswered::ExchangeFailed => None,
+            Unanswered::Status(status) => Some(status),
+            Unanswered::TooLarge
+            | Unanswered::BrokenOff
+            | Unanswered::NotMcp
+            | Unanswered::RpcError(_)
+            | Unanswered::ToolFailed => Some(200),
+        }
+    }
+
+    /// A JSON-RPC error's code: a number, never its message.
+    fn rpc_code(self) -> Option<i64> {
+        match self {
+            Unanswered::RpcError(code) => Some(code),
+            _ => None,
         }
     }
 }

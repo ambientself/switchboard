@@ -1923,10 +1923,15 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   `idempotency_key_header`, false unless a policy says so, is the declaration the header needs.
   An explicit key that is not valid leaves the call with no key, so a side effect is denied for
   want of one; the call context says so (`CallKey::Invalid`), and the denial's sentence says the
-  key it sent is not valid rather than that it carried none (#204). The core's docs say a side effect's `error` means its connector knows nothing
-  took effect, and the proxy connector reports every outcome of a side effect but a success as
-  `unknown` once its request may have been sent, its server's `4xx`, JSON-RPC errors and failed
-  tool results included, since no approval can yet say a proxied tool's errors are safe.
+  key it sent is not valid rather than that it carried none (#204). The core's docs say a side
+  effect's `error` means its connector knows nothing took effect, and the proxy connector
+  reports every outcome of a side effect but a success as `unknown` once its request may have
+  been sent, its server's `4xx`, JSON-RPC errors and failed tool results included, since no
+  approval can yet say a proxied tool's errors are safe. Each such outcome is logged at `WARN` as `proxied_side_effect_unknown`, naming the connector, the
+  tool, the kind of answer that came in place of a definite one (`status`, `rpc_error`,
+  `tool_failed`, `not_mcp`, `too_large`, `broken_off`, `timed_out` or `exchange_failed`), the
+  HTTP status when an answer's head arrived and a JSON-RPC error's code; never the server's
+  body, a JSON-RPC error's message or a failed tool result's text (#204).
   Receipts in Postgres and the signals for `unknown` receipts are built (#55, part 2; above, and
   #47 below), and so is reconciliation (#55, part 4; below). Not built: resolution records.
 - Reconciliation of `unknown` receipts: built (#55, part 4), up to where a person must settle

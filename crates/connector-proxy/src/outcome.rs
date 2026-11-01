@@ -26,7 +26,8 @@
 //!   `unknown` unless its approval says its errors are safe, and no approval can say so yet.
 //!   So a side effect is an error only when nothing was sent. The caller then reads the core's
 //!   sentence that the call may have happened and must not be repeated, not one of the
-//!   sentences here.
+//!   sentences here. The log says what came in place of an answer, with its HTTP status,
+//!   and never the server's text ([`SIDE_EFFECT_UNKNOWN_EVENT`](crate::SIDE_EFFECT_UNKNOWN_EVENT)).
 //! - [`ToolOutcome::Ok`] with the server's `result` object, unchanged, for anything else.
 //!
 //! A successful result is bounded only by the answer cap; the gateway passes its content and
@@ -34,6 +35,7 @@
 //! server reaches the caller only from a JSON-RPC error's message and from a failed tool
 //! result's text, each cut to [`MAX_MESSAGE_CHARS`] with control characters replaced by spaces.
 
+#[cfg(doc)]
 use gateway_core::{ErrorKind, ToolOutcome};
 use serde_json::{Map, Value};
 
@@ -115,12 +117,24 @@ pub fn rpc_error(code: i64, message: &str) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NotMcp;
 
-/// The outcome of a `200` answer to the request with ID `id`, or [`NotMcp`].
+/// A `200` answer that is one JSON-RPC response to the request: the tool's result, or the
+/// server's failure, which is an error from a read and `unknown` from a side effect.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Answered {
+    /// A tool result not marked `isError`, unchanged: the outcome `ok`.
+    Result(Value),
+    /// A JSON-RPC error: its code, and the sentence a read's error carries.
+    RpcError { code: i64, sentence: String },
+    /// A tool result marked `isError`: the sentence a read's error carries.
+    ToolFailed(String),
+}
+
+/// What a `200` answer to the request with ID `id` is, or [`NotMcp`].
 pub(crate) fn interpret(
     content_type: Option<&str>,
     body: &[u8],
     id: u64,
-) -> Result<ToolOutcome, NotMcp> {
+) -> Result<Answered, NotMcp> {
     if !content_type.is_some_and(is_json) {
         return Err(NotMcp);
     }
@@ -139,9 +153,10 @@ pub(crate) fn interpret(
                 error.get("code").and_then(Value::as_i64),
                 error.get("message").and_then(Value::as_str),
             ) {
-                (Some(code), Some(text)) => {
-                    Ok(ToolOutcome::error(ErrorKind::Other, rpc_error(code, text)))
-                }
+                (Some(code), Some(text)) => Ok(Answered::RpcError {
+                    code,
+                    sentence: rpc_error(code, text),
+                }),
                 _ => Err(NotMcp),
             }
         }
@@ -149,23 +164,23 @@ pub(crate) fn interpret(
     }
 }
 
-fn tool_result(result: &Map<String, Value>) -> Result<ToolOutcome, NotMcp> {
+fn tool_result(result: &Map<String, Value>) -> Result<Answered, NotMcp> {
     let Some(Value::Array(content)) = result.get("content") else {
         return Err(NotMcp);
     };
     if result.get("isError") != Some(&Value::Bool(true)) {
-        return Ok(ToolOutcome::Ok(Value::Object(result.clone())));
+        return Ok(Answered::Result(Value::Object(result.clone())));
     }
     let text: Vec<&str> = content
         .iter()
         .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
         .filter_map(|item| item.get("text").and_then(Value::as_str))
         .collect();
-    Ok(if text.is_empty() {
-        ToolOutcome::error(ErrorKind::Other, TOOL_FAILED)
+    Ok(Answered::ToolFailed(if text.is_empty() {
+        TOOL_FAILED.to_owned()
     } else {
-        ToolOutcome::error(ErrorKind::Other, bounded(&text.join("\n")))
-    })
+        bounded(&text.join("\n"))
+    }))
 }
 
 /// `application/json`, with or without parameters, in any case.
