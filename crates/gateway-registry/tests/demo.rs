@@ -188,7 +188,7 @@ fn call(registry: &Registry, caller: &CallerContext, name: &str, args: Value) ->
             caller: caller.clone(),
             tool: name.into(),
             resources,
-            key: None,
+            key: gateway_core::CallKey::Absent,
             currency: gateway_core::Currency::NotAsked,
         },
     )

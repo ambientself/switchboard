@@ -1079,8 +1079,11 @@ receipt.
   text, is dropped with a warning and leaves the call with no key. It is not passed over for
   the next carrier: a call keyed by its tool-use identifier in place of the key its caller
   chose would lose that key's cover of a replay. A side effect is then denied for want of a
-  key, and its tool-use identifier is still recorded. A `_meta` value of `null` is read as no
-  key sent. A tool-use identifier outside that bound is dropped with a warning too.
+  key, with the reason kind `key_missing` and a sentence of its own: the key the call sent is
+  not valid, what a key is, and that the tool-use identifier is not used in its place; it does
+  not repeat what was sent. Its tool-use identifier is still recorded. A `_meta` value of `null`
+  is read as no key sent. A tool-use identifier outside that bound is dropped with a warning
+  too.
 - **A key is scoped** to the proved principal and, when a delegation is present, to its
   identifying fields. For Otto those are agreed with Otto's owners; the session and the turn
   are recommended, and whether the execution is needed too is asked.
@@ -1917,7 +1920,8 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   first, and records the tool-use identifier beside it (#55; section 11); the profile setting
   `idempotency_key_header`, false unless a policy says so, is the declaration the header needs.
   An explicit key that is not valid leaves the call with no key, so a side effect is denied for
-  want of one. The core's docs say a side effect's `error` means its connector knows nothing
+  want of one; the call context says so (`CallKey::Invalid`), and the denial's sentence says the
+  key it sent is not valid rather than that it carried none (#204). The core's docs say a side effect's `error` means its connector knows nothing
   took effect, and the proxy connector reports every outcome of a side effect but a success as
   `unknown` once its request may have been sent, its server's `4xx`, JSON-RPC errors and failed
   tool results included, since no approval can yet say a proxied tool's errors are safe.

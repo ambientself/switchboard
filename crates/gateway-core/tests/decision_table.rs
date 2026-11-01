@@ -12,11 +12,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use gateway_core::audit::{self, Begun, DecisionKind, MAX_RECORDED_RESOURCES, RequestMetadata};
 use gateway_core::{
-    AuditRecord, CallContext, CallerContext, Claimed, Classification, Currency, CurrencyAnswer,
-    Delegation, DelegationDigest, DelegationFailure, DeploymentName, Egress, IdempotencyKey,
-    Person, PolicySnapshot, PresentedDelegation, Principal, ProfileName, ReasonKind, ReceiptState,
-    RequestedTool, Resource, Resources, SnapshotData, SurfaceName, TeamId, ToolName,
-    UnverifiedDelegation, WasProved, decide, list_tools,
+    AuditRecord, CallContext, CallKey, CallerContext, Claimed, Classification, Currency,
+    CurrencyAnswer, Delegation, DelegationDigest, DelegationFailure, DeploymentName, Egress,
+    IdempotencyKey, Person, PolicySnapshot, PresentedDelegation, Principal, ProfileName,
+    ReasonKind, ReceiptState, RequestedTool, Resource, Resources, SnapshotData, SurfaceName,
+    TeamId, ToolName, UnverifiedDelegation, WasProved, decide, list_tools,
 };
 use serde::Deserialize;
 
@@ -127,6 +127,10 @@ struct Case {
     /// The call's idempotency key. A call of a tool not classified `read` needs one.
     #[serde(default)]
     key: Option<IdempotencyKey>,
+    /// Whether the call sent a key that is not valid, which leaves it with none. Only with no
+    /// `key`.
+    #[serde(default)]
+    key_invalid: bool,
     /// What the control plane answered when asked whether the turn is current. Absent when it
     /// was not asked.
     #[serde(default)]
@@ -460,7 +464,16 @@ fn check_cases(world: &World, cases: &[Case]) -> Vec<String> {
             caller,
             tool: case.tool.clone(),
             resources: case.resources.clone(),
-            key: case.key.clone(),
+            key: if case.key_invalid {
+                assert!(
+                    case.key.is_none(),
+                    "case `{}`: a key and an invalid one",
+                    case.name
+                );
+                CallKey::Invalid
+            } else {
+                case.key.clone().into()
+            },
             currency: case.currency.map_or(Currency::NotAsked, Currency::Asked),
         };
         let decision = decide(snapshot, &call);

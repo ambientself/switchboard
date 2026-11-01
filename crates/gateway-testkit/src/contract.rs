@@ -266,7 +266,7 @@ fn decision_context(fixture: &Fixture, call: &Call) -> CallContext {
             .caller_context(call.caller, call.surface)
             .expect("the fixture knows the caller"),
         tool: RequestedTool::new(call.tool),
-        key: None,
+        key: gateway_core::CallKey::Absent,
         currency: gateway_core::Currency::NotAsked,
     }
 }
@@ -1404,7 +1404,7 @@ pub async fn finish_touches_only_the_completion(contract: &impl ContractStore) {
             .expect("the fixture knows team A"),
         tool: RequestedTool::new(READ_TOOL),
         resources: Resources::Named(named),
-        key: None,
+        key: gateway_core::CallKey::Absent,
         currency: gateway_core::Currency::NotAsked,
     };
     let begun = audit::begin(
@@ -2052,7 +2052,7 @@ fn keyed_decision(
         caller,
         tool: RequestedTool::new(DRAFT_TOOL),
         resources: FixtureConnector::resources_of(DRAFT_TOOL, arguments),
-        key: key.cloned(),
+        key: key.cloned().into(),
         currency: gateway_core::Currency::NotAsked,
     };
     decide(&fixture.policy, &context)

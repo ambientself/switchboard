@@ -44,8 +44,9 @@
 //!   the caller's tool-use identifier. The tool-use identifier is recorded beside an explicit
 //!   key. An explicit key that is not valid, or a declared header sent twice or not as text,
 //!   is dropped with a warning and leaves the call with no key; it is not passed over for the
-//!   next carrier, so a side effect is then denied for want of a key. A key reused
-//!   is answered from the earlier call's receipt, and nothing runs (decision 0009, "Reuse").
+//!   next carrier, so a side effect is then denied for want of a key, with a sentence saying
+//!   the key it sent is not valid. A key reused is answered from the earlier call's receipt,
+//!   and nothing runs (decision 0009, "Reuse").
 //! - While the policy is stale, `tools/list` and `tools/call` from a proved caller are refused
 //!   with [`POLICY_STALE`] before anything is decided, and no row is written: decision 0009
 //!   makes a request that reaches no decision telemetry, and each emits a `policy_stale` event.
@@ -92,10 +93,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use gateway_core::audit::{self, Answer, AuditRowId, Begun, RequestMetadata, RowStart};
 use gateway_core::{
-    ApprovedTool, CallContext, CallerContext, Classification, Connector, Currency, CurrencyAnswer,
-    Decision, DeclaredFrom, IDENTITY_FAILURE, IdempotencyKey, MAX_IDEMPOTENCY_KEY, PolicySnapshot,
-    Principal, Proved, RequestedTool, Resources, Reuse, SurfaceName, ToolUseId, VendorReference,
-    decide, list_tools,
+    ApprovedTool, CallContext, CallKey, CallerContext, Classification, Connector, Currency,
+    CurrencyAnswer, Decision, DeclaredFrom, IDENTITY_FAILURE, IdempotencyKey, MAX_IDEMPOTENCY_KEY,
+    PolicySnapshot, Principal, Proved, RequestedTool, Resources, Reuse, SurfaceName, ToolUseId,
+    VendorReference, decide, list_tools,
 };
 use gateway_identity::{Clock, Verification};
 use gateway_mcp::{
@@ -983,24 +984,23 @@ fn bounded_tool_use_id(value: Option<String>) -> Option<ToolUseId> {
 /// no key, and a call of a tool not classified `read` is then denied by the key check.
 ///
 /// The first explicit carrier present decides. One that holds no valid key leaves the call
-/// with no key, and is not passed over for the next carrier: a call keyed by its tool-use
-/// identifier in place of the key its caller chose would run again when a replayed turn sends
-/// that key with new tool-use identifiers.
+/// with no key, [`CallKey::Invalid`], and is not passed over for the next carrier: a call keyed
+/// by its tool-use identifier in place of the key its caller chose would run again when a
+/// replayed turn sends that key with new tool-use identifiers. A side effect is then denied
+/// with a sentence saying the key it sent is not valid.
 ///
 /// The tool-use identifier is recorded beside an explicit key, on the row and on the receipt,
 /// so the same key sent again with a different tool-use identifier is refused as a key reused
 /// for another call, as a key fixed in configuration would be. That order is also what lets a
 /// key that stays the same across a replayed turn cover it, though the turn's model makes new
 /// tool-use identifiers.
-fn call_key(
-    meta: Explicit,
-    header: Explicit,
-    tool_use_id: Option<&ToolUseId>,
-) -> Option<IdempotencyKey> {
+fn call_key(meta: Explicit, header: Explicit, tool_use_id: Option<&ToolUseId>) -> CallKey {
     match meta.or(header) {
-        Explicit::Valid(key) => Some(key),
-        Explicit::Invalid => None,
-        Explicit::Absent => tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok()),
+        Explicit::Valid(key) => CallKey::Valid(key),
+        Explicit::Invalid => CallKey::Invalid,
+        Explicit::Absent => tool_use_id
+            .and_then(|id| IdempotencyKey::parse(id.as_str()).ok())
+            .into(),
     }
 }
 

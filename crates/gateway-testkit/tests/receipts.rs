@@ -41,7 +41,7 @@ fn propose(
         caller: fixture.team_a_workload(SURFACE_ALL).unwrap(),
         tool: RequestedTool::new(DRAFT_TOOL),
         resources: FixtureConnector::resources_of(DRAFT_TOOL, &arguments),
-        key: Some(key.clone()),
+        key: gateway_core::CallKey::Valid(key.clone()),
         currency: gateway_core::Currency::NotAsked,
     };
     block_on(audit::begin(

@@ -1069,7 +1069,7 @@ fn receipt_request(
     arguments: &serde_json::Value,
     record: &AuditRecord,
 ) -> Result<ReceiptRequest, AuditFailure> {
-    let Some(key) = call.key.clone() else {
+    let Some(key) = call.key.key().cloned() else {
         return Err(AuditFailure::from_store(
             "an allowed call of a tool not classified `read` carried no key, so no receipt can be reserved for it"
                 .into(),
