@@ -817,6 +817,15 @@ mutate("exception-unapproved-tool-loads", "the loader accepts an exception namin
        "                    });\n"
        "                };\n",
        "                let Some(tool) = snapshot.tools.get(name) else {\n                    continue;\n                };\n")
+mutate("exception-names-no-tool-loads", "the loader accepts an exception that names no tool",
+       SRC + "policy.rs",
+       "            let Some(first_tool) = exception.tools.first() else {\n"
+       "                return Err(SnapshotError::ExceptionNamesNoTool {\n"
+       "                    profile: profile_name.clone(),\n"
+       "                    exception: exception_name.clone(),\n"
+       "                });\n"
+       "            };\n",
+       "            let Some(first_tool) = exception.tools.first() else {\n                continue;\n            };\n")
 mutate("exception-duplicate-name-loads", "the loader accepts two exceptions of one profile with one name",
        SRC + "policy.rs", "            if !names.insert(exception_name) {", "            if false && !names.insert(exception_name) {")
 mutate("exception-tool-twice-loads", "the loader accepts one tool in two exceptions of one profile",
