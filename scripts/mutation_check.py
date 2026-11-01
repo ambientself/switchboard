@@ -580,31 +580,38 @@ DECIDE_CHECKED = (
     "        Some(call.currency),\n"
     "        Some(&call.resources),\n"
     "    )\n"
-    "    .and_then(|tool| key_is_carried(tool, call.key.as_ref()).map(|()| tool));\n"
+    "    .and_then(|tool| key_is_carried(tool, &call.key).map(|()| tool));\n"
 )
 mutate("key-check-on-list", "tools/list runs the key check, so a proposal is never listed", SRC + "decision.rs",
        "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None, None).ok())",
-       "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None, None).and_then(|tool| key_is_carried(tool, None).map(|()| tool)).ok())")
+       "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None, None).and_then(|tool| key_is_carried(tool, &CallKey::Absent).map(|()| tool)).ok())")
 mutate("key-check-before-resources", "the key check runs before check 6, so a call outside its limit is asked for a key", SRC + "decision.rs",
        DECIDE_CHECKED,
        "    let checked = check(snapshot, &call.caller, &call.tool, Some(call.currency), None)\n"
-       "        .and_then(|tool| key_is_carried(tool, call.key.as_ref()).map(|()| tool))\n"
+       "        .and_then(|tool| key_is_carried(tool, &call.key).map(|()| tool))\n"
        "        .and_then(|_| check(snapshot, &call.caller, &call.tool, Some(call.currency), Some(&call.resources)));\n")
 mutate("key-check-before-currency", "the key check runs before the currency check, so a turn that is not current is asked for a key",
        SRC + "decision.rs", DECIDE_CHECKED,
        "    let checked = check(snapshot, &call.caller, &call.tool, None, None)\n"
-       "        .and_then(|tool| key_is_carried(tool, call.key.as_ref()).map(|()| tool))\n"
+       "        .and_then(|tool| key_is_carried(tool, &call.key).map(|()| tool))\n"
        "        .and_then(|_| check(snapshot, &call.caller, &call.tool, Some(call.currency), Some(&call.resources)));\n")
 mutate("key-check-first", "the key check runs before every other check, so a denied write is asked for a key", SRC + "decision.rs",
        DECIDE_CHECKED,
        "    let checked = call.tool.name().ok().and_then(|name| snapshot.tool(&name))\n"
-       "        .map_or(Ok(()), |tool| key_is_carried(tool, call.key.as_ref()))\n"
+       "        .map_or(Ok(()), |tool| key_is_carried(tool, &call.key))\n"
        "        .and_then(|()| check(snapshot, &call.caller, &call.tool, Some(call.currency), Some(&call.resources)));\n")
 KEY_CARRIED = "    if tool.classification == Classification::Read || key.is_some() {"
 mutate("key-check-removed", "a side effect with no key is allowed", SRC + "decision.rs",
        KEY_CARRIED, "    if true || tool.classification == Classification::Read || key.is_some() {")
 mutate("key-check-on-reads", "a read needs a key too", SRC + "decision.rs",
        KEY_CARRIED, "    if key.is_some() {")
+# A call that sent a key that is not valid carries none, and its denial says that is why, not
+# that it carried none (#204). The decision table, tests/properties.rs and the gateway's
+# tests/keys.rs catch these.
+mutate("key-invalid-reads-as-missing", "a call whose explicit key is not valid is denied as one that sent none", SRC + "decision.rs",
+       "            invalid: *carried == CallKey::Invalid,\n", "            invalid: false,\n")
+mutate("sentence-key-invalid-as-missing", "the sentence for a key that is not valid is the one for no key", SRC + "sentences.rs",
+       "            if *invalid { KEY_INVALID } else { KEY_MISSING },\n", "            KEY_MISSING,\n")
 mutate("key-bound-short", "a key of 128 characters is refused", SRC + "receipt.rs",
        "            && value.len() <= MAX_IDEMPOTENCY_KEY\n", "            && value.len() < MAX_IDEMPOTENCY_KEY\n")
 mutate("key-with-space-accepted", "a key may hold a space", SRC + "receipt.rs",
@@ -612,28 +619,33 @@ mutate("key-with-space-accepted", "a key may hold a space", SRC + "receipt.rs",
        "            && value.bytes().all(|byte| byte.is_ascii_graphic() || byte == b' ');")
 # The gateway fills the key from the caller's tool-use identifier, its first carrier.
 mutate("gw-key-not-from-tool-use-id", "the tool-use identifier never keys a call, so a proposal that sends only one is denied", "crates/gateway/src/path.rs",
-       "        Explicit::Absent => tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok()),\n",
-       "        Explicit::Absent => tool_use_id.and(None),\n")
+       "        Explicit::Absent => tool_use_id\n            .and_then(|id| IdempotencyKey::parse(id.as_str()).ok())\n",
+       "        Explicit::Absent => tool_use_id\n            .and(None)\n")
 # The other carriers (#55): a key sent on purpose comes first, in the _meta field, or else in
 # the Idempotency-Key header from a profile that declares its callers set it per request; the
 # tool-use identifier is recorded beside it. crates/gateway/tests/keys.rs catches these.
 mutate("gw-key-meta-ignored", "the gateway never reads a key from the switchboard/idempotencyKey _meta field", "crates/gateway/src/path.rs",
        "            meta_key(idempotency_key),", "            meta_key(None),")
 mutate("gw-key-header-from-any-profile", "the Idempotency-Key header keys a call under a profile that does not declare it", "crates/gateway/src/path.rs",
-       "            key_header.honoured(declares_header),", "            key_header.honoured(true || declares_header),")
+       "            || key_header.honoured(declares_header),", "            || key_header.honoured(true || declares_header),")
 mutate("gw-key-tool-use-id-first", "the tool-use identifier is preferred over an explicit key", "crates/gateway/src/path.rs",
-       "    match meta.or(header) {\n        Explicit::Valid(key) => Some(key),\n",
+       "    match meta.or_else(header) {\n        Explicit::Valid(key) => CallKey::Valid(key),\n",
        "    if let Some(key) = tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok()) {\n"
-       "        return Some(key);\n    }\n"
-       "    match meta.or(header) {\n        Explicit::Valid(key) => Some(key),\n")
+       "        return CallKey::Valid(key);\n    }\n"
+       "    match meta.or_else(header) {\n        Explicit::Valid(key) => CallKey::Valid(key),\n")
 # An explicit key that is not valid leaves the call with no key, so a side effect is denied; it
 # is not passed over for the tool-use identifier, which would lose the chosen key's cover of a
 # replayed turn. keys.rs catches this.
 mutate("gw-key-invalid-falls-back", "an explicit key that is not valid is passed over, and the call keyed by its tool-use identifier", "crates/gateway/src/path.rs",
-       "        Explicit::Invalid => None,\n",
-       "        Explicit::Invalid => tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok()),\n")
+       "        Explicit::Invalid => CallKey::Invalid,\n",
+       "        Explicit::Invalid => tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok()).into(),\n")
 mutate("gw-key-invalid-meta-passed-over", "a _meta key that is not valid is passed over for the header", "crates/gateway/src/path.rs",
-       "            Self::Absent => next,\n", "            Self::Absent | Self::Invalid => next,\n")
+       "            Self::Absent => next(),\n", "            Self::Absent | Self::Invalid => next(),\n")
+# The header is read only when the _meta field holds nothing, so a header passed over for a
+# _meta key never logs that the call carries no key (#204). path.rs's own tests catch this.
+mutate("gw-key-header-read-beside-meta", "the Idempotency-Key header is read even when the _meta field holds a key", "crates/gateway/src/path.rs",
+       "    match meta.or_else(header) {\n",
+       "    let header = header();\n    match meta.or_else(|| header) {\n")
 # A _meta key that is not a string is a key that is not valid, not an absent one, so it too
 # leaves the call with no key. keys.rs catches the first, the parse table the second.
 mutate("gw-key-non-string-meta-absent", "a _meta key that is not a string is read as no key sent, and the call keyed by its next carrier", "crates/gateway/src/path.rs",
@@ -3037,6 +3049,12 @@ mutate("gw-bulkhead-before-argument-check", "the caps are taken before the argum
        "                drop(self.inner.run(call));\n"
        "                Box::pin(std::future::ready(outcome))\n"
        "            }\n")
+# A side effect with no definite answer is counted under outcome="unknown", not "error" (#204).
+# bulkhead.rs's and metrics.rs's own tests, and tests/limits.rs, catch these.
+mutate("gw-bulkhead-unknown-as-error", "a proxied call whose outcome is unknown is counted as an error", GW_BULKHEAD,
+       "            ToolOutcome::Unknown => &self.unknown,\n", "            ToolOutcome::Unknown => &self.error,\n")
+mutate("gw-metrics-unknown-not-written", "the proxied calls whose outcome is unknown are not written", GW + "metrics.rs",
+       "            (\"unknown\", counts.unknown),\n", "")
 mutate("gw-shed-not-counted", "a call a server's or a team's cap refused is not counted as shed", GW_BULKHEAD,
        "        counter.fetch_add(1, Ordering::Relaxed);\n        tracing::warn!(\n            event = \"call_shed\",\n",
        "        let _ = counter;\n        tracing::warn!(\n            event = \"call_shed\",\n")
@@ -3470,17 +3488,17 @@ mutate("proxy-deadline-not-applied", "a call is never abandoned", PC,
 # side effect may have been sent, the server's own refusal or failure included, since no approval
 # can yet say a proxied tool's errors are safe; a failure before anything was sent stays an error.
 mutate("proxy-late-read-kind-other", "an oversized or late answer from a read is recorded as other", PC,
-       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence)",
-       "        self.without_answer(ErrorKind::Other, sentence)")
+       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence, unanswered)",
+       "        self.without_answer(ErrorKind::Other, sentence, unanswered)")
 mutate("proxy-late-non-read-kind-late", "an oversized or late answer from a propose tool is recorded as a late read", PC,
        "        let sent = if tool.classification == Classification::Read {",
        "        let sent = if true || tool.classification == Classification::Read {")
 mutate("proxy-late-side-effect-as-error", "a side effect's answer too large, too late or broken off is reported as an error, settling its receipt not_performed", PC,
-       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence)",
-       "        if self == Sent::SideEffect {\n            return ToolOutcome::error(ErrorKind::Other, sentence);\n        }\n"
-       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence)")
+       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence, unanswered)",
+       "        if matches!(self, Sent::SideEffect { .. }) {\n            return ToolOutcome::error(ErrorKind::Other, sentence);\n        }\n"
+       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence, unanswered)")
 mutate("proxy-side-effect-unanswered-as-error", "every failure without a definite answer from a side effect is reported as an error", PC,
-       "            Sent::SideEffect => ToolOutcome::Unknown,", "            Sent::SideEffect => ToolOutcome::error(kind, sentence),")
+       "                ToolOutcome::Unknown\n", "                ToolOutcome::error(kind, sentence)\n")
 mutate("proxy-unconnected-side-effect-unknown", "a side effect whose connection could not be made is reported unknown, though nothing was sent", PC,
        "            } else if error.is_connect() {", "            } else if false && error.is_connect() {")
 mutate("proxy-side-effect-4xx-error", "a side effect the server answered with a 4xx is reported as an error, settling its receipt not_performed", PC,
@@ -3490,10 +3508,26 @@ mutate("proxy-side-effect-4xx-error", "a side effect the server answered with a 
        "        }\n"
        "        if status != StatusCode::OK {\n")
 mutate("proxy-side-effect-401-error", "a side effect the server answered with a 401 is reported as an error, settling its receipt not_performed", PC,
-       "            return Err(sent.without_answer(ErrorKind::Other, outcome::CREDENTIAL_REJECTED));",
+       "            return Err(sent.without_answer(\n                ErrorKind::Other,\n"
+       "                outcome::CREDENTIAL_REJECTED,\n                unanswered,\n            ));",
        "            return Err(ToolOutcome::error(ErrorKind::Other, outcome::CREDENTIAL_REJECTED));")
-mutate("proxy-side-effect-tool-error-not-performed", "a side effect's JSON-RPC error or isError result is reported as an error, settling its receipt not_performed", PC,
-       "                    Ok(ToolOutcome::Error(kind, sentence)) => sent.without_answer(kind, &sentence),\n", "")
+mutate_all("proxy-side-effect-tool-error-not-performed", "a side effect's JSON-RPC error or isError result is reported as an error, settling its receipt not_performed",
+           (PC, "sent.without_answer(ErrorKind::Other, &sentence, Unanswered::RpcError(code))",
+            "ToolOutcome::error(ErrorKind::Other, &sentence)"),
+           (PC, "sent.without_answer(ErrorKind::Other, &sentence, Unanswered::ToolFailed)",
+            "ToolOutcome::error(ErrorKind::Other, &sentence)"))
+# A side effect that becomes unknown is logged with what came in place of an answer and its HTTP
+# status, and never the server's text (#204). tests/unknown_logs.rs catches these.
+mutate("proxy-unknown-not-logged", "a side effect whose outcome becomes unknown is not logged", PC,
+       "                tracing::warn!(\n                    event = SIDE_EFFECT_UNKNOWN_EVENT,\n",
+       "                tracing::trace!(\n                    event = SIDE_EFFECT_UNKNOWN_EVENT,\n")
+mutate("proxy-unknown-logs-body", "the line logged for a side effect's unknown outcome holds the server's text", PC,
+       "                    rpc_code = unanswered.rpc_code(),\n",
+       "                    rpc_code = unanswered.rpc_code(),\n                    sentence,\n")
+mutate("proxy-unknown-status-dropped", "the line logged for a side effect's unknown outcome does not name the HTTP status", PC,
+       "            Unanswered::Status(status) => Some(status),\n", "            Unanswered::Status(_) => None,\n")
+mutate("proxy-unknown-kind-wrong", "a JSON-RPC error is logged as a failed tool result", PC,
+       "            Unanswered::RpcError(_) => \"rpc_error\",\n", "            Unanswered::RpcError(_) => \"tool_failed\",\n")
 mutate("proxy-default-deadline-longer", "the default deadline is 30 s", PC,
        "Duration = Duration::from_secs(5);", "Duration = Duration::from_secs(30);")
 mutate("proxy-default-cap-larger", "the default cap is 1 MiB", PC, "usize = 64 * 1024;", "usize = 1024 * 1024;")
@@ -3508,7 +3542,7 @@ mutate("proxy-declared-length-off-by-one", "a declared length of exactly the cap
        "            .is_some_and(|length| length > self.max_response_bytes as u64)",
        "            .is_some_and(|length| length >= self.max_response_bytes as u64)")
 mutate("proxy-broken-body-read-as-complete", "a body that breaks off is read as if complete", PC,
-       "            let frame = frame.map_err(|_| sent.late(outcome::BROKEN_OFF))?;",
+       "            let frame = frame.map_err(|_| sent.late(outcome::BROKEN_OFF, Unanswered::BrokenOff))?;",
        "            let Ok(frame) = frame else { break };")
 # What is sent, and to whom.
 mutate("proxy-credential-not-sent", "the request carries no credential", PC,
@@ -3536,13 +3570,14 @@ mutate("proxy-401-not-named", "a rejected credential is reported as a bare statu
        "        if status == StatusCode::UNAUTHORIZED {", "        if false {")
 # A 403 is the vendor's refusal (#61): from a read, an error of the kind vendor_refusal, not a
 # connector's refusal; from a side effect, unknown (#55).
-PROXY_403 = "            return Err(sent.without_answer(ErrorKind::VendorRefusal, outcome::UPSTREAM_REFUSED));"
+PROXY_403 = ("            return Err(sent.without_answer(\n                ErrorKind::VendorRefusal,\n"
+             "                outcome::UPSTREAM_REFUSED,\n                unanswered,\n            ));")
 mutate("proxy-403-is-refused", "the server's 403 is recorded as a connector's refusal, not as an error", PC,
        PROXY_403, "            return Err(ToolOutcome::Refused(outcome::UPSTREAM_REFUSED.to_owned()));")
 mutate("proxy-403-kind-other", "the server's 403 is recorded as another error, not a vendor refusal", PC,
        PROXY_403, PROXY_403.replace("ErrorKind::VendorRefusal", "ErrorKind::Other"))
 mutate("proxy-side-effect-403-error", "a side effect the server answered with a 403 is reported as a vendor refusal, settling its receipt not_performed", PC,
-       PROXY_403, PROXY_403.replace("sent.without_answer(", "ToolOutcome::error("))
+       PROXY_403, PROXY_403.replace("sent.without_answer(", "ToolOutcome::error(").replace("                unanswered,\n", ""))
 mutate("proxy-any-status-read", "a body is read whatever the status", PC,
        "        if status != StatusCode::OK {", "        if false {")
 # Reading the answer.
