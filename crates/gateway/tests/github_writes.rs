@@ -730,6 +730,9 @@ fn approving(text: &str, change: impl FnOnce(&mut toml::Table)) -> String {
     toml::to_string(&table).unwrap()
 }
 
+/// A change to an approval.
+type Change = fn(&mut toml::Table);
+
 /// `github__create_pr` approved as a read, which declares no settlement.
 fn as_a_read(approval: &mut toml::Table) {
     approval.insert("classification".into(), "read".into());
@@ -751,7 +754,7 @@ fn unqualified(approval: &mut toml::Table) {
 /// refuses the start, and a reload to either is refused while the policy served keeps serving.
 #[tokio::test]
 async fn an_approval_of_create_pr_declaring_otherwise_is_refused_at_the_start_and_on_a_reload() {
-    let changes: [(fn(&mut toml::Table), &str); 2] = [
+    let changes: [(Change, &str); 2] = [
         (
             as_a_read,
             "is approved as `read`, and its connector classifies it `propose`",

@@ -5,7 +5,7 @@
 //! # The outcome of a write
 //!
 //! A write's outcome turns on whether anything may have been sent (decision 0009, "Outcomes"),
-//! and [`Writes`] keeps that for one call:
+//! and `Writes` keeps that for one call:
 //!
 //! - Everything refused or failed before the call's first write request may have been sent is
 //!   `error` or `refused`, as for a read: an argument error, a refusal, the key custodian's
@@ -19,12 +19,12 @@
 //!   2xx that cannot be read, and any failure of a later request, a later write's definite
 //!   refusal included. Its receipt is `unknown`, for reconciliation to settle by the marker.
 //! - Success is [`ToolOutcome::Completed`] with GitHub's reference, `pull/<n>` for a pull
-//!   request ([`completed`]). A 2xx whose number cannot be read is `unknown`, since something
+//!   request (`completed`). A 2xx whose number cannot be read is `unknown`, since something
 //!   was made. A call whose answer shows it wrote nothing reports [`ToolOutcome::Ok`], with no
 //!   reference.
 //!
 //! GitHub documents no idempotency key for these endpoints, and none is sent. A write is never
-//! sent twice ([`crate::api`]).
+//! sent twice (`crate::api`).
 //!
 //! # The marker
 //!

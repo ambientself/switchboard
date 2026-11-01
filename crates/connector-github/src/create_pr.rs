@@ -6,7 +6,7 @@
 //! Before anything is asked of the key custodian or of GitHub:
 //!
 //! - the tool must be approved `propose`, and its call must carry its receipt
-//!   ([`crate::writes::receipt`]), or nothing is sent: `error`;
+//!   (`writes::receipt`), or nothing is sent: `error`;
 //! - its arguments are parsed into its own types, and a malformed one is `invalid_arguments`:
 //!   an argument the schema does not list; a title that is empty, over [`MAX_TITLE_CHARS`]
 //!   characters or holds a control character; a head or base that is not a git branch name
