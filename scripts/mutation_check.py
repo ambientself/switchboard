@@ -6908,11 +6908,14 @@ mutate("github-cut-comparison-accepted", "a comparison GitHub cut at 300 files i
 mutate("github-write-5xx-reported-error", "a 5xx to a write that may have been applied is an error, settling its receipt not_performed", GHA,
        "        if !status.is_success() {\n            return Wrote::NoDefiniteAnswer;\n        }",
        "        if !status.is_success() {\n            return Wrote::Refused {\n                status,\n                rate_limited: false,\n            };\n        }")
-mutate_all("github-write-broken-off-reported-error", "a write whose answer broke off after its connection was made is an error",
-       (GHA, "            Err(error) => {\n                tracing::warn!(%error, \"a write to GitHub's API got no answer\");\n                return Wrote::NoDefiniteAnswer;\n            }",
-        "            Err(error) => {\n                tracing::warn!(%error, \"a write to GitHub's API got no answer\");\n                return Wrote::NotSent;\n            }"),
-       (GHA, "        else {\n            return Wrote::NoDefiniteAnswer;\n        };",
-        "        else {\n            return Wrote::NotSent;\n        };"))
+mutate("github-write-no-answer-reported-error", "a write whose connection closed with no answer after it was made is an error", GHA,
+       "            Err(error) => {\n                tracing::warn!(%error, \"a write to GitHub's API got no answer\");\n                return Wrote::NoDefiniteAnswer;\n            }",
+       "            Err(error) => {\n                tracing::warn!(%error, \"a write to GitHub's API got no answer\");\n                return Wrote::NotSent;\n            }")
+mutate("github-write-broken-off-reported-error", "a 2xx to a write whose body broke off before it ended is an error", GHA,
+       "        else {\n            return Wrote::NoDefiniteAnswer;\n        };",
+       "        else {\n            return Wrote::NotSent;\n        };")
+mutate("github-write-not-json-reported-error", "a 2xx to a write whose body is not JSON is an error", GHA,
+       "            Err(_) => Wrote::NoDefiniteAnswer,", "            Err(_) => Wrote::NotSent,")
 mutate("github-connect-failure-reported-unknown", "a write that could not connect, so was never sent, is unknown", GHA,
        "            Err(error) if error.is_connect() => {", "            Err(error) if false && error.is_connect() => {")
 mutate("github-create-pr-asks-the-entrys-set", "github__create_pr asks for its entry's whole permission set, not its own", GHW,
