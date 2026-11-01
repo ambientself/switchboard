@@ -5111,7 +5111,8 @@ mutate("pg-check-cascade-partition-copy-judged", "a partitioned table's foreign 
 mutate("pg-check-cascade-partition-copies-refused", "a partition's copy of a foreign key is refused for the partition's owner, which the action does not run as", PG_CHECK,
        "WHERE k.contype = 'f' AND k.conparentid = 0\n", "WHERE k.contype = 'f'\n")
 mutate("pg-check-cascade-references-call-rows-refused", "a cascading foreign key that references call_rows is refused", PG_CHECK,
-       "AND k.conrelid <> ALL($3::oid[]) AND k.confrelid <> $1::oid", "AND k.conrelid <> ALL($3::oid[])")
+       "AND k.conrelid <> ALL($3::oid[]) AND k.confrelid <> $1::oid",
+       "AND k.conrelid <> ALL($3::oid[]) AND $1::oid IS NOT NULL")
 # #203: the routes around the grants that the check follows to call_rows, followed to receipts
 # too: a rule or a foreign key's action on receipts, a view or rule elsewhere that reaches it, a
 # definer function or a cascading table whose owner can change it, and one whose owner owns
