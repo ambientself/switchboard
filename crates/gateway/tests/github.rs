@@ -568,7 +568,13 @@ async fn a_github_entry_with_no_github_table_refuses_the_start() {
     });
     match prepared(deployment).await {
         Err(StartError::NoGitHubSettings(entries)) => {
-            assert_eq!(entries, [ConnectorName::new(ENTRY)]);
+            assert_eq!(
+                entries,
+                [
+                    ConnectorName::new(ENTRY),
+                    ConnectorName::new(github_world::READS_ENTRY)
+                ]
+            );
         }
         other => panic!("{other:?}"),
     }

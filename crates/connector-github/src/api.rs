@@ -8,13 +8,17 @@
 //! A request sends the token in an `Authorization` header marked sensitive. No error this
 //! module returns holds the token or GitHub's answer: [`ApiError`] keeps the status and whether
 //! GitHub said its rate limit was used up, and nothing else of what came back.
+//!
+//! The same client, built for a job log host the deployment pins, downloads a log: with no
+//! token and none of the API's headers, keeping only the end of what it reads. A redirect's
+//! target is handed back to the caller, which decides whether a pinned host serves it.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use http_body_util::{BodyExt, Empty, Limited};
-use hyper::body::Bytes;
-use hyper::header::{ACCEPT, AUTHORIZATION, HeaderValue, USER_AGENT};
+use hyper::body::{Bytes, Incoming};
+use hyper::header::{ACCEPT, AUTHORIZATION, HeaderValue, LOCATION, USER_AGENT};
 use hyper::{Method, Request, StatusCode, Uri};
 use hyper_rustls::{DefaultServerNameResolver, HttpsConnector};
 use hyper_util::client::legacy::Client;
@@ -137,44 +141,124 @@ impl Api {
         })
     }
 
-    /// `GET {base}{path_and_query}` with `token`.
-    pub(crate) async fn get(&self, path_and_query: &str, token: &str) -> Answered {
-        let Ok(mut authorization) = HeaderValue::from_str(&format!("Bearer {token}")) else {
-            return Answered::Unreachable;
-        };
-        authorization.set_sensitive(true);
-        let Ok(request) = Request::builder()
+    /// The base URL: a scheme and an authority, with no path.
+    pub(crate) fn base(&self) -> &str {
+        &self.base
+    }
+
+    /// `GET {base}{path_and_query}`: with `token` and the API's headers, or, with no token, as
+    /// a plain download carrying nothing but the `User-Agent`. The response, or `None` when
+    /// there is none.
+    async fn send(
+        &self,
+        path_and_query: &str,
+        token: Option<&str>,
+    ) -> Option<hyper::Response<Incoming>> {
+        let mut request = Request::builder()
             .method(Method::GET)
             .uri(format!("{}{path_and_query}", self.base))
-            .header(ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", API_VERSION)
-            .header(USER_AGENT, PRODUCT)
-            .header(AUTHORIZATION, authorization)
-            .body(Empty::new())
-        else {
-            return Answered::Unreachable;
-        };
+            .header(USER_AGENT, PRODUCT);
+        if let Some(token) = token {
+            let mut authorization = HeaderValue::from_str(&format!("Bearer {token}")).ok()?;
+            authorization.set_sensitive(true);
+            request = request
+                .header(ACCEPT, "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", API_VERSION)
+                .header(AUTHORIZATION, authorization);
+        }
+        let request = request.body(Empty::new()).ok()?;
         let response = match &self.transport {
             #[cfg(feature = "loopback")]
             Transport::Plain(client) => client.request(request).await,
             Transport::Tls(client) => client.request(request).await,
         };
-        let response = match response {
-            Ok(response) => response,
+        match response {
+            Ok(response) => Some(response),
             Err(error) => {
                 // hyper's error names the connection's failure, never a header.
                 tracing::warn!(%error, "GitHub's API could not be reached");
-                return Answered::Unreachable;
+                None
             }
+        }
+    }
+
+    /// `GET {base}{path_and_query}` with `token`, for a redirect: where it points is returned,
+    /// never followed, and the body of a redirect or a success is not read.
+    pub(crate) async fn get_location(&self, path_and_query: &str, token: &str) -> Located {
+        let Some(response) = self.send(path_and_query, Some(token)).await else {
+            return Located::Answered(Answered::Unreachable);
         };
         let status = response.status();
-        let rate_limited = status == StatusCode::TOO_MANY_REQUESTS
-            || (status == StatusCode::FORBIDDEN
-                && (response
-                    .headers()
-                    .get("x-ratelimit-remaining")
-                    .is_some_and(|remaining| remaining == "0")
-                    || response.headers().contains_key("retry-after")));
+        if status.is_redirection()
+            && let Some(location) = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|location| location.to_str().ok())
+        {
+            return Located::Redirect(location.to_owned());
+        }
+        if status.is_success() {
+            return Located::Direct(status);
+        }
+        Located::Answered(Answered::Status {
+            status,
+            rate_limited: rate_limited(&response),
+        })
+    }
+
+    /// `GET {base}{path_and_query}` with no credential: at most `max_read` bytes of the body
+    /// are read, and the last `keep` of them kept.
+    pub(crate) async fn get_tail(
+        &self,
+        path_and_query: &str,
+        keep: usize,
+        max_read: usize,
+    ) -> Tail {
+        let Some(response) = self.send(path_and_query, None).await else {
+            return Tail::Unreachable;
+        };
+        let status = response.status();
+        if !status.is_success() {
+            return Tail::Status(status);
+        }
+        let mut body = response.into_body();
+        let mut kept: Vec<u8> = Vec::new();
+        let mut read = 0;
+        let mut stopped = false;
+        while let Some(frame) = body.frame().await {
+            let Ok(frame) = frame else {
+                return Tail::Unreachable;
+            };
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            read += data.len();
+            kept.extend_from_slice(&data);
+            if kept.len() > 2 * keep {
+                kept.drain(..kept.len() - keep);
+            }
+            if read >= max_read {
+                stopped = true;
+                break;
+            }
+        }
+        if kept.len() > keep {
+            kept.drain(..kept.len() - keep);
+        }
+        Tail::Text {
+            cut: read > kept.len(),
+            tail: kept,
+            stopped,
+        }
+    }
+
+    /// `GET {base}{path_and_query}` with `token`.
+    pub(crate) async fn get(&self, path_and_query: &str, token: &str) -> Answered {
+        let Some(response) = self.send(path_and_query, Some(token)).await else {
+            return Answered::Unreachable;
+        };
+        let status = response.status();
+        let rate_limited = rate_limited(&response);
         let Ok(body) = Limited::new(response.into_body(), MAX_ANSWER_BYTES)
             .collect()
             .await
@@ -192,6 +276,47 @@ impl Api {
             Err(_) => Answered::Unreadable,
         }
     }
+}
+
+/// Whether GitHub's answer says its rate limit is used up.
+fn rate_limited<B>(response: &hyper::Response<B>) -> bool {
+    let status = response.status();
+    status == StatusCode::TOO_MANY_REQUESTS
+        || (status == StatusCode::FORBIDDEN
+            && (response
+                .headers()
+                .get("x-ratelimit-remaining")
+                .is_some_and(|remaining| remaining == "0")
+                || response.headers().contains_key("retry-after")))
+}
+
+/// What came of a request whose answer should be a redirect.
+#[derive(Debug)]
+pub(crate) enum Located {
+    /// A redirect, and where it points: not followed.
+    Redirect(String),
+    /// A success, whose body was not read.
+    Direct(StatusCode),
+    /// Any other answer, or none.
+    Answered(Answered),
+}
+
+/// What came of a download with no credential.
+#[derive(Debug)]
+pub(crate) enum Tail {
+    /// The end of the body.
+    Text {
+        /// The last bytes read, at most the `keep` asked for.
+        tail: Vec<u8>,
+        /// Whether more was read than is kept.
+        cut: bool,
+        /// Whether reading stopped at `max_read`, before the body ended.
+        stopped: bool,
+    },
+    /// An answer that is not a success.
+    Status(StatusCode),
+    /// No answer, or one that could not be read in full.
+    Unreachable,
 }
 
 /// The legacy client, which follows no redirect and reads no proxy setting from the
