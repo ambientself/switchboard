@@ -348,11 +348,11 @@ async fn command_text_and_the_markers_text_are_refused_before_any_request() {
     for (at, (changes, said)) in [
         (
             json!({"title": "atlantis apply"}),
-            "the title begins with \"atlantis\"",
+            "the title begins with a word Atlantis would read as a command",
         ),
         (
             json!({"body": "  Atlantis plan -p prod"}),
-            "the body begins with \"atlantis\"",
+            "the body begins with a word Atlantis would read as a command",
         ),
         (
             json!({"body": "Done.\n<!-- Switchboard-Receipt: 0190f5a2 -->"}),

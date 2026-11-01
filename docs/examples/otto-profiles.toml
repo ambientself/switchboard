@@ -6,8 +6,9 @@
 # grant, and a side effect allowed only while Otto's resolver says the turn is current
 # (decision 0012, "Currency"). Decision 0011's exception for Otto's two comment tools belongs in
 # this profile, and in no other. The mechanism is built, but the exception is not in force until
-# the security owner signs its entry in docs/route-exceptions.md, and this gateway serves neither
-# tool yet, so the list is shown only as a comment. Once in force it would read:
+# the security owner signs its entry in docs/route-exceptions.md, so the list is shown only as a
+# comment; github__pr_comment is built and served only where a profile lists it, which only the
+# tests' registries do, and jira__comment is not built. Once in force it would read:
 #
 #   exceptions = [{ name = "otto-comment-tools", tools = ["github__pr_comment", "jira__comment"] }]
 #

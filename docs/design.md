@@ -467,8 +467,9 @@ gets no exception, because it can edit other people's comments. The core's mecha
 profile's own list of excepted tools, and an allowed call records the exception that allowed it
 in a field of its own, not as a reason. The list names tools, never a classification. The
 exception comes into force only once the security owner has signed its entry. Until then no
-policy the project deploys lists it, this gateway serves neither tool, and Otto's callers are
-denied both, which loses parity with Otto's gateway.
+policy the project deploys lists it, and Otto's callers are denied both, which loses parity with
+Otto's gateway. `github__pr_comment` is built (section 13) and served only where a profile's own
+list names it, which only test registries do; `jira__comment` is not built.
 
 **Profile rules, per caller type.** Classification, proved versus claimed identity, the denial
 contract, audit before execution or ordinary denial, and fail-closed enforcement apply to all
@@ -1297,9 +1298,9 @@ receipt.
 The gateway refuses any snapshot that serves a tool not classified `read` unless the audit
 store is the Postgres store, which keeps receipts, audit is on and identity is on (section 12).
 The snapshot loader's rule 2 refuses every proxied tool not classified `read` (decision 0011),
-but the GitHub connector now serves a `propose` tool, `github__create_pr` (section 13), so a
-release build with a registry that approves it reaches this gate, and it is the gate that
-refuses such a registry without the Postgres store. No deployment, demo or example registry
+but the GitHub connector now serves a `propose` tool, `github__create_pr`, and a `write` tool,
+`github__pr_comment` (section 13), so a release build with a registry that approves either
+reaches this gate, and it is the gate that refuses such a registry without the Postgres store. No deployment, demo or example registry
 in this repository has a GitHub entry that writes: the first side effect to reach a real system
 waits until someone is named to settle a receipt by hand and a way to record that exists
 (decision 0009, Still open 9 and 10).
@@ -1690,8 +1691,9 @@ records an empty list. GitHub's 422, a query it cannot run, is `invalid_argument
 runs only under an entry narrowed to the caller's limit, as the loader requires of a tool that
 checks its own scope, and a caller whose limit holds no repository of the organization is
 refused before any request. The proposal tools after `github__create_pr`, Jira,
-`otto__declare_unverified_claim`, `github__skill_body` and the comment tools are not built.
-The core's exception mechanism for them is built (section 8), and lists no tool.
+`otto__declare_unverified_claim`, `github__skill_body` and `jira__comment` are not built.
+`github__pr_comment` is (below), and the core's exception mechanism that lets it past check 5
+(section 8) is listed by no shipped registry.
 
 **The first write tool, `github__create_pr`,** opens a draft pull request from one branch into
 another of a repository of the organization (#12). It is `propose`: the connector states it so,
@@ -1714,8 +1716,9 @@ refuses to be built, naming the entry. Before anything is asked of the custodian
   bytes at most); or a body that with the marker line is over 65,536 characters, GitHub's own
   bound, which the schema keeps the caller's body within by allowing it 65,000;
 - an owner other than the organization is `refused` with Otto's sentence; so is a title or body
-  whose first word, after any leading whitespace, is `atlantis` in any case, which Atlantis
-  would read as a command (Otto's comment rule, applied to a proposal's text); and so is a
+  that Atlantis would read as a command, by the shared command-text guard below (a first word
+  of `atlantis`, `@atlantis` or `/atlantis` in any case, past leading whitespace and format
+  characters; broader than Otto's comment rule, applied to a proposal's text); and so is a
   title or body that holds `switchboard-receipt` in any case, the marker's text.
 
 Then one token is asked for, narrowed to the call's one repository with the tool's own set,
@@ -1756,14 +1759,50 @@ The write machinery is shared by every GitHub write tool (`crates/connector-gith
 - **The marker.** One line the connector controls, `<!-- switchboard-receipt: <receipt> -->`,
   the receipt being the call's audit row. A caller cannot write it: text holding its prefix is
   refused, as above.
-- **The guards.** One predicate for command text, shared with the comment tools when they come;
-  and one for refused paths, Otto's four groups with Otto's sentences, in any case: a file named
+- **The guards.** One predicate for command text, shared by every write tool: a text whose
+  first word is `atlantis`, `@atlantis` or `/atlantis` (the bot list, a constant in the
+  connector), in any case, after any leading whitespace or Unicode format character (a
+  zero-width space or joiner, a byte order mark, a direction mark), with any format character
+  inside the word passed over. That is broader than Otto's rule, a first word of `atlantis`.
+  And one for refused paths, Otto's four groups with Otto's sentences, in any case: a file named
   `AGENTS.md` in any directory and any path with a `.agents` segment, the instruction-authority
   group; any path under `.github/workflows/` and a file named `atlantis.yaml` or `atlantis.yml`
   anywhere, the automation group. `.github`, `.github/workflows` and `.agents` themselves are
   refused too, since a file there would replace the directory. `.github/actions/` and other CI
   files are not in either group. `github__create_pr` applies the automation group to its
   comparison; the proposal tools with files apply both to the files they write.
+
+**The comment tool, `github__pr_comment`,** comments on a pull request in a repository of the
+organization (#12). It is `write`: the connector states it so, declared from `owner` and `repo`,
+and its approval declares `settlement = { lookup = { system = "github", kind = "repository" } }`.
+Decision 0006 permits no `write` tool, so check 5 lets it pass only under a profile whose own
+list of exceptions names it, a profile that requires currency (section 8): it is asked about
+once a call and allowed only while the turn is current, and its row records the exception.
+Only test registries list the exception; it is not in force until its register entry is
+signed. An entry that serves it must be narrowed `call` and state `pull_requests: write`. Its
+schema's `required` is Otto's, `owner`, `repo` and `body` (`conformance/baseline.json` pins it),
+and the connector checks the rest. Before anything is asked of the custodian or of GitHub:
+
+- the tool must be approved `write` and its call must carry its receipt, or nothing is sent and
+  the call is an `error`;
+- its arguments parse, or the call is `invalid_arguments`: an argument the schema does not list,
+  a missing number or one below 1, a missing or empty body, or a body that with the marker line
+  is over 65,536 characters, which the schema keeps within by allowing the caller's 65,000;
+- an owner other than the organization is `refused` with Otto's sentence; a body the
+  command-text predicate above holds is `refused` with a sentence naming Atlantis; and so is a
+  body that holds `switchboard-receipt` in any case.
+
+Then one token is asked for, narrowed to the call's one repository, with `pull_requests: write`
+alone and the call's revision. With it the connector reads the pull request,
+`GET /repos/{owner}/{repo}/pulls/{number}`, and any answer but the pull request is `error`, with
+nothing posted: a number that is an issue or nothing is a 404. The write is
+`POST /repos/{owner}/{repo}/issues/{number}/comments`, the body the caller's, a blank line, and
+the marker line: appended, never first, so what Atlantis reads is the caller's first word. It is
+sent once; its outcome follows the rule above: a definite refusal (403 `vendor_refusal`, any
+other 4xx `other`) is `error`, and a 5xx, an exchange broken off or late, or a 201 without the
+comment's id is `unknown`. The result is `{comment: {id, url}, provenance}`, the provenance
+naming `write`, tagged as external evidence; the receipt records `comment/<id>`. The tool only
+posts: editing a comment needs decision 0011, section 6's check that the gateway made it.
 
 **The lookup by marker** settles an `unknown` receipt of a GitHub write (section 11). It is not
 a tool call: it writes no row and only reads. It asks the custodian for a token for the team
@@ -1776,7 +1815,13 @@ chose. Nothing found is `not_found`, never authoritative, since GitHub does not 
 list as complete and current and a pull request may sit past the pages read; so a lookup never
 settles a receipt `not_performed`. A receipt with no team, a target that is not one repository
 of the organization, a custodian refusal and any error or unreadable answer are `failed`. The
-gateway registers the lookup for each GitHub entry that serves a write.
+gateway registers the lookup for each GitHub entry that serves a write. A receipt of
+`github__pr_comment` is looked for among the repository's comments, with the same token:
+`GET /repos/{owner}/{repo}/issues/comments?since=…&sort=created&direction=asc&per_page=100`, at
+most ten pages, `since` being when the receipt was reserved, which its UUIDv7 carries, less ten
+minutes. The first comment whose body has a line exactly equal to the marker is found, with
+`comment/<id>`; nothing found is `not_found`, never authoritative; a receipt that is not a
+UUIDv7 is `failed`.
 
 The deliberate differences from Otto's `github_create_pr`: the comparison's refusal of
 automation files, which Otto does not make, and which a push to the head between the
@@ -1788,6 +1833,12 @@ needs a key and the suite sends none, so its `github_create_pr` calls are denied
 one; this gateway's sentences name `github__…` tools; the Go fake has no compare endpoint, and
 its `github_create_pr` cases name heads that do not exist; the body ends with a marker line;
 and the provenance says `propose`, which the Otto adapter maps to `write`.
+
+The deliberate differences from Otto's `github_pr_comment`: it is served only under the
+exception; a call needs a key, and a repeated key is answered `duplicate` from its receipt,
+never posted twice; the marker line is appended to the comment; a number that is not a pull
+request is `error` with nothing posted; the Atlantis refusal is broader than Otto's (`@atlantis`,
+`/atlantis` and format characters); and unlisted arguments are `invalid_arguments`.
 
 No deployment, demo or example registry has a GitHub entry that writes. A real side effect
 waits for decision 0009's Still open 9 and 10: who settles a receipt by hand, and how that is
@@ -2661,8 +2712,9 @@ cases for each comment tool, allowed under a profile that requires currency and 
 other profile, at the currency check, check 6, check 4 and the key check, and one showing
 `addOrEditJiraIssueComment` denied; and the mutations `check-5-removed` and
 `exception-list-ignored`, which removes the exception-list check, with the rest in
-`scripts/mutation_check.py`. Not built: serving `github__pr_comment` and `jira__comment`, and
-listing their exception in any deployed policy, which waits on the security owner's signature
+`scripts/mutation_check.py`. `github__pr_comment` is built (the write tools' entry below) and
+served only by test registries. Not built: `jira__comment`, and listing the exception in any
+deployed policy, which waits on the security owner's signature
 ([route-exceptions.md](route-exceptions.md)).
 
 - Built, as the crate `key-custodian`: the key custodian and its client (section 9). Its tests
@@ -2696,9 +2748,8 @@ listing their exception in any deployed policy, which waits on the security owne
   each vendor error; no token in an answer, a row or a log line; the in-process bound, late
   and oversized; the team's rate quota, from the wiring and from the deployment file; each
   start refusal; and a reload that changes an entry. Not built: the write tools but
-  `github__create_pr` (the entry below), Jira, the comment tools (the core's exception
-  mechanism is, under #12's list below), and any deployment of a GitHub entry, which needs a
-  real App. Left as they are: GitHub names are compared case-sensitively, so a call that
+  `github__create_pr` and `github__pr_comment` (the entry below), Jira, `jira__comment`, and
+  any deployment of a GitHub entry, which needs a real App. Left as they are: GitHub names are compared case-sensitively, so a call that
   writes an owner or a repository in another case than its limit does is denied; and each
   GitHub entry has quota buckets of its own, not GitHub as a whole.
 
@@ -2760,12 +2811,31 @@ listing their exception in any deployed policy, which waits on the security owne
   repeated call a `duplicate`; a write that cannot connect `error`; an approval declaring
   otherwise refused at the start and on a reload; and the receipt-store gate and the pod gate,
   each reached from a registry with this tool. Not built: the proposal tools that write files
-  and amend a proposal, the comment tools, and the connector's own statement of a tool's
+  and amend a proposal, `jira__comment`, and the connector's own statement of a tool's
   settlement, which its statement has no place for. Left as they are: a push to the head
   between the comparison and the pull request's creation is not caught; a lookup does not check
   who opened the pull request it finds; no log capture checks a write's token, which the reads'
   log test covers for the shared client; and no deployment, demo or example registry has an
   entry that writes.
+
+- Built: `github__pr_comment` (section 13), served only under a profile whose own exception
+  names it, and the command-text predicate made broader for every write: `@atlantis`,
+  `/atlantis`, and format characters before or inside the word. Its tests
+  (`crates/gateway/tests/github_comment.rs`) run over HTTP with a test minter's turn grants
+  and Otto's fake resolver, against the fake GitHub API, which posts comments on pull requests
+  and lists a repository's comments: a current turn's comment posted once, its body ending
+  with the marker, on one token for the call's repository with `pull_requests: write` alone,
+  its row naming the exception and its receipt `completed` with `comment/<id>`; denied at
+  check 5 without the exception, and at the currency check for each answer but `current` and
+  for none; another organization, each Atlantis form, the marker's text and each malformed
+  argument refused or `invalid_arguments` before any token; a repository outside the limit
+  denied at check 6; no pull request, and a post GitHub refused, `error`; a 500 with or without
+  the comment made, a post broken off, and a late post `unknown`, each posted once; a repeated
+  key a `duplicate`; and one reconciliation pass settling the comments made by the marker,
+  among another person's, and handing the one not made to a person. Left as they are: the
+  currency question is asked of the comment tool, as of any tool that is not a read, before
+  check 5 denies it under a profile whose list does not name it; the lookup does not check who
+  wrote the comment it finds; and no log capture checks the comment's token.
 
 **#12, the bound around in-process connectors and the rate quotas** (decision 0014, sections 1
 and 2). Built before any built-in connector, so the first one is bounded from its first call:
@@ -3034,8 +3104,13 @@ Otto promises. These findings inform Q9–Q13; they are not silent changes to th
   through that mapping, like the tool-name mapping. They are not expected differences.
 - **The comment tools are an expected difference.** Under section 8 the Rust gateway denies
   `github_pr_comment` and `jira_comment` to Otto's callers, so the suite's cases that use them
-  cannot pass against it until the exception in decision 0011 is in force: built (#12) and
-  its register entry signed. They are:
+  cannot pass against it until the exception in decision 0011 is in force: built (#12;
+  `github__pr_comment` is, `jira__comment` is not) and its register entry signed. Once it is,
+  `github__pr_comment` still differs from Otto's as section 13 lists: served only under the
+  exception; a repeated key answered `duplicate`, never written twice, so
+  `TestRepeatedCommentIsWrittenTwice` stays an expected difference; the marker line appended
+  to the comment; a number that is not a pull request `error`; and an Atlantis refusal broader
+  than Otto's. The cases are:
   - the tool inventory, which requires both to be served;
   - `TestOriginalToolsAndBrokeredCredentials`, which calls `github_pr_comment` as an allowed
     call, checks its confirmation, and requires exactly two writes, the comment's among them;

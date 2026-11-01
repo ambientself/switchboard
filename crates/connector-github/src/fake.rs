@@ -32,8 +32,9 @@
 //! careless vendor might, so a test can show that nothing the caller reads holds it.
 //!
 //! For the write tools it opens pull requests, lists them, and answers comparisons, and a write
-//! can be given a fault of its own ([`Fault`]); see `writes`. It records each request's body
-//! beside its token.
+//! can be given a fault of its own ([`Fault`]); see `writes`. It posts comments on pull requests
+//! and lists a repository's comments, for the comment tool and its lookup; see `comments`. It
+//! records each request's body beside its token.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -52,6 +53,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+mod comments;
 mod reads;
 mod writes;
 
@@ -105,6 +107,7 @@ struct Shared {
     content: Mutex<Content>,
     reads: Mutex<reads::Content>,
     writes: Mutex<writes::Content>,
+    comments: Mutex<comments::Content>,
     /// Whether to stop taking connections once the next comparison is answered.
     close_after_compare: AtomicBool,
     /// Stops the server taking connections.
@@ -139,6 +142,7 @@ impl FakeRest {
             content: Mutex::new(Content::default()),
             reads: Mutex::new(reads::Content::default()),
             writes: Mutex::new(writes::Content::default()),
+            comments: Mutex::new(comments::Content::default()),
             close_after_compare: AtomicBool::new(false),
             close: Notify::new(),
         });
@@ -368,6 +372,12 @@ async fn answer(
             token.as_deref(),
         );
     };
+    // The comment tool's endpoints and its lookup's (`comments`).
+    if let Some(response) =
+        comments::answer(&shared, &issued, &method, &uri, token.as_deref(), &body).await
+    {
+        return response;
+    }
     // The endpoints of the write tools and the lookup (`writes`).
     if let Some(response) =
         writes::answer(&shared, &issued, &method, &uri, token.as_deref(), &body).await

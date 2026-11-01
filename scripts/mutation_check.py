@@ -7259,6 +7259,49 @@ mutate("github-lookup-marker-substring", "a lookup finds the marker anywhere in 
 mutate("github-lookup-entry-set", "a lookup's token asks for the write entry's whole set, not pull_requests: read", GHL,
        "            permissions: BTreeMap::from([(LOOKUP_PERMISSION.to_owned(), Access::Read)]),",
        '            permissions: BTreeMap::from([("contents".to_owned(), Access::Write), (LOOKUP_PERMISSION.to_owned(), Access::Write)]),')
+# github__pr_comment (#12): the shared command-text guard it refuses Atlantis commands with, its
+# own refusals before any request, the pull request check, its token, one post only, and the
+# lookup of its comment by the marker. crates/gateway/tests/github_comment.rs and writes.rs's and
+# pr_comment.rs's own tests catch these.
+GHM = GH + "pr_comment.rs"
+GHG = GH + "writes.rs"
+mutate("github-comment-command-text-guard-removed", "a comment Atlantis would read as a command is posted", GHM,
+       "        if writes::command_text(&parsed.body) {", "        if false && writes::command_text(&parsed.body) {")
+mutate("github-command-text-case-sensitive", "an Atlantis command in another case, such as `Atlantis apply`, is not command text", GHG,
+       "        .any(|command| word.eq_ignore_ascii_case(command))", "        .any(|command| word == *command)")
+mutate("github-command-text-not-trimmed", "an Atlantis command after leading whitespace is not command text", GHG,
+       "    let start = text.trim_start_matches(|c: char| c.is_whitespace() || format_character(c));",
+       "    let start = text;")
+mutate("github-command-text-format-characters-kept", "an Atlantis command after a zero-width space is not command text", GHG,
+       "    let start = text.trim_start_matches(|c: char| c.is_whitespace() || format_character(c));",
+       "    let start = text.trim_start_matches(char::is_whitespace);")
+mutate("github-command-text-mention-and-slash-accepted", "`@atlantis` and `/atlantis` are not command text", GHG,
+       'pub const ATLANTIS_COMMANDS: &[&str] = &["atlantis", "@atlantis", "/atlantis"];',
+       'pub const ATLANTIS_COMMANDS: &[&str] = &["atlantis"];')
+mutate("github-comment-organization-check-removed", "a comment naming another organization is sent", GHM,
+       "        if parsed.owner != self.organization() {", "        if false {")
+mutate("github-comment-callers-marker-accepted", "a comment holding the marker's text is posted", GHM,
+       "        if writes::holds_marker(&parsed.body) {", "        if false && writes::holds_marker(&parsed.body) {")
+mutate("github-comment-marker-not-attached", "a comment is posted without the receipt's marker line", GHM,
+       '    let sent = format!("{body}\\n\\n{marker}");', "    let sent = body.to_owned();")
+mutate("github-comment-token-for-the-limit", "a comment's token is asked for every repository of the caller's limit, not the call's one", GHM,
+       "            repositories: vec![repository.clone()],",
+       '            repositories: ["atlas", "borealis"].iter().map(|repo| format!("{}/{repo}", parsed.owner)).collect(),')
+mutate("github-comment-extra-permission", "a comment's token is asked for issues: write beside pull_requests: write", GHM,
+       "            permissions: PERMISSIONS\n                .iter()\n                .map(|(permission, access)| ((*permission).to_owned(), *access))\n                .collect(),",
+       '            permissions: [("issues".to_owned(), Access::Write), ("pull_requests".to_owned(), Access::Write)].into_iter().collect(),')
+mutate("github-comment-pull-request-check-removed", "a comment is posted on a number GitHub does not answer as a pull request", GHM,
+       "        match self.api().get(&pull, token.expose()).await {\n            Answered::Json(_) => {}\n            other => return pull_failed(other, &parsed),\n        }\n",
+       "        let _ = (&pull, pull_failed as fn(Answered, &PrComment) -> ToolOutcome);\n")
+mutate("github-comment-posted-again", "a comment whose post failed is posted a second time", GHM,
+       "            Ok(posted) => posted,\n            Err(outcome) => return outcome,\n        };",
+       "            Ok(posted) => posted,\n            Err(_) => match writes.send(self.api(), WriteMethod::Post, &format!(\"{base}/issues/{}/comments\", parsed.number), &NewComment { body: &body }, token.expose(), \"the comment\").await {\n                Ok(posted) => posted,\n                Err(outcome) => return outcome,\n            },\n        };")
+mutate("github-comment-lookup-authoritative", "a comment lookup that finds nothing says so authoritatively, settling a receipt not_performed", GHM,
+       "        LookupAnswer::NotFound {\n            authoritative: false,\n        }",
+       "        LookupAnswer::NotFound {\n            authoritative: true,\n        }")
+mutate("github-comment-lookup-marker-ignored", "a comment lookup takes the first comment it reads, marked or not", GHM,
+       "                .find(|comment| crate::lookup::marked(comment, &marker))",
+       "                .find(|_| !marker.is_empty())")
 
 # --- Which tests can see a mutation ----------------------------------------------------------
 #
