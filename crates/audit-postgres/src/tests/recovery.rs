@@ -2,6 +2,7 @@
 //! budget, and a row that a failed begin may have written is completed as `error` on the
 //! finish pool.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -230,11 +231,25 @@ async fn begin_as(
     audit::begin(store, start, decision, call.arguments, call.metadata).await
 }
 
-/// Begins `call` under a new row, and checks that begin wrote it. The begin connection is
-/// then open, and has prepared the insert, so a later begin on it sends only the insert,
-/// whose answer comes after its commit.
+/// The begin budget a warm-up begin has, in place of the short one a test sets for the begin
+/// it tries: under heavy local load, a warm-up held to a 300 ms budget has failed (#203).
+const WARM_UP_BUDGET: Duration = Duration::from_secs(10);
+
+/// Awaits `warm`, a begin that warms the store's begin pool up, with the begin budget
+/// [`WARM_UP_BUDGET`], and gives the store back the test's own budget after.
+async fn with_warm_up_budget<T>(store: &PgAuditStore, warm: impl Future<Output = T>) -> T {
+    let micros = u64::try_from(WARM_UP_BUDGET.as_micros()).unwrap();
+    store.warm_up_budget_micros.store(micros, Ordering::SeqCst);
+    let warmed = warm.await;
+    store.warm_up_budget_micros.store(0, Ordering::SeqCst);
+    warmed
+}
+
+/// Begins `call` under a new row, with [`WARM_UP_BUDGET`], and checks that begin wrote it. The
+/// begin connection is then open, and has prepared the insert, so a later begin on it sends
+/// only the insert, whose answer comes after its commit.
 async fn warm_up(store: &PgAuditStore, fixture: &Fixture, call: Call) {
-    let _ = begin_as(store, fixture, &row_start().row, call)
+    let _ = with_warm_up_budget(store, begin_as(store, fixture, &row_start().row, call))
         .await
         .unwrap();
 }
@@ -981,7 +996,11 @@ async fn a_receipt_that_commits_between_an_attempts_read_and_its_update_is_settl
     let admin = db.admin().await;
     // The begin connection has the statements of a begin with a receipt prepared, and the
     // finish connection is open.
-    let warmed = begin_with_receipt(&store, &fixture, &row_start(), "Warm up.", &fresh_key()).await;
+    let warmed = with_warm_up_budget(
+        &store,
+        begin_with_receipt(&store, &fixture, &row_start(), "Warm up.", &fresh_key()),
+    )
+    .await;
     assert!(matches!(warmed, Ok(Begun::Allowed(_))), "{warmed:?}");
     drop(store.finish.get().await.unwrap());
     let lock = hold_commits(&db).await;

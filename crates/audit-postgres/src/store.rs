@@ -825,6 +825,11 @@ pub struct PgAuditStore {
     /// contract suite's runner tells it to.
     #[cfg(test)]
     pub(crate) lose_confirmations: AtomicBool,
+    /// A begin budget, in microseconds, in place of [`Budgets::begin`] while it is not zero: a
+    /// test's own for the begins it makes to warm the begin pool up, so that a warm-up under
+    /// heavy load is not held to the short budget the test sets for the begin it tries (#203).
+    #[cfg(test)]
+    pub(crate) warm_up_budget_micros: AtomicU64,
 }
 
 impl PgAuditStore {
@@ -884,6 +889,8 @@ impl PgAuditStore {
             disagreed: Arc::new(|_| {}),
             #[cfg(test)]
             lose_confirmations: AtomicBool::new(false),
+            #[cfg(test)]
+            warm_up_budget_micros: AtomicU64::new(0),
         })
     }
 
@@ -1044,12 +1051,27 @@ impl PgAuditStore {
         None
     }
 
+    /// The begin budget: [`Budgets::begin`], or, in the crate's own tests, the warm-up's own
+    /// while a test has set one.
+    #[cfg(test)]
+    fn begin_budget(&self) -> Duration {
+        match self.warm_up_budget_micros.load(Ordering::SeqCst) {
+            0 => self.budgets.begin,
+            micros => Duration::from_micros(micros),
+        }
+    }
+
+    #[cfg(not(test))]
+    fn begin_budget(&self) -> Duration {
+        self.budgets.begin
+    }
+
     /// Writes a call row's first half, with a receipt or the answer to its key or without
     /// either, or a list row, within the begin budget, on the begin pool, trying again by
     /// identifier while the failure is one that trying again could fix. What a begin with a
     /// receipt did is returned; for any other, `None`.
     async fn insert(&self, row: Insert) -> Result<Option<Reservation>, InsertFailed> {
-        let deadline = Instant::now() + self.budgets.begin;
+        let deadline = Instant::now() + self.begin_budget();
         // Whether an attempt executed its insert and ended without an answer, or with an error
         // trying again could fix, so that the row may exist. That error may be an explicit
         // refusal, such as a read-only server's. Once set it stays set: what a later attempt
@@ -1116,7 +1138,7 @@ impl PgAuditStore {
         sent: &mut bool,
         connected: &mut bool,
     ) -> Result<Option<Reservation>, PgAuditError> {
-        let budget = self.budgets.begin;
+        let budget = self.begin_budget();
         let mut client = timeout_at(deadline, self.begin.get())
             .await
             .map_err(|_| PgAuditError::BeginBudget { budget })??;
