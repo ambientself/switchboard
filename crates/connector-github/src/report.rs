@@ -10,9 +10,9 @@
 //! repositories, so for the whole installation, and for `metadata: read` alone, the permission
 //! every GitHub token carries and the least that lists the repositories. The custodian gives it
 //! only to a tool served by an entry the registry declares `reports_reach = true`, and the
-//! registry holds such an entry to that job: narrowed `none`, `read`, served only to named
-//! principals (the registry's own, on `registry-reach`). The connector serves this tool only on
-//! such an entry, and serves no other tool on one.
+//! registry holds such an entry to that job: narrowed `none`, `read`, served only on
+//! `registry-reach`, to one named principal, the registry's own identity. The connector serves
+//! this tool only on such an entry, and serves no other tool on one ([`crate::served`]).
 //!
 //! It takes no arguments. It reads every page, [`PER_PAGE`] repositories a page, up to
 //! [`MAX_REPORT_PAGES`]. An installation on more repositories than that is an error, never a
@@ -24,7 +24,8 @@
 
 use std::collections::BTreeSet;
 
-use gateway_core::{ErrorKind, ToolOutcome};
+use gateway_core::{Classification, ErrorKind, ToolOutcome};
+use gateway_registry::{Assurance, StatedResources};
 use serde_json::{Value, json};
 
 use crate::api::{Answered, Api};
@@ -54,6 +55,12 @@ pub fn definition() -> Definition {
             "properties": {},
             "additionalProperties": false
         }),
+        // It reads only the names of the installation's repositories, nothing a limit applies
+        // to, for the registry alone, on the one surface the registry's loader allows it.
+        assurance: Assurance {
+            classification: Classification::Read,
+            resources: StatedResources::NoResources,
+        },
     }
 }
 
@@ -174,6 +181,150 @@ mod tests {
         }
     }
 
+    /// An installation's report as a GitHub that lists `listed` repositories, `example-org/r0`
+    /// on, says it has `total`, and answers each page of `per_page` as asked; with the pages
+    /// asked for, in order.
+    struct Installation {
+        listed: usize,
+        total: usize,
+        asked: std::sync::Mutex<Vec<(usize, usize)>>,
+    }
+
+    impl Installation {
+        fn page(&self, query: &str) -> String {
+            let number = |name: &str| {
+                query
+                    .split('&')
+                    .filter_map(|pair| pair.split_once('='))
+                    .find(|(key, _)| *key == name)
+                    .and_then(|(_, value)| value.parse::<usize>().ok())
+                    .unwrap()
+            };
+            let (per_page, page) = (number("per_page"), number("page"));
+            self.asked.lock().unwrap().push((per_page, page));
+            let repositories: Vec<Value> = (0..self.listed)
+                .skip((page - 1) * per_page)
+                .take(per_page)
+                .map(|index| json!({"full_name": format!("example-org/r{index}")}))
+                .collect();
+            json!({"total_count": self.total, "repositories": repositories}).to_string()
+        }
+    }
+
+    /// What the report's tool reads from `installation`, and the pages it asked for.
+    fn report(listed: usize, total: usize) -> (ToolOutcome, Vec<(usize, usize)>) {
+        use std::sync::Arc;
+
+        use axum::http::{StatusCode, Uri};
+
+        let installation = Arc::new(Installation {
+            listed,
+            total,
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = runtime.block_on(async {
+            let serving = installation.clone();
+            let router = axum::Router::new().fallback(move |uri: Uri| {
+                let serving = serving.clone();
+                async move {
+                    assert_eq!(uri.path(), "/installation/repositories");
+                    (StatusCode::OK, serving.page(uri.query().unwrap_or("")))
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, router).await;
+            });
+            let api = Api::new(&format!("http://{address}"), None).unwrap();
+            read(&api, "token").await
+        });
+        let asked = installation.asked.lock().unwrap().clone();
+        (outcome, asked)
+    }
+
+    fn listed(outcome: &ToolOutcome) -> (Vec<String>, u64) {
+        let ToolOutcome::Ok(result) = outcome else {
+            panic!("{outcome:?}");
+        };
+        let names = result["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap().to_owned())
+            .collect();
+        (names, result["totalCount"].as_u64().unwrap())
+    }
+
+    fn failed(outcome: &ToolOutcome) -> String {
+        match outcome {
+            ToolOutcome::Error(kind, sentence) => {
+                assert_eq!(*kind, ErrorKind::Other);
+                sentence.clone()
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Every page is read, a hundred repositories at a time, until the list reaches GitHub's
+    /// total, and no further.
+    #[test]
+    fn every_page_is_read_until_the_list_reaches_its_total() {
+        let (outcome, asked) = report(250, 250);
+        let (names, total) = listed(&outcome);
+        assert_eq!(total, 250);
+        assert_eq!(names.len(), 250);
+        assert!(names.contains(&"example-org/r249".to_owned()));
+        assert!(names.windows(2).all(|pair| pair[0] < pair[1]), "sorted");
+        assert_eq!(asked, [(100, 1), (100, 2), (100, 3)]);
+        // Two full pages that reach the total ask for no third.
+        let (outcome, asked) = report(200, 200);
+        assert_eq!(listed(&outcome).0.len(), 200);
+        assert_eq!(asked, [(100, 1), (100, 2)]);
+        // An installation on no repository is one empty page.
+        let (outcome, asked) = report(0, 0);
+        assert_eq!(listed(&outcome), (Vec::new(), 0));
+        assert_eq!(asked, [(100, 1)]);
+    }
+
+    /// A list that does not come to GitHub's total, short of it or past it, is an error, never a
+    /// list read in part.
+    #[test]
+    fn a_list_that_does_not_come_to_its_total_is_an_error() {
+        let (outcome, asked) = report(120, 150);
+        assert_eq!(
+            failed(&outcome),
+            "GitHub's report lists 120 repositories, and says the installation has 150"
+        );
+        assert_eq!(asked, [(100, 1), (100, 2)]);
+        let (outcome, _) = report(3, 2);
+        assert_eq!(
+            failed(&outcome),
+            "GitHub's report lists 3 repositories, and says the installation has 2"
+        );
+    }
+
+    /// An installation on more than 1,000 repositories is an error: ten pages are read and no
+    /// more, since a repository on a page not read would look dropped.
+    #[test]
+    fn more_than_a_thousand_repositories_is_an_error() {
+        let (outcome, asked) = report(1000, 1000);
+        assert_eq!(listed(&outcome).0.len(), 1000);
+        assert_eq!(asked.len(), 10);
+        let (outcome, asked) = report(1001, 1001);
+        assert_eq!(
+            failed(&outcome),
+            "the installation reaches more than 1000 repositories, more than the report reads; \
+             a list read in part would show the rest as dropped"
+        );
+        assert_eq!(asked.len(), MAX_REPORT_PAGES);
+        assert_eq!(asked.last(), Some(&(PER_PAGE, MAX_REPORT_PAGES)));
+    }
+
     #[test]
     fn the_definition_takes_no_arguments() {
         let definition = definition();
@@ -182,6 +333,13 @@ mod tests {
         assert_eq!(
             definition.input_schema["additionalProperties"],
             json!(false)
+        );
+        assert_eq!(
+            definition.assurance,
+            Assurance {
+                classification: Classification::Read,
+                resources: StatedResources::NoResources,
+            }
         );
     }
 }

@@ -1438,7 +1438,9 @@ every tool. Its `[[connectors]]` entry declares its credential's mode and vendor
 principal, its narrowing, what it permits and, for a tool declared as the reach, its reach,
 given together or not at all; an entry that declares them is a connector entry of the
 snapshot, of kind built-in, so the loader's rules apply to its tools, and one that does not
-serves no approved tool and keeps the meaning it had for the key custodian alone. Each tool is
+serves no approved tool and keeps the meaning it had for the key custodian alone. The loader
+refuses a tool declared as the reach on an entry that records no reach, or an empty one, as it
+refuses a proxied entry with none (rule 3): every call would name nothing, and be denied. Each tool is
 approved in `[[built_in_tools]]`, on an entry that lists it: its classification, its
 definition, how its resources are known (from its arguments, as the reach, none, or checked by
 the connector itself, which only gateway code may be), its settlement, and two hashes. One is
@@ -1447,9 +1449,21 @@ system, credential, narrowing, what it permits, permission set and reach. The lo
 recomputes both, as it does a proxied tool's. A resource source may be qualified by a second
 argument, so `{ from_argument = "repo", qualified_by = "owner" }` names the repository
 `owner/repo` exactly as a limit holds it. The gateway registers the connector under each
-entry's name, reads its calls with the registry's adapters behind the argument check, wraps it
-in its bound and quotas, and refuses, at boot and on every reload, an approved definition that
-is not the one the connector serves. The narrowing gate refuses a proxied entry narrowed per
+entry's name, with the tools it serves on that entry, reads its calls with the registry's
+adapters behind the argument check, and wraps it in its bound and quotas.
+
+A built-in connector is gateway code, so its code, not the approval, states what each tool is:
+its classification, and how the resources it reaches are known, from which arguments, as the
+reach, checked by the tool itself, or none (#220). At boot and on every reload the gateway
+refuses an approval on an entry whose connector does not serve the tool there, an approved
+definition that is not the one the connector serves, and an approval that declares other than
+the connector states, with a sentence naming the entry, the tool and both sides. So an approval
+cannot declare `checks_own_scope` or `no_resources` for a tool that checks nothing while it
+runs, which would let check 6 allow a repository outside the caller's limit and leave the row
+with no resources where decision 0011 says `unknown`. What a connector serves is keyed by entry
+and tool, so what it serves on one entry says nothing of another: the GitHub connector serves
+the reach report's tool on a reach-report entry alone, and every other tool on every other
+entry. The narrowing gate refuses a proxied entry narrowed per
 call or to the limit, and no built-in entry: its connector narrows. A reload that changes a
 built-in entry under the same revision is refused as an unchanged revision, as the custodian
 refuses it, and under a new one until a restart, since the connector was built with the entry.
@@ -1536,8 +1550,9 @@ credential that sees the installation's whole list of repositories, since GitHub
 token only the ones it can see, so that credential is a `[[connectors]]` entry of its own, with
 `reports_reach = true`. The loader holds such an entry to that one job: it declares its
 credential, narrowed `none`, permitting `read`, with no reach or reach report of its own; every
-tool approved on it is `read`; and its tools are served only on surfaces restricted to named
-principals, the registry's `registry-reach`. Its one tool,
+tool approved on it is `read`; and its tools are served only on `registry-reach`, restricted
+to one named principal, the registry's own identity (decision 0011, section 4), and on no
+other surface, whoever it admits. Its one tool,
 `github__list_installation_repositories`, takes no arguments and reads
 `GET /installation/repositories`, every page up to 1,000 repositories; a longer list, or one
 short of GitHub's total, is an error, never a list read in part. The key custodian makes one stated
@@ -1545,11 +1560,13 @@ exception for it: a request that names no repository, which GitHub reads as ever
 refused unless its tool is a reach-report entry's and it asks for `metadata: read` and nothing
 else. The flag is in the entry's binding. An entry whose reach is checked this way names the
 tool in `reach_report`, and declares a reach of its own system's repositories; the tool stays
-approved while any of the entry's tools is. The check is opt-in: no rule yet requires a
-`reach_report` of a GitHub entry with a reach, as one requires a proxied entry's `reach_check`,
-so an entry that names none loads, is served, and is never compared with GitHub's report. Its
-tokens are still narrowed to the caller's limit or the call's repository. The drift pass makes
-the check (Drift, below). What the credential permits, its permission set, is not in GitHub's
+approved while any of the entry's tools is. The check is required: a GitHub entry that
+declares a reach and names no `reach_report` is refused, as a proxied entry with a reach and no
+`reach_check` is (#220; when #193 built the report, the check was opt-in). An entry of another
+system may still declare a reach without one, since no other vendor's report is built. The
+drift pass makes the check (Drift, below), each entry's report on a schedule of its own: a
+tick while the last report is still out starts none, and a report's call is given the call
+deadline of the report tool's connector, `[connectors.<name>] deadline_seconds`, plus 5 s. What the credential permits, its permission set, is not in GitHub's
 report; the custodian checks it on every token, and refuses one GitHub issued with any
 permission beyond those asked for. Jira's report, and any proxied server's, are not built.
 
@@ -2205,8 +2222,8 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   start refused with an interval shorter than a call deadline. The vendor-report kind is built
   for GitHub (#193; section 13): each built-in entry with a `reach_report` is checked on a
   schedule of its own, every interval, at once when the pass starts and at each tick unless the
-  last is out, as a canary is. An entry that names no `reach_report` is not checked, and no rule
-  yet requires one of a GitHub entry with a reach (not built). The check sends the report's
+  last is out, as a canary is. A GitHub entry that declares a reach must name one (section 13);
+  an entry of another system need not, and is not checked. The check sends the report's
   tool, a reach-report entry's, through the same listener as the same principal, so it is
   decided and audited like any call, with the deadline `[connectors.<name>]` sets for the tool's
   entry plus the 5 s allowance, and compares the repositories it lists with the entry's recorded

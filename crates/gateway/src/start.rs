@@ -92,7 +92,7 @@ use connector_proxy::{
     CredentialFileError, FileCredentials, Loopback, ProxyConnector, Refusal, Upstream,
     UpstreamError,
 };
-use gateway_core::{ConnectorName, CredentialMode, InstanceName, Issuer, ToolName};
+use gateway_core::{ConnectorName, CredentialMode, InstanceName, Issuer};
 use gateway_identity::Clock;
 use gateway_otto::HttpResolver;
 use gateway_otto::resolver::ResolverConfigError;
@@ -783,15 +783,14 @@ fn github(
             .iter()
             .filter_map(|name| registry.connectors().get(name)),
     )?);
-    let definitions: Vec<(ToolName, String)> = connector_github::definitions()
-        .iter()
-        .chain([&connector_github::report::definition()])
-        .filter_map(|definition| {
-            Some((ToolName::parse(definition.name).ok()?, definition.sha256()))
-        })
-        .collect();
     for name in entries {
-        wiring = wiring.built_in(name.clone(), connector.clone(), definitions.clone());
+        // The tools the connector serves on this entry, each as its own code states it.
+        let served = registry
+            .connectors()
+            .get(name)
+            .map(connector_github::served)
+            .unwrap_or_default();
+        wiring = wiring.built_in(name.clone(), connector.clone(), served);
         if let Some(limits) = bounds.get(name) {
             wiring = wiring.in_process_limits(name.clone(), *limits);
         }
