@@ -1146,11 +1146,18 @@ receipt.
   0009 does not say how long such a task may hold a lease; the choice made here is the
   conservative one: for as long as the side effect runs, with no limit, and then a full lease
   more, so the first lookup comes at least a lease after the side effect ended, by which time a
-  vendor's search has had a lease to show it. The hold lasts only while the instance can write
-  to the store: a hold that is not written is logged as `in_process_late_side_effect_unheld`
-  and tried again at the next renewal, and an instance that stops, or is cut off from the
-  store for a whole lease, lets the lease run out and the receipt be looked up. The first hold
-  has 2 s, so a late side effect is answered at most that much after its deadline. A gateway
+  vendor's search has had a lease to show it. The instance's own reconciliation also skips,
+  before claiming, every receipt whose late side effect still runs in its process, held or
+  not. Another replica is kept off only by the lease, so across replicas the hold lasts only
+  while the instance can write to the store. A hold that is not written (the store failed, its
+  2 s ran out, or another holder has the receipt) is logged as
+  `in_process_late_side_effect_unheld`, once for each run of them, and tried again a second
+  later, not at the next renewal, until one is written. So a single first hold that is not
+  written leaves the receipt claimable by another replica from the moment the call's finish
+  records it `unknown` until a retry is written: a few seconds while the store answers. An
+  instance that stops, or cannot write to the store while its lease runs out, lets the receipt
+  be looked up. The first hold has 2 s, so a late side effect is answered at most that much
+  after its deadline. A gateway
   shutting down waits for such tasks within the time it already waits for its rows to
   complete, and never cancels one; one still running when that time is up is logged as
   `late_side_effects_left_running`, and its receipt stays `unknown` for reconciliation or a
@@ -2474,8 +2481,9 @@ and 2). Built before any built-in connector, so the first one is bounded from it
   cancelled once it may have been sent ("Where a call runs"): at the deadline the call is
   answered `unknown`, its row is `unknown` and its receipt stays `unknown`, and its work is
   moved, as it is, to a task of its own that runs it to its end and logs what it came to. That
-  task holds the receipt's lease while it runs, so no instance looks the receipt up meanwhile,
-  and shutting down waits for it within the grace (section 11, Receipts). Reconciliation
+  task holds the receipt's lease while it runs, so no instance looks the receipt up meanwhile
+  while the store takes its holds, and its own instance never does; shutting down waits for it
+  within the grace (section 11, Receipts). Reconciliation
   settles the receipt afterwards, or a person does. A result over the size bound is
   discarded: `error` of the kind `oversized_or_late_read` from a read, `unknown` from any other
   tool, even one the vendor confirmed, whose reference is logged for reconciliation. Each
