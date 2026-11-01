@@ -12,8 +12,9 @@
 //! - `DELETE /installation/token`: it revokes the token in the `Authorization` header, and
 //!   answers 401 to one it did not issue or has revoked.
 //!
-//! It can be told to refuse, fail, hang, widen what it issues, or issue tokens that expire
-//! sooner than GitHub's hour (see [`Behaviour`]), and to fail the next revocations with 500
+//! It can be told to refuse, fail, hang, widen what it issues, write the names of the
+//! repositories it issues for in capitals, or issue tokens that expire sooner than GitHub's hour
+//! (see [`Behaviour`]), and to fail the next revocations with 500
 //! (see [`FakeGitHub::fail_revocations`]). An administrator can add a repository to the
 //! installation or drop one from it ([`FakeGitHub::add_repository`],
 //! [`FakeGitHub::drop_repository`]), which changes what a token asked for with no repositories
@@ -57,6 +58,9 @@ pub enum Behaviour {
     Hang,
     /// Issues a token for every repository of the installation, whatever was asked.
     Widen,
+    /// Issues tokens as asked, and writes each repository's `full_name` in capitals, as GitHub
+    /// writes a name the way its owner cased it, whatever case it was asked for in.
+    Recase,
 }
 
 /// A token the fake issued, and what it is scoped to.
@@ -391,9 +395,15 @@ async fn create(
     let listed: Vec<Value> = repositories
         .iter()
         .map(|name| {
+            let full_name = format!("{}/{name}", shared.app.account);
+            let full_name = if behaviour == Behaviour::Recase {
+                full_name.to_ascii_uppercase()
+            } else {
+                full_name
+            };
             json!({
                 "name": name,
-                "full_name": format!("{}/{name}", shared.app.account),
+                "full_name": full_name,
             })
         })
         .collect();

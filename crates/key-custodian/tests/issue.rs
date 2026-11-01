@@ -157,6 +157,21 @@ async fn a_token_broader_than_asked_is_revoked_and_not_handed_out() {
     );
 }
 
+#[tokio::test]
+async fn a_token_whose_names_github_writes_in_another_case_is_handed_out() {
+    // GitHub writes each repository's full name as its owner cased it; its names are not
+    // case-sensitive, so the token is the one asked for.
+    let world = World::new().await;
+    world.fake.set_behaviour(Behaviour::Recase);
+    let mut asked = request();
+    asked.repositories = vec![format!("{ACCOUNT}/atlas"), format!("{ACCOUNT}/borealis")];
+    let token = world.client.token(&asked).await.unwrap();
+    assert_eq!(token.expose(), world.fake.issued()[0].token);
+    assert_eq!(world.record.lines()[0]["outcome"], "issued");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(world.fake.revoked().is_empty());
+}
+
 /// Waits up to `seconds` for `done`.
 async fn until(done: impl Fn() -> bool, seconds: u64) {
     for _ in 0..seconds * 10 {
