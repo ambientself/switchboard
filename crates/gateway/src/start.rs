@@ -40,9 +40,12 @@
 //! and reads its CA file, and is registered under each entry's name ([`Wiring::built_in`]),
 //! with the bounds `[connectors.<name>]` sets for that entry and `[limits]`'s rate quotas, and
 //! with the definition of each tool it serves, the reach report's tool among them, which each
-//! approval must match. The gateway reads no GitHub key: the connector asks the key custodian at
-//! `[github] custodian_socket` for every token. The drift pass gives a reach report's call the
-//! deadline `[connectors.<name>]` sets for the entry that serves the report's tool.
+//! approval must match. An entry that serves a write tool also has the connector registered as
+//! its lookup by marker ([`Wiring::lookup`]), which reconciliation asks to settle an `unknown`
+//! receipt of the entry's tools. The gateway reads no GitHub key: the connector asks the key
+//! custodian at `[github] custodian_socket` for every token, a lookup's included. The drift pass
+//! gives a reach report's call the deadline `[connectors.<name>]` sets for the entry that serves
+//! the report's tool.
 //!
 //! Each keys URL is checked first, every one before any is fetched: it must be on its issuer's
 //! own origin, an `https` one must have a CA file that reads as a PEM bundle of certificates,
@@ -806,6 +809,14 @@ fn github(
             .map(connector_github::served)
             .unwrap_or_default();
         wiring = wiring.built_in(name.clone(), connector.clone(), served);
+        // An entry that serves a write has its receipts settled by the connector's lookup.
+        if registry
+            .connectors()
+            .get(name)
+            .is_some_and(connector_github::writes::serves_a_write)
+        {
+            wiring = wiring.lookup(name.clone(), connector.clone());
+        }
         if let Some(limits) = bounds.get(name) {
             wiring = wiring.in_process_limits(name.clone(), *limits);
         }
