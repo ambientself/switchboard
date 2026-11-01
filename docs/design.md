@@ -1194,11 +1194,29 @@ receipt.
   each make a new call. Receipts cover a replayed turn only if Otto's control plane sends a key
   that stays the same across replays, which is agreed with Otto's owners.
 
+**The attribution read.** A connector that changes something that exists reads from the
+gateway's receipts whether the gateway made it for the same principal (decision 0011, section
+6), never from a control plane's own records: a receipt `completed`, of the tool that makes it,
+for the same issuer and subject, in the same vendor target, with the same vendor reference,
+each compared exactly, the first reserved if more than one is. A delegation's fields are not
+compared, so a later turn of the same principal may change what an earlier one made, and a
+receipt settled `completed` by reconciliation counts as one settled by its call. A receipt
+`unknown`, `not_performed`, or `completed` with no reference answers nothing. The read
+(`ReceiptAttribution`, beside the receipt types in the core) is the store's: the in-memory
+store keeps it, and the Postgres store reads it on the open-row query's pool, as reconciliation
+does, with Postgres's migration 0014 adding a partial index, `receipts_by_reference`, over the
+receipts that recorded a reference. No grant changes: the gateway's role already reads every
+column it names. The contract suite has a case for it on both stores: another principal's,
+another tool's, another target's and another reference's receipts are not answered, nor an
+`unknown` one until reconciliation settles it. The GitHub connector is given the read once the
+store has connected (section 13); a call that needs it before then sends nothing.
+
 The gateway refuses any snapshot that serves a tool not classified `read` unless the audit
 store is the Postgres store, which keeps receipts, audit is on and identity is on (section 12).
 The snapshot loader's rule 2 refuses every proxied tool not classified `read` (decision 0011),
-but the GitHub connector now serves a `propose` tool, `github__create_pr` (section 13), so a
-release build with a registry that approves it reaches this gate, and it is the gate that
+but the GitHub connector now serves `propose` tools, `github__create_pr`,
+`github__propose_change` and `github__amend_change` (section 13), so a release build with a
+registry that approves one reaches this gate, and it is the gate that
 refuses such a registry without the Postgres store. No deployment, demo or example registry
 in this repository has a GitHub entry that writes: the first side effect to reach a real system
 waits until someone is named to settle a receipt by hand and a way to record that exists
@@ -1573,9 +1591,8 @@ records them in place of `unknown` when it finishes (section 11); a search that 
 records an empty list. GitHub's 422, a query it cannot run, is `invalid_arguments`. A search
 runs only under an entry narrowed to the caller's limit, as the loader requires of a tool that
 checks its own scope, and a caller whose limit holds no repository of the organization is
-refused before any request. The proposal tools after `github__create_pr`, Jira,
-`otto__declare_unverified_claim`, `github__skill_body` and the comment exception are not
-built.
+refused before any request. Jira, `otto__declare_unverified_claim`, `github__skill_body` and
+the comment exception are not built.
 
 **The first write tool, `github__create_pr`,** opens a draft pull request from one branch into
 another of a repository of the organization (#12). It is `propose`: the connector states it so,
@@ -1649,6 +1666,96 @@ The write machinery is shared by every GitHub write tool (`crates/connector-gith
   files are not in either group. `github__create_pr` applies the automation group to its
   comparison; the proposal tools with files apply both to the files they write.
 
+**The proposal tools, `github__propose_change` and `github__amend_change`,** write files as a
+draft pull request on a branch under `otto/`, and add to one, as Otto's do (#12;
+`crates/connector-github/src/proposals.rs`, `propose.rs` and `amend.rs`). Each is `propose`,
+stated by the connector and declared from `owner` and `repo`, settled by a lookup in
+repositories, and served only on an entry narrowed `call` that states `contents: write` and
+`pull_requests: write`. Each reuses the write machinery above: its receipt and approval checks,
+the command-text and marker-text predicates, the refused-path predicate, the outcome rule and
+the client that never resends.
+
+Before anything is asked of the custodian or of GitHub, each parses its arguments into its own
+types, and a malformed one is `invalid_arguments`: an argument the schema does not list;
+`files` missing, empty or over 50, a file that is not `{path, content}`, a path held to
+`github__get_file`'s rules with no `.git` segment in any case, given once and not under another
+file of the call, a content that is not a string or over 1,000,000 bytes; `unverifiedClaims`
+missing or null ("unverifiedClaims is required"), not strings, over 20, or a claim over 1,000
+bytes. `github__propose_change` also takes a title held to `github__create_pr`'s rules, an
+`idempotency_key` of 1 to 100 characters of `A-Z a-z 0-9 . _ -`, not beginning with `.`,
+holding no `..` and not ending with `.lock`, which names the branch `otto/<key>`, and a body of
+at most 65,536 characters; the whole body, with the claims block and the marker, is held to
+GitHub's 65,536 before any request too. The key is not the call's idempotency key: a repeat
+under the same tool-use identifier is a `duplicate` before the connector runs, and a repeat
+under a new one reaches it. `github__amend_change` takes `pr_number`, 1 or more, and an
+optional `expected_head` of 40 lowercase hex digits. Then, in this order, each is `refused`:
+another organization, with Otto's sentence; a path in a refused group, with Otto's sentence;
+a title, body or claim whose first word is `atlantis`; and a title, body or claim holding the
+marker's text. `github__amend_change` with no `[github] bot_login`, the App's own login, is an
+`error` with no request at all. A connector not yet given the gateway's receipts sends nothing.
+
+Each asks for at most two tokens, each narrowed to the call's repository with the call's
+revision: `{contents: read, pull_requests: write}` for every read and the pull request's write,
+and `{contents: write}` for the git writes, asked for only once the reads have decided that it
+writes. Every answer that writes nothing is decided from reads before the first write, since
+after it every failure is `unknown`:
+
+- `github__propose_change` reads the default branch, `GET /repos/{owner}/{repo}`; the pull
+  requests of every state whose head is `<org>:otto/<key>`; with none, the ref
+  `heads/otto/<key>`; the default branch's head and tree, `GET .../branches/{branch}`; and each
+  file at that commit, `GET .../contents/{path}?ref={sha}`. A pull request from the branch is
+  the caller's only when the gateway's receipts hold a `completed` `github__propose_change`
+  receipt for the caller, the repository and `pull/<n>` (section 11); one that is not is
+  `refused`. The caller's, closed and not merged, is `ok` `proposal_declined`, saying it will
+  never be reopened; merged, `ok` `already_proposed` with `merged: true`; open, `ok`
+  `already_proposed` when the call's arguments have that receipt's digest, and `ok`
+  `key_conflict`, naming the recorded copy, when they do not. A branch with no pull request is
+  `refused`. A path that is a directory, a symbolic link or a submodule at the base is
+  `refused`; files all the same as at the base are an `error`, "no change".
+- `github__amend_change` reads the pull request. Closed is an `error`, "is closed, not open".
+  Each of these is `refused`: an author other than the bot login; a head in another repository;
+  a head branch not under `otto/` (`not under the reserved "otto/" prefix`); no `completed`
+  `github__propose_change` receipt for the caller, the repository and `pull/<n>` ("is not one
+  github__propose_change opened"); not a draft ("marked ready for review"); and a description
+  without the line marking that receipt, which a person removed. Then it reads the head
+  branch's commit and tree, and each file there: an `expected_head` other than the head is an
+  `error`; a path that is not a regular file is `refused`; files all the same are an `error`
+  ("expected_head is required") without `expected_head`, and `ok` `no_change` with it.
+
+Then they write. `github__propose_change`, in Otto's order: a blob for each file, base64; a
+tree on the base's tree, each file mode `100644`; a commit whose message is the title and whose
+one parent is the base; `POST /git/refs` for `refs/heads/otto/<key>`; and `POST /pulls`, a draft
+into the default branch. Its result is `{state: "proposed", branch, prNumber, baseSha,
+commitSha, url, provenance}`. `github__amend_change`: blobs, a tree on the head's tree, a commit
+"Amend pull request #<n>" whose one parent is the head, `PATCH /git/refs/heads/<branch>` with
+`force: false`, which GitHub refuses unless it moves forward, and `PATCH /pulls/{n}` with the
+body alone. Its result is `{state: "amended", branch, prNumber, headSha, url, provenance}`. Each
+records `pull/<n>` on its receipt. The first blob is each one's first write, so a definite
+refusal of it is `error` and every failure after it is `unknown`, a 422 on the ref and a broken
+pull request write included. Neither ever deletes a ref, writes one outside `otto/` or the
+default branch, forces one, or opens a second pull request for a key.
+
+A proposal's body is the claims block, a blank line, the marker block, and, after a blank line,
+the caller's description. The claims block is GitHub's warning alert, then each claim in a code
+fence of its own, one backtick longer than the longest run of backticks in it and at least
+three, so no claim closes its fence; with none it is a note saying none were declared. The
+marker block is one marker line per receipt that wrote the pull request: the proposal's, then
+each amendment's. An amendment finds the block by the proposal receipt's own line, compared
+exactly, line by line, keeps every line of it and adds its own, and replaces the claims block
+above it; the description after it is kept, its line endings made `\n`. So reconciliation finds
+an `unknown` proposal or amendment by its own line.
+
+The deliberate differences from Otto's two tools: whether a pull request is the caller's comes
+from the gateway's receipts, for the same issuer and subject, not from Otto's proposal table;
+the marker block; the refusal of the marker's text and of command text in the title, body and
+claims; a no-change answer decided from contents reads, before anything is written, where
+Otto writes blobs and a tree first; the bounds above, which Otto does not record; unlisted
+arguments `invalid_arguments`; and a write entry narrowed per call. What conformance (#23)
+must account for besides `github__create_pr`'s: the suite's calls carry no key; its repeats
+come under one tool-use identifier, which this gateway answers as a `duplicate`; its sentences
+name `github_propose_change`, and this gateway's `github__propose_change`; and its proposal
+records are Otto's table, which this gateway does not write.
+
 **The lookup by marker** settles an `unknown` receipt of a GitHub write (section 11). It is not
 a tool call: it writes no row and only reads. It asks the custodian for a token for the team
 the receipt recorded, the receipt's tool, the receipt's target repository alone and
@@ -1656,7 +1763,10 @@ the receipt recorded, the receipt's tool, the receipt's target repository alone 
 `GET /repos/{owner}/{repo}/pulls?state=all&sort=updated&direction=desc&per_page=100`, at most
 three pages. The first pull request whose body has a line exactly equal to the marker is found,
 with `pull/<number>`: a whole line, never a substring, a branch name or anything else the caller
-chose. Nothing found is `not_found`, never authoritative, since GitHub does not document the
+chose. With `[github] bot_login` configured, only a pull request GitHub says that login opened
+is looked at, so a person who copies a draft's description, marker and all, into a pull
+request of their own makes nothing a lookup finds; without it, any author's is. Nothing found
+is `not_found`, never authoritative, since GitHub does not document the
 list as complete and current and a pull request may sit past the pages read; so a lookup never
 settles a receipt `not_performed`. A receipt with no team, a target that is not one repository
 of the organization, a custodian refusal and any error or unreadable answer are `failed`. The
@@ -2556,7 +2666,8 @@ that removes the exception-list check.
   each vendor error; no token in an answer, a row or a log line; the in-process bound, late
   and oversized; the team's rate quota, from the wiring and from the deployment file; each
   start refusal; and a reload that changes an entry. Not built: the write tools but
-  `github__create_pr` (the entry below), Jira, the comment exception, and any deployment of a
+  `github__create_pr` and the proposal tools (the entries below), Jira, the comment exception,
+  and any deployment of a
   GitHub entry, which needs a real App. Left as they are: GitHub names are compared case-sensitively, so a call that
   writes an owner or a repository in another case than its limit does is denied; and each
   GitHub entry has quota buckets of its own, not GitHub as a whole.
@@ -2618,13 +2729,39 @@ that removes the exception-list check.
   person; a write past the in-process deadline settled only after it ends; a
   repeated call a `duplicate`; a write that cannot connect `error`; an approval declaring
   otherwise refused at the start and on a reload; and the receipt-store gate and the pod gate,
-  each reached from a registry with this tool. Not built: the proposal tools that write files
-  and amend a proposal, the comment tools, and the connector's own statement of a tool's
-  settlement, which its statement has no place for. Left as they are: a push to the head
-  between the comparison and the pull request's creation is not caught; a lookup does not check
-  who opened the pull request it finds; no log capture checks a write's token, which the reads'
-  log test covers for the shared client; and no deployment, demo or example registry has an
-  entry that writes.
+  each reached from a registry with this tool. Not built: the comment tools, and the
+  connector's own statement of a tool's settlement, which its statement has no place for. Left
+  as they are: a push to the head between the comparison and the pull request's creation is
+  not caught; a lookup checks who opened the pull request it finds only with `[github]
+  bot_login` (the entry below); no log capture checks a write's token, which the reads' log
+  test covers for the shared client; and no deployment, demo or example registry has an entry
+  that writes.
+
+- Built: the proposal tools, `github__propose_change` and `github__amend_change` (section 13),
+  on the write machinery above; the attribution read (section 11), in both stores, with
+  Postgres's migration 0014 and a contract case on both; `[github] bot_login`, which
+  `github__amend_change` needs and which narrows the lookup by marker, `github__create_pr`'s
+  included, to the App's own pull requests; and the fake GitHub API's git data, its pull
+  request edits and setters, and a fault for any write. Their tests
+  (`crates/gateway/tests/github_proposals.rs`) mirror the conformance suite's proposal and
+  amendment cases and its proposal refusals, with a key on every call and a new tool-use
+  identifier on every repeat: the branch, commit and draft on the two tokens; each repeat
+  answered from reads with nothing written; the no-change error; a path that is not a regular
+  file, a branch with no pull request, and a pull request another principal's call or
+  `github__create_pr` opened, refused; each refusal and argument error before any request; a
+  definite refusal of the first blob `error`, and a failure of a later write, a 422 on the ref
+  and a broken pull request write `unknown`, with reconciliation finding the one opened; the
+  amendment's commit, forward move without force and rewritten body; its repeat with and without
+  `expected_head` and with a stale one; its refusals and its closed `error`; its need of the bot
+  login; reconciliation finding an amendment by its line; and a lookup passing over a copy
+  someone else opened. No test sends a `DELETE`, writes a ref outside `otto/` or forces one.
+  Left as they are: a path under a file that exists at the base is not read before writing, so
+  the tree write fails and the call is `unknown`; a branch `otto` itself, or one under
+  `otto/<key>/`, makes the ref write fail the same way; a push to the branch between the reads
+  and the ref's move fails the move, `unknown`; a file of the same text but another mode at the
+  base counts as unchanged; and the amendment's commit `commit_landed_body_failed` state, a
+  commit that lands while the body write fails, is `unknown` here, and a lookup does not find it,
+  since the body does not hold the amendment's line, so it goes to a person.
 
 **#12, the bound around in-process connectors and the rate quotas** (decision 0014, sections 1
 and 2). Built before any built-in connector, so the first one is bounded from its first call:
