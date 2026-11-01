@@ -164,6 +164,9 @@ pub struct Options {
     pub proposals: bool,
     /// The deployment file's `[github] bot_login`, if any.
     pub bot_login: Option<&'static str>,
+    /// Whether the connector is left without the store's receipts to read, as before the
+    /// gateway's store connects.
+    pub withhold_receipts: bool,
 }
 
 impl Default for Options {
@@ -179,6 +182,7 @@ impl Default for Options {
             reconcile: ReconcileSettings::default(),
             proposals: false,
             bot_login: None,
+            withhold_receipts: false,
         }
     }
 }
@@ -687,13 +691,23 @@ impl World {
         };
         // The connector reads the receipts of the store the world reads rows from, as the
         // gateway gives it the Postgres store's once it connects.
-        let wiring = start::wire_github_reading(
-            &registry,
-            deployment.github.as_ref(),
-            &deployment.connectors,
-            store.clone(),
-            Wiring::new(Arc::new(SystemClock)).audit_store(store.clone()),
-        )
+        let wiring = Wiring::new(Arc::new(SystemClock)).audit_store(store.clone());
+        let wiring = if options.withhold_receipts {
+            start::wire_github(
+                &registry,
+                deployment.github.as_ref(),
+                &deployment.connectors,
+                wiring,
+            )
+        } else {
+            start::wire_github_reading(
+                &registry,
+                deployment.github.as_ref(),
+                &deployment.connectors,
+                store.clone(),
+                wiring,
+            )
+        }
         .unwrap()
         .quotas(options.quotas);
         let settings = Settings {

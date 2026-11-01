@@ -1414,3 +1414,37 @@ async fn a_bot_login_that_is_not_a_github_login_refuses_the_start() {
         other => panic!("{:?}", other.err()),
     }
 }
+
+/// Without the gateway's receipts to read, no pull request can be told to be the caller's, so
+/// each proposal tool sends nothing: it fails closed.
+#[tokio::test]
+async fn without_the_gateways_receipts_each_proposal_tool_sends_nothing() {
+    let world = world_with(Options {
+        withhold_receipts: true,
+        ..proposing()
+    })
+    .await;
+    for (at, (tool, arguments)) in [
+        (PROPOSE_CHANGE, proposal("no-store", json!({}))),
+        (AMEND_CHANGE, amendment(1, json!({}))),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let message = world
+            .write(tool, TEAM_A, arguments, &format!("toolu_no_store_{at}"))
+            .await
+            .tool_error();
+        assert!(
+            message.contains("needs the gateway's receipts"),
+            "{message}"
+        );
+        assert_eq!(
+            outcome(&world, tool).await,
+            Outcome::Error {
+                error_kind: ErrorKind::Other
+            }
+        );
+    }
+    nothing_requested(&world);
+}
