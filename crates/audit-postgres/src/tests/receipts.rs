@@ -2,6 +2,8 @@
 //! and the transaction of a begin with a receipt hold, beyond what the contract suite's item 6
 //! tries through the core, and the count of receipts in `unknown`.
 
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gateway_core::audit::{self, Begun, Completion, Outcome, RequestMetadata, RowStart};
@@ -22,7 +24,9 @@ use super::{
     ADDED_BY_0010, EXCEPTION_COLUMN, GATEWAY_ROLE, INSUFFICIENT_PRIVILEGE, TestDatabase, code,
     message,
 };
-use crate::{MIGRATIONS, OWNER_ROLE, PgAuditError, PgAuditStore, PoolSizes, migrate};
+use crate::{
+    Budgets, GivenUpCauses, MIGRATIONS, OWNER_ROLE, PgAuditError, PgAuditStore, PoolSizes, migrate,
+};
 
 const STATES: [(&str, ReceiptState); 4] = [
     ("pending", ReceiptState::Pending),
@@ -681,4 +685,192 @@ async fn the_receipts_migration_keeps_the_rows_already_written() {
         .unwrap()
         .get(0);
     assert_eq!(named, 0);
+}
+
+/// Waits until `store` has no completion in flight, failing the test after a minute.
+async fn settled(store: &PgAuditStore) {
+    let waited = tokio::time::timeout(Duration::from_secs(60), async {
+        while store.finishes().in_flight > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(waited.is_ok(), "the store's completions did not settle");
+}
+
+/// The completion of a lost begin with a receipt settles a row found complete with the answer
+/// to its own key, which the contract suite tries, and nothing else (#203). Here the begin wrote
+/// its row open with its receipt reserved, its key used by no other receipt, and the row was
+/// then completed otherwise, as the superuser: the completion finds that completion, which is
+/// no answer to the key, and gives the row up as completed differently, as a finish would.
+#[tokio::test]
+async fn a_lost_begins_row_completed_otherwise_is_given_up() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let admin = db.admin().await;
+    let store = db.store(PoolSizes::default()).with_budgets(Budgets {
+        begin: Duration::from_secs(1),
+        ..Budgets::default()
+    });
+    store.lose_confirmations.store(true, Ordering::SeqCst);
+    let fixture = Fixture::new().unwrap();
+    let start = row_start();
+    let id = start.row.as_str().to_owned();
+    let completed_otherwise = async {
+        while rows_under(&admin, &id).await == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        admin
+            .batch_execute(&format!(
+                "UPDATE switchboard_audit.call_rows SET outcome = 'ok', latency_ms = 5
+                 WHERE id = '{id}'"
+            ))
+            .await
+            .unwrap();
+    };
+    let key = fresh_key();
+    let (begun, ()) = tokio::join!(
+        begin(&store, &fixture, &start, "Lost.", &key),
+        completed_otherwise
+    );
+    assert!(begun.is_err(), "{begun:?}");
+    settled(&store).await;
+    assert_eq!(
+        store.stats().finishes_given_up,
+        GivenUpCauses {
+            completed_differently: 1,
+            ..GivenUpCauses::default()
+        }
+    );
+}
+
+/// The row's deadline can pass between the settle's own test of it and the trigger's, by the
+/// database's clock. The trigger then refuses the move with SQLSTATE `SB001`, and the store
+/// completes the row again: the settle now finds the deadline passed, and the row is completed
+/// with its receipt left `pending` for reconciliation or a person (#203). A test trigger, which
+/// fires before `receipt_moves`, waits the first time it fires until the deadline has passed.
+#[tokio::test]
+async fn a_deadline_that_passes_during_the_settle_leaves_the_receipt_pending() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let admin = db.admin().await;
+    let store = db.store(PoolSizes::default()).with_budgets(Budgets {
+        answer: Duration::from_secs(10),
+        ..Budgets::default()
+    });
+    let fixture = Fixture::new().unwrap();
+    let start = row_start();
+    let Ok(Begun::Allowed(guard)) = begin(&store, &fixture, &start, "Late.", &fresh_key()).await
+    else {
+        panic!("the call was not begun as allowed");
+    };
+    let id = start.row.as_str();
+    admin
+        .batch_execute(&format!(
+            "CREATE SEQUENCE public.waits;
+             CREATE FUNCTION public.wait_past_the_deadline() RETURNS trigger
+                 LANGUAGE plpgsql SECURITY DEFINER
+                 AS $$BEGIN
+                     IF nextval('public.waits') = 1 THEN
+                         PERFORM pg_catalog.pg_sleep(3);
+                     END IF;
+                     RETURN NEW;
+                 END$$;
+             CREATE TRIGGER a_wait BEFORE UPDATE ON switchboard_audit.receipts
+                 FOR EACH ROW EXECUTE FUNCTION public.wait_past_the_deadline();
+             BEGIN;
+             SET LOCAL session_replication_role = replica;
+             UPDATE switchboard_audit.call_rows
+                 SET deadline = clock_timestamp() + interval '2 seconds'
+                 WHERE id = '{id}';
+             COMMIT;"
+        ))
+        .await
+        .unwrap();
+    let connector = Answers(ToolOutcome::Completed(
+        json!({"draft": "d-1"}),
+        VendorReference::new("d-1"),
+    ));
+    let finished = audit::finish(&store, audit::run(&connector, guard).await, 4).await;
+    assert!(finished.failure().is_none(), "{:?}", finished.failure());
+
+    // The settle matched the receipt before the deadline, so the test trigger fired, and the
+    // move it waited in front of was refused: the receipt is still pending.
+    let fired: bool = admin
+        .query_one("SELECT is_called FROM public.waits", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        fired,
+        "the settle found the deadline passed before it moved anything"
+    );
+    let (outcome, state): (Option<String>, String) = admin
+        .query_one(
+            &format!(
+                "SELECT c.outcome, r.state FROM switchboard_audit.call_rows c
+                     JOIN switchboard_audit.receipts r ON r.row_id = c.id
+                 WHERE c.id = '{id}'"
+            ),
+            &[],
+        )
+        .await
+        .map(|row| (row.get(0), row.get(1)))
+        .unwrap();
+    assert_eq!(
+        (outcome.as_deref(), state.as_str()),
+        (Some("ok"), "pending")
+    );
+    assert_eq!(store.stats().finishes_given_up, GivenUpCauses::default());
+}
+
+/// A finish given up names the vendor's reference it was to keep on the row's receipt (#203):
+/// here a side effect's finish, whose row the superuser had already completed otherwise.
+#[tokio::test]
+async fn a_finish_given_up_names_the_vendors_reference() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let admin = db.admin().await;
+    let reported = Arc::new(Mutex::new(Vec::new()));
+    let kept = Arc::clone(&reported);
+    let store = db.store(PoolSizes::default()).on_given_up(move |given_up| {
+        kept.lock().unwrap().push((
+            given_up.row.as_str().to_owned(),
+            given_up
+                .reference
+                .map(|reference| reference.as_str().to_owned()),
+        ));
+    });
+    let fixture = Fixture::new().unwrap();
+    let start = row_start();
+    let Ok(Begun::Allowed(guard)) = begin(&store, &fixture, &start, "Twice.", &fresh_key()).await
+    else {
+        panic!("the call was not begun as allowed");
+    };
+    let id = start.row.as_str().to_owned();
+    admin
+        .batch_execute(&format!(
+            "UPDATE switchboard_audit.call_rows
+                 SET outcome = 'error', error_kind = 'other', latency_ms = 0
+                 WHERE id = '{id}'"
+        ))
+        .await
+        .unwrap();
+    let connector = Answers(ToolOutcome::Completed(
+        json!({"draft": "d-7"}),
+        VendorReference::new("d-7"),
+    ));
+    let finished = audit::finish(&store, audit::run(&connector, guard).await, 4).await;
+    assert!(
+        finished.failure().is_some(),
+        "a second completion was written"
+    );
+    settled(&store).await;
+    assert_eq!(
+        *reported.lock().unwrap(),
+        vec![(id, Some("d-7".to_owned()))]
+    );
 }

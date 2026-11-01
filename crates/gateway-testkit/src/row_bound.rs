@@ -54,6 +54,12 @@ pub const MAX_REACHED_BYTES: usize =
 /// identifier of 4,101, and 33 for the keys and punctuation.
 const MAX_RECORDED_RESOURCE_BYTES: usize = 2 * (2 + 2 * 128 + 3) + (2 + 2 * 2_048 + 3) + 33;
 
+/// The most bytes a receipt's principal issuer, principal subject or delegation scope may hold:
+/// with the key, they are the entry of the unique index that makes a key unique in its scope,
+/// which Postgres's btree must hold, so a longer value is refused at begin, never cut (#203).
+/// `audit_postgres::MAX_KEY_SCOPE_BYTES`.
+pub const MAX_KEY_SCOPE_BYTES: usize = 768;
+
 /// The bytes of an integer column.
 const INTEGER_BYTES: usize = std::mem::size_of::<i64>();
 
