@@ -15,7 +15,7 @@ use std::sync::Arc;
 use gateway::{BootError, Config, GRANT_HEADER, GrantCounts, Wiring, boot};
 use gateway_core::{AuditRecord, Classification, DelegationFailure, PodUid, ReasonKind, WasProved};
 use gateway_identity::Clock;
-use gateway_otto::minter::{TestMinter, padded, parts, with_part};
+use gateway_otto::minter::{self, TestMinter, padded, parts, with_part};
 use gateway_otto::{FailureKind, KeyConfigError};
 use gateway_testkit::{
     AUDIENCE, CONNECTOR, Caller, DRAFT_TOOL, FIXTURE_NOW, Fixture, FixtureConnector,
@@ -1021,12 +1021,73 @@ fn each_key_configuration_refusal_refuses_to_start() {
     .unwrap_err();
     assert!(matches!(both, BootError::GrantContradiction), "{both:?}");
 
+    // The rest of gateway-otto's refusals, each reached through boot with its own message: an
+    // issuer with no name, an issuer named twice, a key file that is not a public key, a key of
+    // small order and one key under two issuers. Decision 0012 lists the last two as boot
+    // refusals.
+    let second = |name: &'static str, key: String| {
+        move |issuers: &mut Value| {
+            issuers.as_array_mut().unwrap().push(json!({
+                "name": name,
+                "current_key": key,
+                "require_pod": false,
+                "require_egress": false,
+            }));
+        }
+    };
+    let with_issuers = |change: &dyn Fn(&mut Value)| {
+        boot_with(
+            |config| {
+                let mut grants = grants(&minter, false);
+                change(&mut grants["enforce"]["issuers"]);
+                config["grants"] = grants;
+            },
+            false,
+        )
+        .unwrap_err()
+    };
+    let refusals = [
+        (
+            with_issuer(&|issuer| issuer["name"] = json!("")),
+            KeyConfigError::EmptyIssuerName,
+        ),
+        (
+            with_issuers(&second(ISSUER, TestMinter::generate().public_key_pem())),
+            KeyConfigError::DuplicateIssuer(ISSUER.into()),
+        ),
+        (
+            with_issuer(&|issuer| issuer["current_key"] = json!("not a key")),
+            KeyConfigError::NotAPublicKey(ISSUER.into()),
+        ),
+        (
+            with_issuer(&|issuer| {
+                issuer["current_key"] = json!(minter::public_key_pem(&minter::small_order_key()));
+            }),
+            KeyConfigError::SmallOrderKey(ISSUER.into()),
+        ),
+        (
+            with_issuers(&second("otto-other", minter.public_key_pem())),
+            KeyConfigError::KeyUnderTwoIssuers {
+                key_id: minter.key_id(),
+                first: ISSUER.into(),
+                second: "otto-other".into(),
+            },
+        ),
+    ];
+    for (refused, expected) in refusals {
+        assert!(
+            matches!(&refused, BootError::GrantKeys(error) if *error == expected),
+            "{expected:?}: {refused:?}"
+        );
+        assert_eq!(refused.to_string(), expected.to_string());
+    }
+
     // A mapping that is not one to one is refused as the configuration is read.
     let fixture = Fixture::new().unwrap();
     let mut value = config(&fixture);
-    let mut grants = grants(&minter, false);
-    grants["enforce"]["tool_mapping"] = json!({"otto_read": READ_TOOL, "otto_also": READ_TOOL});
-    value["grants"] = grants;
-    let refused = serde_json::from_value::<Config>(value).unwrap_err();
+    let mut doubled = grants(&minter, false);
+    doubled["enforce"]["tool_mapping"] = json!({"otto_read": READ_TOOL, "otto_also": READ_TOOL});
+    value["grants"] = doubled;
+    let refused = serde_json::from_value::<Config>(value.clone()).unwrap_err();
     assert!(refused.to_string().contains("both map to"), "{refused}");
 }
