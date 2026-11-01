@@ -34,7 +34,7 @@ use gateway_core::{
 use gateway_identity::SystemClock;
 use gateway_otto::minter::TestMinter;
 use gateway_registry::Registry;
-use gateway_testkit::InMemoryAuditStore;
+use gateway_testkit::{InMemoryAuditStore, StoreBudgets};
 use github_world::{
     ACCOUNT, CREATE_PR, OTHER_ORG, Options, PERMISSIONS, TEAM_A, WRITE_ENTRY, WRITE_SURFACE, World,
     registry,
@@ -53,6 +53,14 @@ fn writing() -> Options {
 async fn world() -> World {
     World::with(writing()).await
 }
+
+/// Budgets that put a call row's deadline a little over a second past its call deadline, so a
+/// test in real time sees it pass. No receipt is due before its row's deadline.
+const SHORT_BUDGETS: StoreBudgets = StoreBudgets {
+    begin: Duration::from_millis(100),
+    answer: Duration::from_millis(100),
+    finish_deadline: Duration::from_secs(1),
+};
 
 /// A pull request from `feature/retry` into `main` of `repo`.
 fn arguments(repo: &str) -> Value {
@@ -483,10 +491,10 @@ async fn a_write_github_definitely_refused_is_an_error_and_never_carries_a_crede
 /// Each answer that leaves the write's effect unknown is `unknown`, whether or not GitHub
 /// applied it: a 502 after applying, a connection closed with no answer, a 201 broken off
 /// before its body ends, a 201 whose body is not JSON, and a 502 with nothing applied. One
-/// reconciliation pass settles the four GitHub applied, finding each by its marker, and leaves
-/// the fifth `unknown`: not found, which is never authoritative, and, with one attempt, handed
-/// to a person. The lookups read with tokens of their own, for the
-/// receipt's team, its repository and `pull_requests: read`, and only read.
+/// reconciliation pass once their rows' deadlines have passed settles the four GitHub applied,
+/// finding each by its marker, and leaves the fifth `unknown`: not found, which is never
+/// authoritative, and, with one attempt, handed to a person. The lookups read with tokens of
+/// their own, for the receipt's team, its repository and `pull_requests: read`, and only read.
 #[tokio::test]
 async fn a_write_that_may_have_been_sent_is_unknown_and_reconciliation_settles_what_was_made() {
     let world = World::with(Options {
@@ -494,6 +502,7 @@ async fn a_write_that_may_have_been_sent_is_unknown_and_reconciliation_settles_w
             attempts: 1,
             ..ReconcileSettings::default()
         },
+        budgets: SHORT_BUDGETS,
         ..writing()
     })
     .await;
@@ -522,6 +531,9 @@ async fn a_write_that_may_have_been_sent_is_unknown_and_reconciliation_settles_w
         receipts.push(receipt);
     }
     assert_eq!(world.rest.opened("atlas").len(), 4, "four were applied");
+    for receipt in &receipts {
+        world.past_deadline(&receipt.row).await;
+    }
 
     let requests_before = world.rest.requests().len();
     let tokens_before = world.app.issued().len();
@@ -599,8 +611,8 @@ async fn a_write_that_may_have_been_sent_is_unknown_and_reconciliation_settles_w
 }
 
 /// A write still on its way at the in-process deadline is answered `unknown`, and runs on: the
-/// pull request is still opened. Its receipt is held while it runs and for a full lease after,
-/// and only then does a pass look it up and settle it `completed`.
+/// pull request is still opened. Its receipt is held while it runs, past its row's deadline, and
+/// for a full lease after, and only then does a pass look it up and settle it `completed`.
 #[tokio::test]
 async fn a_late_write_is_unknown_and_settled_only_after_it_ends() {
     let lease = Duration::from_millis(2000);
@@ -611,13 +623,14 @@ async fn a_late_write_is_unknown_and_settled_only_after_it_ends() {
             lease,
             attempts: 3,
         },
+        budgets: SHORT_BUDGETS,
         ..writing()
     })
     .await;
     world.rest.compare_files("atlas", &["src/client.rs"]);
     world
         .rest
-        .fault_next_write(Fault::Late(Duration::from_millis(2500)));
+        .fault_next_write(Fault::Late(Duration::from_millis(3500)));
     world
         .create_pr(TEAM_A, arguments("atlas"), "toolu_late")
         .await
@@ -627,6 +640,11 @@ async fn a_late_write_is_unknown_and_settled_only_after_it_ends() {
     let receipt = last_receipt(&world);
     assert_eq!(receipt.state, ReceiptState::Unknown);
     assert!(world.rest.opened("atlas").is_empty(), "still on its way");
+    world.past_deadline(&receipt.row).await;
+    assert!(
+        world.rest.opened("atlas").is_empty(),
+        "still on its way past its row's deadline"
+    );
     assert_eq!(
         world.reconciler.pass().await.claimed,
         0,

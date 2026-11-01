@@ -14,7 +14,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use connector_github::fake::{FakeLogHost, FakeRest};
 use gateway::boot::{self, Settings, Wiring};
@@ -23,11 +23,11 @@ use gateway::{
     AuditSection, Deployment, RateQuotas, ReconcileSettings, Reconciler, TELEMETRY_QUEUE,
     Telemetry, Timeouts, serve_with_telemetry, start,
 };
-use gateway_core::audit::{Completion, Outcome};
+use gateway_core::audit::{AuditRowId, Completion, Outcome};
 use gateway_core::{AuditRecord, Classification, ConnectorName};
 use gateway_identity::SystemClock;
 use gateway_registry::{Registry, built_in_binding_sha256};
-use gateway_testkit::InMemoryAuditStore;
+use gateway_testkit::{InMemoryAuditStore, StoreBudgets};
 use key_custodian::fake::{FakeApp, FakeGitHub};
 use key_custodian::start::{Config, GitHubSection, Limits};
 use key_custodian::{Running, start as start_custodian};
@@ -150,6 +150,9 @@ pub struct Options {
     pub writes: bool,
     /// How the world's reconciler runs, when a test asks it for a pass.
     pub reconcile: ReconcileSettings,
+    /// The store's budgets, which each call row's deadline includes. No receipt is due before
+    /// its row's deadline.
+    pub budgets: StoreBudgets,
 }
 
 impl Default for Options {
@@ -163,6 +166,7 @@ impl Default for Options {
             custodian: true,
             writes: false,
             reconcile: ReconcileSettings::default(),
+            budgets: StoreBudgets::default(),
         }
     }
 }
@@ -603,9 +607,13 @@ impl World {
         let registry = Registry::from_toml_str(&registry).unwrap();
         // A world that writes keeps the time as it passes, so a receipt's lease ends.
         let store = if options.writes {
-            Arc::new(InMemoryAuditStore::new().with_clock(Arc::new(SystemClock)))
+            Arc::new(
+                InMemoryAuditStore::new()
+                    .with_clock(Arc::new(SystemClock))
+                    .with_budgets(options.budgets),
+            )
         } else {
-            Arc::new(InMemoryAuditStore::new())
+            Arc::new(InMemoryAuditStore::new().with_budgets(options.budgets))
         };
         let wiring = start::wire_github(
             &registry,
@@ -760,6 +768,15 @@ impl World {
     /// Waits a moment for a row's completion to be written after its answer.
     pub async fn settle(&self) {
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    /// Waits, in real time, until the row `row` is past its deadline, before which its receipt
+    /// is not due.
+    pub async fn past_deadline(&self, row: &AuditRowId) {
+        let deadline = self.store.deadline(row).expect("the row has a deadline");
+        while SystemTime::now() <= deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }
 
