@@ -79,8 +79,9 @@ pub(crate) fn definition() -> Definition {
         "expected_head".into(),
         json!({
             "type": "string",
-            "pattern": "^[0-9a-f]{40}$",
-            "description": "The commit the branch's head must be. Required to confirm a repeat that would change nothing."
+            "minLength": 40,
+            "maxLength": 40,
+            "description": "The commit the branch's head must be, as 40 lowercase hex digits. Required to confirm a repeat that would change nothing."
         }),
     );
     Definition {

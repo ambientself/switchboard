@@ -3,7 +3,9 @@
 //! fake GitHub App API, the fake GitHub REST API, the testkit's issuer and an in-memory audit
 //! store. No real credential: the App's key is generated per run, and every token is one the
 //! fake App API made up. With [`Options::writes`], the registry also has a write entry serving
-//! `github__create_pr`, and the world a reconciler that passes only when a test asks.
+//! `github__create_pr`, and the world a reconciler that passes only when a test asks; with
+//! [`Options::proposals`], the entry serves `github__propose_change` and
+//! `github__amend_change` too, and the connector reads the world's store's receipts.
 
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
@@ -82,6 +84,13 @@ pub const WRITE_SURFACE: &str = "github-write";
 pub const WRITE_PERMISSIONS: &str = r#"{ contents = "write", pull_requests = "write" }"#;
 /// The write tool.
 pub const CREATE_PR: &str = connector_github::create_pr::CREATE_PR;
+/// The proposal tools, which [`Options::proposals`] adds to the write entry.
+pub const PROPOSE_CHANGE: &str = connector_github::proposals::PROPOSE_CHANGE;
+pub const AMEND_CHANGE: &str = connector_github::proposals::AMEND_CHANGE;
+/// The App's own login, as the fake GitHub API names the author of each pull request it opens.
+pub const BOT_LOGIN: &str = "switchboard-test-app[bot]";
+/// A second workload of team A: another principal of the same team.
+pub const TEAM_A_OTHER: &str = "system:serviceaccount:team-a:second-workload";
 
 /// Whether `definition` is a read, which the read entries serve.
 fn is_read(definition: &connector_github::Definition) -> bool {
@@ -150,6 +159,11 @@ pub struct Options {
     pub writes: bool,
     /// How the world's reconciler runs, when a test asks it for a pass.
     pub reconcile: ReconcileSettings,
+    /// Whether the write entry also serves `github__propose_change` and
+    /// `github__amend_change`. Needs `writes`.
+    pub proposals: bool,
+    /// The deployment file's `[github] bot_login`, if any.
+    pub bot_login: Option<&'static str>,
 }
 
 impl Default for Options {
@@ -163,6 +177,8 @@ impl Default for Options {
             custodian: true,
             writes: false,
             reconcile: ReconcileSettings::default(),
+            proposals: false,
+            bot_login: None,
         }
     }
 }
@@ -178,11 +194,38 @@ pub fn registry_text(revision: &str, narrowing: &str, permissions: &str) -> Stri
     registry(revision, narrowing, permissions, false)
 }
 
+/// The write tools the write entry serves: `github__create_pr`, and the proposal tools when
+/// `proposals` is true.
+fn write_tools(proposals: bool) -> Vec<&'static str> {
+    if proposals {
+        vec![CREATE_PR, PROPOSE_CHANGE, AMEND_CHANGE]
+    } else {
+        vec![CREATE_PR]
+    }
+}
+
+/// `tools` as a TOML list.
+fn listed(tools: &[&str]) -> String {
+    let quoted: Vec<String> = tools.iter().map(|tool| format!("\"{tool}\"")).collect();
+    format!("[{}]", quoted.join(", "))
+}
+
 /// [`registry_text`], with the write entry when `writes` is true: `github-write`, narrowed
 /// `call`, stating [`WRITE_PERMISSIONS`], permitting `propose`, serving `github__create_pr`,
 /// approved as its connector states it and settled by a lookup in repositories, on a surface
 /// of its own admitting team A and team B; and the workloads' profile may `propose`.
 pub fn registry(revision: &str, narrowing: &str, permissions: &str, writes: bool) -> String {
+    registry_with(revision, narrowing, permissions, writes, false)
+}
+
+/// [`registry`], with the write entry also serving the proposal tools when `proposals` is true.
+pub fn registry_with(
+    revision: &str,
+    narrowing: &str,
+    permissions: &str,
+    writes: bool,
+    proposals: bool,
+) -> String {
     let served: Vec<String> = connector_github::definitions()
         .into_iter()
         .filter(is_read)
@@ -246,9 +289,14 @@ team-b = [{{ system = "github", kind = "repository", identifier = "{ACCOUNT}/cos
         &format!("tools = {}\nteams", reads_list()),
         "tools = []\nteams",
     );
-    let write = if writes { write_text() } else { String::new() };
+    let write_tools = write_tools(proposals);
+    let write = if writes {
+        write_text(&write_tools)
+    } else {
+        String::new()
+    };
     let write_only = write.replace(
-        &format!("tools = [\"{CREATE_PR}\"]\nteams"),
+        &format!("tools = {}\nteams", listed(&write_tools)),
         "tools = []\nteams",
     );
     let registry =
@@ -273,31 +321,34 @@ team-b = [{{ system = "github", kind = "repository", identifier = "{ACCOUNT}/cos
     }
     if writes {
         text.push_str(&write);
-        let definition = connector_github::definitions()
-            .into_iter()
-            .find(|definition| definition.name == CREATE_PR)
-            .unwrap();
-        text.push_str(&approval(&definition, WRITE_ENTRY, &binding(WRITE_ENTRY)));
+        for tool in &write_tools {
+            let definition = connector_github::definitions()
+                .into_iter()
+                .find(|definition| definition.name == *tool)
+                .unwrap();
+            text.push_str(&approval(&definition, WRITE_ENTRY, &binding(WRITE_ENTRY)));
+        }
     }
     text
 }
 
-/// The write entry and its surface, serving `github__create_pr` to team A and team B.
-fn write_text() -> String {
+/// The write entry and its surface, serving `tools` to team A and team B.
+fn write_text(tools: &[&str]) -> String {
+    let tools = listed(tools);
     format!(
         r#"
 [[connectors]]
 name = "{WRITE_ENTRY}"
 system = "github"
 permissions = {WRITE_PERMISSIONS}
-tools = ["{CREATE_PR}"]
+tools = {tools}
 credential = {{ mode = "team_service_identity", principal = "switchboard-test-app" }}
 narrowing = "call"
 permits = "propose"
 
 [[surfaces]]
 name = "{WRITE_SURFACE}"
-tools = ["{CREATE_PR}"]
+tools = {tools}
 teams = ["team-a", "team-b"]
 principals = "any_in_teams_and_groups"
 "#
@@ -386,6 +437,18 @@ pub fn approval(definition: &connector_github::Definition, entry: &str, binding:
 /// in-memory store wired in its place), `[github]` pointing at the fake, the custodian and the
 /// job log host `log_host`, and `bounds` beside it.
 pub fn deployment_text(api_url: &str, socket: &Path, log_host: &str, bounds: &str) -> String {
+    deployment_with(api_url, socket, log_host, bounds, None)
+}
+
+/// [`deployment_text`], with `[github] bot_login` when `bot_login` is given.
+pub fn deployment_with(
+    api_url: &str,
+    socket: &Path,
+    log_host: &str,
+    bounds: &str,
+    bot_login: Option<&str>,
+) -> String {
+    let bot_login = bot_login.map_or(String::new(), |login| format!("bot_login = \"{login}\"\n"));
     format!(
         r#"deployment = "github-test"
 listen = "127.0.0.1:0"
@@ -420,7 +483,7 @@ api_url = "{api_url}"
 custodian_socket = "{}"
 custodian_deadline_seconds = 2
 job_log_hosts = ["{log_host}"]
-
+{bot_login}
 {bounds}
 
 [credentials]
@@ -532,11 +595,12 @@ impl World {
         let rest = FakeRest::start(app.clone(), ACCOUNT).await.unwrap();
         let log_host = FakeLogHost::start().await.unwrap();
         let other_log_host = FakeLogHost::start().await.unwrap();
-        let registry = registry(
+        let registry = registry_with(
             options.revision,
             options.narrowing,
             PERMISSIONS,
             options.writes,
+            options.proposals,
         );
         write(&dir.join("registry.toml"), &registry, 0o644);
         let custodian_registry = match options.custodian_revision {
@@ -544,7 +608,13 @@ impl World {
                 let path = dir.join("custodian-registry.toml");
                 write(
                     &path,
-                    &self::registry(revision, options.narrowing, PERMISSIONS, options.writes),
+                    &registry_with(
+                        revision,
+                        options.narrowing,
+                        PERMISSIONS,
+                        options.writes,
+                        options.proposals,
+                    ),
                     0o644,
                 );
                 path
@@ -555,13 +625,21 @@ impl World {
         write(&dir.join("jwks.json"), &issuer().jwks_document(), 0o644);
         write(
             &dir.join("teams.toml"),
-            &format!("[subjects]\n\"{TEAM_A_SA}\" = \"team-a\"\n\"{TEAM_B_SA}\" = \"team-b\"\n"),
+            &format!(
+                "[subjects]\n\"{TEAM_A_SA}\" = \"team-a\"\n\"{TEAM_A_OTHER}\" = \"team-a\"\n\"{TEAM_B_SA}\" = \"team-b\"\n"
+            ),
             0o644,
         );
         let socket = dir.join("c.sock");
         write(
             &dir.join("gateway.toml"),
-            &deployment_text(&rest.url(), &socket, &log_host.url(), options.bounds),
+            &deployment_with(
+                &rest.url(),
+                &socket,
+                &log_host.url(),
+                options.bounds,
+                options.bot_login,
+            ),
             0o644,
         );
 
@@ -607,10 +685,13 @@ impl World {
         } else {
             Arc::new(InMemoryAuditStore::new())
         };
-        let wiring = start::wire_github(
+        // The connector reads the receipts of the store the world reads rows from, as the
+        // gateway gives it the Postgres store's once it connects.
+        let wiring = start::wire_github_reading(
             &registry,
             deployment.github.as_ref(),
             &deployment.connectors,
+            store.clone(),
             Wiring::new(Arc::new(SystemClock)).audit_store(store.clone()),
         )
         .unwrap()
@@ -696,8 +777,20 @@ impl World {
     /// Calls `github__create_pr` with `arguments` as `subject`, over HTTP, with the tool-use
     /// identifier `tool_use_id`, which is the call's key.
     pub async fn create_pr(&self, subject: &str, arguments: Value, tool_use_id: &str) -> Answered {
+        self.write(CREATE_PR, subject, arguments, tool_use_id).await
+    }
+
+    /// Calls the write tool `tool` with `arguments` as `subject`, over HTTP, with the tool-use
+    /// identifier `tool_use_id`, which is the call's key.
+    pub async fn write(
+        &self,
+        tool: &str,
+        subject: &str,
+        arguments: Value,
+        tool_use_id: &str,
+    ) -> Answered {
         let params = json!({
-            "name": CREATE_PR,
+            "name": tool,
             "arguments": arguments,
             "_meta": {"claudecode/toolUseId": tool_use_id},
         });

@@ -91,7 +91,6 @@ pub(crate) fn definition() -> Definition {
             "type": "string",
             "minLength": 1,
             "maxLength": MAX_KEY_CHARS,
-            "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*$",
             "description": "Names the proposal's branch, otto/<key>: letters, digits, '.', '_' and '-', not beginning with '.', with no '..' and not ending in '.lock'. A repeat with the same key answers the existing proposal."
         }),
     );
