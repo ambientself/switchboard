@@ -1826,8 +1826,10 @@ commitSha, url, provenance}`. `github__amend_change`: blobs, a tree on the head'
 body alone. Its result is `{state: "amended", branch, prNumber, headSha, url, provenance}`. Each
 records `pull/<n>` on its receipt. The first blob is each one's first write, so a definite
 refusal of it is `error` and every failure after it is `unknown`, a 422 on the ref and a broken
-pull request write included. Neither ever deletes a ref, writes one outside `otto/` or the
-default branch, forces one, or opens a second pull request for a key.
+pull request write included. Neither ever deletes a ref, writes one outside `otto/`, forces one,
+or opens a second pull request for a key. `github__amend_change` does not check whether the
+`otto/` branch it moves has since been made the repository's default branch, so an amendment
+after an administrator did that would move the default branch, forward only.
 
 A proposal's body is the claims block, a blank line, the marker block, and, after a blank line,
 the caller's description. The claims block is GitHub's warning alert, then each claim in a code
@@ -2873,7 +2875,9 @@ listing their exception in any deployed policy, which waits on the security owne
   and the ref's move fails the move, `unknown`; a file of the same text but another mode at the
   base counts as unchanged; and the amendment's commit `commit_landed_body_failed` state, a
   commit that lands while the body write fails, is `unknown` here, and a lookup does not find it,
-  since the body does not hold the amendment's line, so it goes to a person.
+  since the body does not hold the amendment's line, so it goes to a person; and an amendment
+  does not check whether its `otto/` branch has since been made the default branch, so after an
+  administrator did that it would move the default branch, forward only.
 
 **#12, the bound around in-process connectors and the rate quotas** (decision 0014, sections 1
 and 2). Built before any built-in connector, so the first one is bounded from its first call:
