@@ -26,8 +26,8 @@ use gateway_core::audit::{
 };
 use gateway_core::receipt::ReceiptRequest;
 use gateway_core::{
-    ArgumentDigest, CredentialIdentity, CredentialMode, DelegationKeyScope, Principal,
-    PrincipalKind, Receipt, ReceiptState, Reuse, ToolName, ToolUseId, VendorReference,
+    ArgumentDigest, CredentialIdentity, CredentialMode, Principal, PrincipalKind, Receipt,
+    ReceiptState, Reuse, ToolName, ToolUseId, VendorReference,
 };
 use serde_json::{Value, json};
 use tokio_postgres::types::ToSql;
@@ -122,6 +122,21 @@ pub const MAX_ROW_BYTES: usize = 512 * 1024;
 /// this repository, makes that finish refused: the caller is answered with the audit-failure
 /// sentence instead, and the row is left open.
 pub const MAX_OUTCOME_SENTENCE_BYTES: usize = 2 * 1024;
+
+/// The most bytes a receipt's `principal_issuer`, `principal_subject` or `delegation_scope` may
+/// hold (#203). With the key, they are the entry of the unique index that makes a key unique in
+/// its scope, and Postgres's btree holds an entry of at most 2,704 bytes on its default 8 KiB
+/// pages. Three values at this cap and a key at its own, 128 bytes
+/// (`gateway_core::MAX_IDEMPOTENCY_KEY`), are 2,432 bytes, and with 4 bytes of header and up to
+/// 3 of padding for each value and 8 for the entry's own header, an entry is at most 2,468, so
+/// a value Postgres cannot compress still fits. A longer value is refused at begin with
+/// [`PgAuditError::TooLong`], naming its column and this cap, and nothing is written: cut, two
+/// principals or delegations that differ only past the cap would share a key's scope.
+///
+/// The issuer is the gateway's own configuration, a subject comes from a token of at most
+/// 16 KiB, and a delegation's scope is its session, execution and turn as a JSON array, from
+/// the control plane that signed it. None the gateway serves comes near the cap.
+pub const MAX_KEY_SCOPE_BYTES: usize = 768;
 
 /// The longest name an outcome has: `refused`.
 const LONGEST_OUTCOME: usize = "refused".len();
@@ -990,6 +1005,12 @@ fn optional(column: &'static str, text: Option<&str>) -> Result<Option<String>, 
     text.map(|text| stored(column, text)).transpose()
 }
 
+/// `text`, for `column` of a key's scope on a receipt: refused when it holds U+0000 or is longer
+/// than [`MAX_KEY_SCOPE_BYTES`].
+fn key_scope(column: &'static str, text: &str) -> Result<String, PgAuditError> {
+    within_cap(column, stored(column, text)?, MAX_KEY_SCOPE_BYTES)
+}
+
 /// `text`, for `column`, which holds at most `cap` bytes: refused when it is longer, naming the
 /// column and the cap, rather than cut.
 fn within_cap(column: &'static str, text: String, cap: usize) -> Result<String, PgAuditError> {
@@ -1330,7 +1351,9 @@ impl ReceiptRow {
                             WHERE c.id = r.row_id AND c.deadline < clock_timestamp())";
 
     /// The columns for the receipt `request` asks for, reserved under the row `id`. Refuses a
-    /// value holding U+0000, as every text value is refused.
+    /// value holding U+0000, as every text value is refused, and an issuer, subject or
+    /// delegation scope longer than [`MAX_KEY_SCOPE_BYTES`], which the unique index on a key in
+    /// its scope could not hold.
     pub fn from_request(id: &AuditRowId, request: &ReceiptRequest) -> Result<Self, PgAuditError> {
         if !is_uuid(id.as_str()) {
             return Err(PgAuditError::Column("id"));
@@ -1342,12 +1365,13 @@ impl ReceiptRow {
         let target = request.target();
         Ok(Self {
             row_id: id.as_str().to_owned(),
-            principal_issuer: stored("principal_issuer", scope.principal.issuer.as_str())?,
-            principal_subject: stored("principal_subject", scope.principal.subject.as_str())?,
-            delegation_scope: optional(
-                "delegation_scope",
-                scope.delegation.as_ref().map(DelegationKeyScope::as_str),
-            )?,
+            principal_issuer: key_scope("principal_issuer", scope.principal.issuer.as_str())?,
+            principal_subject: key_scope("principal_subject", scope.principal.subject.as_str())?,
+            delegation_scope: scope
+                .delegation
+                .as_ref()
+                .map(|delegation| key_scope("delegation_scope", delegation.as_str()))
+                .transpose()?,
             idempotency_key: stored("idempotency_key", request.key().as_str())?,
             tool: stored("tool", request.tool().as_str())?,
             tool_use_id: optional("tool_use_id", request.tool_use_id().map(|id| id.as_str()))?,
@@ -2488,6 +2512,7 @@ mod tests {
         assert_eq!(row_bound::MAX_BEGUN_ROW_BYTES, MAX_BEGUN_ROW_BYTES);
         assert_eq!(row_bound::COMPLETION_RESERVE, COMPLETION_RESERVE);
         assert_eq!(row_bound::MAX_REACHED_BYTES, MAX_REACHED_BYTES);
+        assert_eq!(row_bound::MAX_KEY_SCOPE_BYTES, MAX_KEY_SCOPE_BYTES);
         let reach = FinishRow::from_completion(&Completion {
             outcome: Outcome::Ok,
             latency_ms: 1,

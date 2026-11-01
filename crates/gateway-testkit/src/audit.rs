@@ -21,8 +21,8 @@ use crate::clock::FixedClock;
 use crate::contract::StoredRecord;
 use crate::gate::Gate;
 use crate::row_bound::{
-    MAX_BEGUN_ROW_BYTES, MAX_ROW_BYTES, call_row_sizes, list_row_sizes, refuse_long_reach,
-    refuse_long_sentence, refuse_over,
+    MAX_BEGUN_ROW_BYTES, MAX_KEY_SCOPE_BYTES, MAX_ROW_BYTES, call_row_sizes, list_row_sizes,
+    refuse_long_reach, refuse_long_sentence, refuse_over,
 };
 
 /// The instance [`row_start`] names.
@@ -211,6 +211,37 @@ fn refuse_non_uuid(id: &AuditRowId) -> Result<(), StoreError> {
             "audit row identifier {id:?} is not a UUID in the lowercase hyphenated form"
         )
         .into());
+    }
+    Ok(())
+}
+
+/// Why the Postgres store would refuse to reserve the receipt `request` asks for: an issuer,
+/// subject or delegation scope longer than [`MAX_KEY_SCOPE_BYTES`], which its unique index on a
+/// key in its scope could not hold (#203). It writes neither the row nor the receipt.
+fn refused_key_scope(request: &ReceiptRequest) -> Result<(), StoreError> {
+    let scope = request.scope();
+    let values = [
+        ("principal_issuer", Some(scope.principal.issuer.as_str())),
+        ("principal_subject", Some(scope.principal.subject.as_str())),
+        (
+            "delegation_scope",
+            scope
+                .delegation
+                .as_ref()
+                .map(|delegation| delegation.as_str()),
+        ),
+    ];
+    for (column, value) in values {
+        if let Some(value) = value
+            && value.len() > MAX_KEY_SCOPE_BYTES
+        {
+            return Err(format!(
+                "the audit column {column} would hold {} bytes, more than the \
+                 {MAX_KEY_SCOPE_BYTES} it may hold, so it is not written",
+                value.len()
+            )
+            .into());
+        }
     }
     Ok(())
 }
@@ -787,8 +818,9 @@ fn disagrees(receipt: &Receipt, settled: ReceiptState) -> bool {
 /// It refuses what the Postgres store's column mapping refuses, and writes nothing: an
 /// identifier that is not a UUID in the lowercase hyphenated form, a record handed to begin
 /// already complete, a record, list record or completion with U+0000 in a text value, a count
-/// of resources or tools left out or a latency past a Postgres `bigint`, and a call row whose
-/// allowance is past one. It holds that store's row bound, as [`row_bound`](crate::row_bound)
+/// of resources or tools left out or a latency past a Postgres `bigint`, a call row whose
+/// allowance is past one, and a receipt whose issuer, subject or delegation scope is over
+/// [`MAX_KEY_SCOPE_BYTES`]. It holds that store's row bound, as [`row_bound`](crate::row_bound)
 /// counts it: begin refuses a call row over 522,203 bytes and list a list row over 512 KiB,
 /// naming the row's largest column, and finish refuses a refusal's sentence over 2,048 bytes,
 /// leaving the row open. Of the table's own constraints it checks these: unknown resources or
@@ -1211,6 +1243,9 @@ impl InMemoryAuditStore {
                     row.as_str()
                 )
                 .into());
+            }
+            if let Some(request) = receipt {
+                refused_key_scope(request)?;
             }
             if let Some(gate) = gate {
                 gate.wait().await;

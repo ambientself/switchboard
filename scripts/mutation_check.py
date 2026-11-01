@@ -1999,6 +1999,11 @@ mutate("testkit-lost-list-confirmation-ignored", "a list told to lose its confir
 mutate("testkit-lost-confirmation-before-write", "a lost confirmation writes no row", A,
        "            if state.begin_failing.take() {\n                return Err(down());\n            }\n            if state.list_rows",
        "            if state.begin_failing.take() || state.confirmation_lost.take() {\n                return Err(down());\n            }\n            if state.list_rows")
+# #203: as the Postgres store, the in-memory store refuses a receipt whose issuer, subject or
+# delegation scope is over the cap. The contract suite's
+# a_key_scope_over_its_cap_is_refused_at_begin_and_one_at_it_is_reserved catches this.
+mutate("testkit-key-scope-uncapped", "a receipt's key scope over its cap is reserved", A,
+       "            && value.len() > MAX_KEY_SCOPE_BYTES\n", "            && false\n")
 mutate("testkit-answer-budget-written-at-once", "a finish past the answer budget is written before its gate opens", A,
        "state.answer_gate.clone().filter(|gate| !gate.is_open())", "None::<Gate>")
 mutate("testkit-answer-budget-never-written", "a finish past the answer budget is never written", A,
@@ -5395,6 +5400,15 @@ mutate("pg-columns-exception-not-written", "begin writes no exception", PG_COLUM
        "            allowed_by_exception: { let _ = &record.allowed_by_exception; None },\n")
 mutate("pg-check-misses-exception", "the boot check does not require the exception column", PG_CHECK,
        '    ("allowed_by_exception", "text"),\n];', "];")
+# #203: a receipt's issuer, subject and delegation scope are held to MAX_KEY_SCOPE_BYTES, so the
+# unique index on a key in its scope can always hold its entry. The contract suite's
+# a_key_scope_over_its_cap_is_refused_at_begin_and_one_at_it_is_reserved, on Postgres, catches
+# these; a cap past what the index holds fails its case at the cap.
+mutate("pg-columns-key-scope-uncapped", "a receipt's issuer, subject or delegation scope over its cap is reserved", PG_COLUMNS,
+       "    within_cap(column, stored(column, text)?, MAX_KEY_SCOPE_BYTES)\n", "    stored(column, text)\n")
+mutate_all("pg-columns-key-scope-cap-past-the-index", "a receipt's key scope is capped, in both stores, past what the unique index can hold",
+           (PG_COLUMNS, "pub const MAX_KEY_SCOPE_BYTES: usize = 768;", "pub const MAX_KEY_SCOPE_BYTES: usize = 1024;"),
+           (TESTKIT_SRC + "row_bound.rs", "pub const MAX_KEY_SCOPE_BYTES: usize = 768;", "pub const MAX_KEY_SCOPE_BYTES: usize = 1024;"))
 
 # Migration 0011: what a tool that checks its own scope reached replaces the row's unknown
 # resources in finish's own statement (decision 0011, #12). The schema test
