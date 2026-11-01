@@ -890,6 +890,7 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
             requires_delegation: profile.requires_delegation,
             requires_currency: profile.requires_currency,
             idempotency_key_header: profile.idempotency_key_header,
+            exceptions: profile.exceptions,
         })
         .collect();
     let limits = ResourceLimits {

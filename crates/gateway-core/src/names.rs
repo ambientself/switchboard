@@ -188,6 +188,79 @@ impl From<ToolName> for String {
     }
 }
 
+/// The longest an exception's name may be.
+pub const MAX_EXCEPTION_NAME: usize = 64;
+
+/// The name of an exception a profile lists (decision 0011, section 9), such as
+/// `otto-comment-tools`: 1 to 64 characters of lowercase ASCII letters, digits and `-`, not
+/// starting or ending with `-`.
+///
+/// Validated whenever one is made, including from configuration. It is what an allowed call's
+/// row records, so a name held as an `ExceptionName` is safe to write there, and its length is
+/// capped where the row's size is worked out.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ExceptionName(String);
+
+/// A string that is not a valid exception name.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+#[error(
+    "not a valid exception name: an exception name is 1 to {MAX_EXCEPTION_NAME} lowercase ASCII \
+     letters, digits or `-`, not starting or ending with `-`"
+)]
+pub struct InvalidExceptionName;
+
+impl ExceptionName {
+    /// Checks `value` against the naming rule.
+    pub fn parse(value: &str) -> Result<Self, InvalidExceptionName> {
+        let valid = !value.is_empty()
+            && value.len() <= MAX_EXCEPTION_NAME
+            && !value.starts_with('-')
+            && !value.ends_with('-')
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+        if valid {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(InvalidExceptionName)
+        }
+    }
+
+    /// The name as a string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ExceptionName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::str::FromStr for ExceptionName {
+    type Err = InvalidExceptionName;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl TryFrom<String> for ExceptionName {
+    type Error = InvalidExceptionName;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(&value)
+    }
+}
+
+impl From<ExceptionName> for String {
+    fn from(name: ExceptionName) -> Self {
+        name.0
+    }
+}
+
 /// The UID of a Kubernetes pod, as the pod's projected ServiceAccount token proves it
 /// (decision 0012): a UUID in the lowercase hyphenated form Kubernetes gives it, such as
 /// `0f8fad5b-d9cb-469f-a165-70867728950e`.
@@ -319,6 +392,48 @@ mod tests {
                 "{invalid:?} was accepted"
             );
         }
+    }
+
+    #[test]
+    fn an_exception_name_follows_the_naming_rule() {
+        let longest = "a".repeat(MAX_EXCEPTION_NAME);
+        for valid in [
+            "a",
+            "7",
+            "otto-comment-tools",
+            "a-b-c",
+            "a--b",
+            longest.as_str(),
+        ] {
+            assert_eq!(
+                ExceptionName::parse(valid).map(String::from).as_deref(),
+                Ok(valid),
+                "{valid:?} was refused"
+            );
+        }
+        let too_long = "a".repeat(MAX_EXCEPTION_NAME + 1);
+        for invalid in [
+            "",
+            too_long.as_str(),
+            "-otto",
+            "otto-",
+            "-",
+            "Otto",
+            "otto_comment",
+            "otto comment",
+            "otto.comment",
+            "otto\ncomment",
+            "\u{f6}tto",
+            "`otto`",
+        ] {
+            assert_eq!(
+                ExceptionName::parse(invalid),
+                Err(InvalidExceptionName),
+                "{invalid:?} was accepted"
+            );
+        }
+        assert!(serde_json::from_str::<ExceptionName>(r#""otto-comment-tools""#).is_ok());
+        assert!(serde_json::from_str::<ExceptionName>(r#""Otto""#).is_err());
     }
 
     #[test]

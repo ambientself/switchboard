@@ -1984,6 +1984,7 @@ principals = "any_in_teams_and_groups"
                 requires_delegation: true,
                 requires_currency,
                 idempotency_key_header: false,
+                exceptions: Vec::new(),
             }],
             limits: Default::default(),
             entries: Vec::new(),

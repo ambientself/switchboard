@@ -9,7 +9,8 @@ use thiserror::Error;
 
 use crate::classification::Classification;
 use crate::names::{
-    ConnectorName, GroupId, PolicyRevision, ProfileName, SurfaceName, TeamId, ToolName,
+    ConnectorName, ExceptionName, GroupId, PolicyRevision, ProfileName, SurfaceName, TeamId,
+    ToolName,
 };
 use crate::principal::{Principal, PrincipalId, PrincipalKind};
 use crate::reconcile::Settlement;
@@ -228,7 +229,8 @@ pub struct Profile {
     pub name: ProfileName,
     /// The classifications this profile permits. Listing `write` or `destructive` here has no
     /// effect: the decision function denies both in every profile, so what a profile can
-    /// permit is `read` and `propose`.
+    /// permit as a classification is `read` and `propose`. A `write` tool is let past only by
+    /// name, in [`exceptions`](Self::exceptions).
     pub classifications: BTreeSet<Classification>,
     /// Whether a call under this profile must carry a delegation.
     pub requires_delegation: bool,
@@ -247,6 +249,36 @@ pub struct Profile {
     /// reads the key's carriers.
     #[serde(default)]
     pub idempotency_key_header: bool,
+    /// The exceptions this profile lists: each names `write` tools that check 5 lets past under
+    /// this profile, and under no other (decision 0011, section 9). Empty unless a policy says
+    /// so, so a policy written before the list existed keeps its meaning. The loader refuses a
+    /// list on a profile that does not require currency, a tool that is not approved or not
+    /// `write`, a `write` tool settled by a person, and a name or a tool listed twice.
+    #[serde(default)]
+    pub exceptions: Vec<Exception>,
+}
+
+impl Profile {
+    /// The exception in this profile's own list that names `tool`, by its exact name, if one
+    /// does. A list names tools, never a classification or a part of a name.
+    pub fn excepting(&self, tool: &ToolName) -> Option<&ExceptionName> {
+        self.exceptions
+            .iter()
+            .find(|exception| exception.tools.contains(tool))
+            .map(|exception| &exception.name)
+    }
+}
+
+/// One exception a profile lists (decision 0011, section 9): the `write` tools it names, which
+/// check 5 lets past under that profile. A call it allows records its name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Exception {
+    /// The exception's name, which an allowed call's row records.
+    pub name: ExceptionName,
+    /// The exposed names of the tools it names. Not empty: the loader refuses an exception
+    /// that names none.
+    pub tools: BTreeSet<ToolName>,
 }
 
 /// Which resources each team and group may reach: an allowlist of exact matches on system,
@@ -510,6 +542,101 @@ pub enum SnapshotError {
     /// receipt.
     #[error("tool `{0}` is classified `read`, which has no receipt, and declares a settlement")]
     SettlementOnRead(ToolName),
+    /// An exception names no tool.
+    #[error("profile `{profile}` lists exception `{exception}`, which names no tool")]
+    ExceptionNamesNoTool {
+        /// The profile.
+        profile: ProfileName,
+        /// The exception.
+        exception: ExceptionName,
+    },
+    /// Two exceptions of one profile share a name, so which one allowed a call would be
+    /// ambiguous.
+    #[error(
+        "profile `{profile}` lists exception `{exception}` more than once, the second naming \
+         tool `{tool}`"
+    )]
+    DuplicateException {
+        /// The profile.
+        profile: ProfileName,
+        /// The exception's name.
+        exception: ExceptionName,
+        /// A tool the second exception of that name names.
+        tool: ToolName,
+    },
+    /// One tool in two exceptions of one profile, so which one allowed a call would be
+    /// ambiguous.
+    #[error(
+        "profile `{profile}` names tool `{tool}` in exception `{first}` and in exception \
+         `{exception}`; a call is allowed by exactly one exception"
+    )]
+    ToolInTwoExceptions {
+        /// The profile.
+        profile: ProfileName,
+        /// The first exception that names the tool.
+        first: ExceptionName,
+        /// The second.
+        exception: ExceptionName,
+        /// The tool.
+        tool: ToolName,
+    },
+    /// A profile that does not require currency lists an exception (decision 0011, section 9):
+    /// an exception may sit only where every call it allows is fenced by currency.
+    #[error(
+        "profile `{profile}` lists exception `{exception}`, naming tool `{tool}`, and does not \
+         require currency; an exception is allowed only on a profile that does"
+    )]
+    ExceptionWithoutCurrency {
+        /// The profile.
+        profile: ProfileName,
+        /// The exception.
+        exception: ExceptionName,
+        /// A tool it names.
+        tool: ToolName,
+    },
+    /// An exception names a tool that is not approved.
+    #[error(
+        "profile `{profile}`'s exception `{exception}` names tool `{tool}`, which is not approved"
+    )]
+    ExceptionToolUnapproved {
+        /// The profile.
+        profile: ProfileName,
+        /// The exception.
+        exception: ExceptionName,
+        /// The tool.
+        tool: ToolName,
+    },
+    /// An exception names a tool not classified `write`. An exception lets a `write` tool past
+    /// check 5 and nothing else: never a `destructive` tool, and never a `read` or `propose`
+    /// one, which the profile's classifications decide.
+    #[error(
+        "profile `{profile}`'s exception `{exception}` names tool `{tool}`, which is classified \
+         `{classification}`; an exception names only `write` tools"
+    )]
+    ExceptionToolNotWrite {
+        /// The profile.
+        profile: ProfileName,
+        /// The exception.
+        exception: ExceptionName,
+        /// The tool.
+        tool: ToolName,
+        /// Its classification.
+        classification: Classification,
+    },
+    /// An exception names a `write` tool whose `unknown` receipts are settled by a person
+    /// (decision 0009, "Reconciliation"): an excepted `write` tool is settled by a lookup.
+    #[error(
+        "profile `{profile}`'s exception `{exception}` names tool `{tool}`, whose `unknown` \
+         receipts are settled by a person; an excepted `write` tool must be settled by a lookup"
+    )]
+    ExceptedWriteSettledByPerson {
+        /// The profile.
+        profile: ProfileName,
+        /// The exception.
+        exception: ExceptionName,
+        /// The tool.
+        tool: ToolName,
+    },
     /// Rule 9: a `propose` tool on a surface that admits a group, and its connector has no
     /// per-user entry: its entry is shared, or it has none.
     #[error(
@@ -549,10 +676,10 @@ impl PolicySnapshot {
     /// decision 0011, section 3, each named by its [`SnapshotError`] variant. Rules 1 to 8
     /// apply to tools whose connector has an entry, and rule 9 to every tool: one with no entry
     /// is not per-user. Then it refuses a tool not classified `read` that declares no
-    /// settlement, and a `read` tool that declares one (decision 0009, "Reconciliation"). Last,
+    /// settlement, and a `read` tool that declares one (decision 0009, "Reconciliation"). Then
     /// it refuses a tool `declared` as the reach whose connector has no entry, which a snapshot
     /// with no entries at all could otherwise hold: there would be no reach for its calls to
-    /// name.
+    /// name. Last, it checks each profile's exceptions, as [`check_exceptions`] says.
     pub fn new(data: SnapshotData) -> Result<Self, SnapshotError> {
         let mut tools = BTreeMap::new();
         for tool in data.tools {
@@ -616,6 +743,7 @@ impl PolicySnapshot {
                 connector: tool.connector.clone(),
             });
         }
+        check_exceptions(&snapshot)?;
         Ok(snapshot)
     }
 
@@ -624,7 +752,9 @@ impl PolicySnapshot {
     /// the profiles, the limits or the connector entries. The result is under `revision`.
     ///
     /// The loader's rules are not run again. A removal can only narrow what is allowed, so an
-    /// unrelated change that breaks a rule cannot hold up a withdrawal.
+    /// unrelated change that breaks a rule cannot hold up a withdrawal. A profile's exceptions
+    /// stay as they were, and may name a withdrawn tool: it is on no surface, so check 2 denies
+    /// it before check 5 reads the list, and no list can name a tool into being.
     pub fn without(&self, withdrawn: &BTreeSet<ToolName>, revision: PolicyRevision) -> Self {
         let mut derived = self.clone();
         derived.revision = revision;
@@ -668,6 +798,11 @@ impl PolicySnapshot {
     /// The profile with this name.
     pub fn profile(&self, name: &ProfileName) -> Option<&Profile> {
         self.profiles.get(name)
+    }
+
+    /// Every profile, in name order.
+    pub fn profiles(&self) -> impl Iterator<Item = &Profile> {
+        self.profiles.values()
     }
 
     /// The resource limits.
@@ -828,6 +963,81 @@ fn check_settlements(snapshot: &PolicySnapshot) -> Result<(), SnapshotError> {
     Ok(())
 }
 
+/// Each profile's exceptions (decision 0011, section 9): an exception names at least one tool;
+/// no two of a profile's exceptions share a name or a tool, so a call is allowed by exactly one;
+/// a profile that lists any requires currency, so every call an exception allows is fenced; and
+/// each tool named is approved, classified `write`, and settled by a lookup, never by a person
+/// (decision 0009, "Reconciliation"). Each refusal names the profile, the exception and a tool,
+/// where there is one.
+///
+/// Decision 0011 lets an exception name the tools it lists. This loader holds it to `write`
+/// tools, so that an exception can never let a `destructive` tool past check 5, and never stands
+/// in for a profile's classifications.
+fn check_exceptions(snapshot: &PolicySnapshot) -> Result<(), SnapshotError> {
+    for profile in snapshot.profiles.values() {
+        let mut names: BTreeSet<&ExceptionName> = BTreeSet::new();
+        let mut named: BTreeMap<&ToolName, &ExceptionName> = BTreeMap::new();
+        for exception in &profile.exceptions {
+            let (profile_name, exception_name) = (&profile.name, &exception.name);
+            let Some(first_tool) = exception.tools.first() else {
+                return Err(SnapshotError::ExceptionNamesNoTool {
+                    profile: profile_name.clone(),
+                    exception: exception_name.clone(),
+                });
+            };
+            if !names.insert(exception_name) {
+                return Err(SnapshotError::DuplicateException {
+                    profile: profile_name.clone(),
+                    exception: exception_name.clone(),
+                    tool: first_tool.clone(),
+                });
+            }
+            for tool in &exception.tools {
+                if let Some(first) = named.insert(tool, exception_name) {
+                    return Err(SnapshotError::ToolInTwoExceptions {
+                        profile: profile_name.clone(),
+                        first: first.clone(),
+                        exception: exception_name.clone(),
+                        tool: tool.clone(),
+                    });
+                }
+            }
+            if !profile.requires_currency {
+                return Err(SnapshotError::ExceptionWithoutCurrency {
+                    profile: profile_name.clone(),
+                    exception: exception_name.clone(),
+                    tool: first_tool.clone(),
+                });
+            }
+            for name in &exception.tools {
+                let Some(tool) = snapshot.tools.get(name) else {
+                    return Err(SnapshotError::ExceptionToolUnapproved {
+                        profile: profile_name.clone(),
+                        exception: exception_name.clone(),
+                        tool: name.clone(),
+                    });
+                };
+                if tool.classification != Classification::Write {
+                    return Err(SnapshotError::ExceptionToolNotWrite {
+                        profile: profile_name.clone(),
+                        exception: exception_name.clone(),
+                        tool: name.clone(),
+                        classification: tool.classification,
+                    });
+                }
+                if tool.settlement == Some(Settlement::Person) {
+                    return Err(SnapshotError::ExceptedWriteSettledByPerson {
+                        profile: profile_name.clone(),
+                        exception: exception_name.clone(),
+                        tool: name.clone(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Rule 5 for one tool on one surface: every team and group the surface admits has the whole
 /// reach of the tool's entry in its limit.
 fn reach_within_limits(
@@ -922,6 +1132,7 @@ mod tests {
             requires_delegation: false,
             requires_currency: false,
             idempotency_key_header: false,
+            exceptions: Vec::new(),
         }
     }
 
@@ -1012,6 +1223,60 @@ mod tests {
         // Withdrawing nothing changes only the revision.
         let same = snapshot.without(&BTreeSet::new(), "r1".into());
         assert_eq!(same, snapshot);
+    }
+
+    /// A profile excepts a tool only by its exact name: not a longer name that starts with it,
+    /// not a shorter one it starts with, and not one that differs in case.
+    #[test]
+    fn a_profile_excepts_a_tool_by_its_exact_name_only() {
+        let mut profile = profile("p");
+        profile.exceptions.push(Exception {
+            name: ExceptionName::parse("comment-tools").unwrap(),
+            tools: [tool_name("sys__comment")].into(),
+        });
+        assert_eq!(
+            profile.excepting(&tool_name("sys__comment")).map(ExceptionName::as_str),
+            Some("comment-tools")
+        );
+        for other in [
+            "sys__comment_edit",
+            "sys__commen",
+            "sys__Comment",
+            "sys__comment-",
+            "other__comment",
+        ] {
+            assert_eq!(profile.excepting(&tool_name(other)), None, "{other}");
+        }
+    }
+
+    /// A withdrawal leaves every profile's exceptions as they were: a withdrawn tool leaves
+    /// the approved tools and every surface, so check 2 denies it before check 5 reads a list.
+    #[test]
+    fn without_keeps_the_profiles_exceptions_and_drops_the_tool_from_the_surfaces() {
+        let mut data = data();
+        data.tools.push(ApprovedTool {
+            classification: Classification::Write,
+            settlement: Some(Settlement::Lookup(crate::reconcile::TargetKind {
+                system: "git".into(),
+                kind: "repo".into(),
+            })),
+            ..tool("c__comment")
+        });
+        data.surfaces[0].tools.insert(tool_name("c__comment"));
+        data.profiles[0].requires_currency = true;
+        data.profiles[0].exceptions.push(Exception {
+            name: ExceptionName::parse("comments").unwrap(),
+            tools: [tool_name("c__comment")].into(),
+        });
+        let snapshot = PolicySnapshot::new(data).unwrap();
+        let derived = snapshot.without(&[tool_name("c__comment")].into(), "r1+w".into());
+        assert_eq!(derived.profiles, snapshot.profiles);
+        assert!(derived.tool(&tool_name("c__comment")).is_none());
+        assert!(
+            derived
+                .surfaces()
+                .all(|surface| !surface.tools.contains(&tool_name("c__comment")))
+        );
     }
 
     #[test]

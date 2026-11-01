@@ -111,6 +111,7 @@ fn snapshot_data(elsewhere: bool) -> SnapshotData {
                 requires_delegation: true,
                 requires_currency: false,
                 idempotency_key_header: false,
+                exceptions: Vec::new(),
             },
             Profile {
                 name: "proposers".into(),
@@ -118,6 +119,7 @@ fn snapshot_data(elsewhere: bool) -> SnapshotData {
                 requires_delegation: true,
                 requires_currency: false,
                 idempotency_key_header: false,
+                exceptions: Vec::new(),
             },
         ],
         limits: limits(),
@@ -960,6 +962,7 @@ fn snapshot_with_entry() -> PolicySnapshot {
             requires_delegation: true,
             requires_currency: false,
             idempotency_key_header: false,
+            exceptions: Vec::new(),
         }],
         limits: limits(),
         entries: Vec::new(),

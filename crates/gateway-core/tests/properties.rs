@@ -424,6 +424,7 @@ fn any_world() -> impl Strategy<Value = World> {
                 requires_delegation,
                 requires_currency,
                 idempotency_key_header: false,
+                exceptions: Vec::new(),
             },
         );
     let resources = prop_oneof![
