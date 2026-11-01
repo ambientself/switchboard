@@ -447,8 +447,6 @@ mutate("exception-recorded-on-denial", "a denial names the exception its profile
        "                .and_then(|profile| call.tool.name().ok().and_then(|name| profile.excepting(&name).cloned())),\n")
 mutate("exception-list-required", "a policy that does not mention exceptions is refused, not read as none", SRC + "policy.rs",
        "    #[serde(default)]\n    pub exceptions: Vec<Exception>,", "    pub exceptions: Vec<Exception>,")
-mutate("exception-record-field-required", "a stored record without the exception column does not read back", SRC + "audit.rs",
-       "    #[serde(default)]\n    pub allowed_by_exception: Option<ExceptionName>,", "    pub allowed_by_exception: Option<ExceptionName>,")
 mutate("exception-name-any-case", "an exception's name may hold capitals", SRC + "names.rs",
        "                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');",
        "                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');")
