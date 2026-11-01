@@ -15,7 +15,8 @@
 //!   credential may be asked for, and, for an entry that serves approved tools, its credential
 //!   as decision 0011 records it. The key custodian reads the permissions; the gateway wires a
 //!   built-in connector for each entry and serves the tools `[[built_in_tools]]` approves on
-//!   it, with their definitions and adapters among the others above.
+//!   it, with their definitions and adapters among the others above, once each approval agrees
+//!   with what the connector's own code states of the tool ([`ServedTool`]).
 //!
 //! A file that is wrong in any way the loader can see is refused whole, with a
 //! [`RegistryError`] that names the first problem. Nothing is half-loaded.
@@ -34,6 +35,7 @@
 #![forbid(unsafe_code)]
 
 mod adapter;
+mod assurance;
 mod builtin;
 mod definition;
 mod file;
@@ -41,7 +43,11 @@ mod registry;
 mod selection;
 
 pub use adapter::{ArgumentAdapter, ArgumentError, JsonPointer, ResourceSource};
-pub use builtin::{Access, BuiltInEntry, EntryDeclaration, REPORTED_KIND, ReachReport};
+pub use assurance::{Assurance, ServedTool, StatedResources};
+pub use builtin::{
+    Access, BuiltInEntry, EntryDeclaration, REACH_SURFACE, REPORTED_KIND, REPORTED_SYSTEM,
+    ReachReport,
+};
 pub use definition::{
     Approval, Route, SCHEMA_DIALECT, ToolDefinition, binding_sha256, built_in_binding_sha256,
     definition_sha256,

@@ -9,8 +9,8 @@ use gateway_core::audit::{
 };
 use gateway_core::receipt::{EstablishedBy, ReceiptRequest, Reservation, may_move};
 use gateway_core::{
-    AuditRecord, AuditStore, BoxFuture, IdempotencyKey, InstanceName, LeaseHolder, LookupAnswer,
-    LookupRecord, ReasonKind, Receipt, ReceiptQueue, ReceiptState, Recorded, Reuse,
+    AuditRecord, AuditStore, BoxFuture, Classification, IdempotencyKey, InstanceName, LeaseHolder,
+    LookupAnswer, LookupRecord, ReasonKind, Receipt, ReceiptQueue, ReceiptState, Recorded, Reuse,
     VendorReference,
 };
 use gateway_identity::Clock;
@@ -269,6 +269,7 @@ fn refused_at_begin(
         record.claimed_acting_person.is_some(),
     )?;
     refused_failure(id, record)?;
+    refused_exception(id, record)?;
     Ok(allowance)
 }
 
@@ -311,6 +312,22 @@ fn refused_failure(id: &AuditRowId, record: &AuditRecord) -> Result<(), StoreErr
     }
     if failure.digest.is_some() && !failure.failure.follows_signature() {
         return Err(violates(id, "delegation_digest_shape"));
+    }
+    Ok(())
+}
+
+/// Why the Postgres store would refuse a call record's exception, if it would, as its table's
+/// `allowed_by_exception_shape` says (migration 0012): an exception is recorded only on an
+/// allowed call of a `write` or `destructive` tool, never on a denial, a read or a proposal.
+fn refused_exception(id: &AuditRowId, record: &AuditRecord) -> Result<(), StoreError> {
+    let side_effect_check_5_denies = matches!(
+        record.classification,
+        Some(Classification::Write | Classification::Destructive)
+    );
+    if record.allowed_by_exception.is_some()
+        && !(record.decision == DecisionKind::Allow && side_effect_check_5_denies)
+    {
+        return Err(violates(id, "allowed_by_exception_shape"));
     }
     Ok(())
 }

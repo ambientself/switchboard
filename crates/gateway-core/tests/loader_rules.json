@@ -1,5 +1,5 @@
 {
-  "about": "The snapshot loader's rules (decision 0011, section 3), one refusing case and at least one passing case for each, and decision 0009's rule that every tool not classified `read` says how its `unknown` receipts are settled. Every case starts from `base`, a proxied entry reaching one project with a read tool declared from its arguments, served to the one team whose limit holds it. `tool`, `entry` and `surface` change fields of the base's first tool, entry and surface (null removes a field); `tools`, `entries`, `surfaces` and `limits` replace the base's. `expect` is `loads`, `does not parse`, or the SnapshotError variant refused with, and `names` lists text the refusal's message must contain. tests/loader_rules.rs runs every case and reports every one that fails.",
+  "about": "The snapshot loader's rules (decision 0011, section 3), one refusing case and at least one passing case for each, decision 0009's rule that every tool not classified `read` says how its `unknown` receipts are settled, and the rules for a profile's exceptions (decision 0011, section 9), named `exception rule a` to `d`. Every case starts from `base`, a proxied entry reaching one project with a read tool declared from its arguments, served to the one team whose limit holds it. `tool`, `entry` and `surface` change fields of the base's first tool, entry and surface (null removes a field); `tools`, `entries`, `surfaces`, `limits` and `profiles` replace the base's. `expect` is `loads`, `does not parse`, or the SnapshotError variant refused with, and `names` lists text the refusal's message must contain. tests/loader_rules.rs runs every case and reports every one that fails.",
   "base": {
     "revision": "rules-1",
     "tools": [
@@ -379,6 +379,171 @@
       "tool": { "classification": "propose", "settlement": { "lookup": { "system": "docs" } } },
       "entry": { "kind": "built_in", "permits": "propose" },
       "expect": "does not parse"
+    },
+
+    {
+      "name": "exception rule a: an exception on a profile that requires currency loads",
+      "tool": {"classification": "write", "settlement": {"lookup": {"system": "docs", "kind": "project"}}},
+      "entry": {"kind": "built_in", "permits": "write"},
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": true, "exceptions": [{"name": "comments", "tools": ["docs-a__list"]}]}],
+      "expect": "loads"
+    },
+    {
+      "name": "exception rule a: an exception on a profile that does not require currency is refused",
+      "tool": {"classification": "write", "settlement": {"lookup": {"system": "docs", "kind": "project"}}},
+      "entry": {"kind": "built_in", "permits": "write"},
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": false, "exceptions": [{"name": "comments", "tools": ["docs-a__list"]}]}],
+      "expect": "ExceptionWithoutCurrency", "names": ["`fenced`", "`comments`", "`docs-a__list`", "currency"]
+    },
+    {
+      "name": "exception rule a: an exception on a profile that does not mention currency is refused",
+      "tool": {"classification": "write", "settlement": {"lookup": {"system": "docs", "kind": "project"}}},
+      "entry": {"kind": "built_in", "permits": "write"},
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "exceptions": [{"name": "comments", "tools": ["docs-a__list"]}]}],
+      "expect": "ExceptionWithoutCurrency", "names": ["`fenced`", "`comments`", "`docs-a__list`"]
+    },
+    {
+      "name": "exception rule a: a profile that does not require currency and lists no exception loads",
+      "tool": {"classification": "write", "settlement": {"lookup": {"system": "docs", "kind": "project"}}},
+      "entry": {"kind": "built_in", "permits": "write"},
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": false, "exceptions": []}],
+      "expect": "loads"
+    },
+    {
+      "name": "exception rule b: an exception naming an approved write tool loads",
+      "tool": {"classification": "write", "settlement": {"lookup": {"system": "docs", "kind": "project"}}},
+      "entry": {"kind": "built_in", "permits": "write"},
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": true, "exceptions": [{"name": "comments", "tools": ["docs-a__list"]}]}],
+      "expect": "loads"
+    },
+    {
+      "name": "exception rule b: an exception naming a tool that is not approved is refused",
+      "tool": {"classification": "write", "settlement": {"lookup": {"system": "docs", "kind": "project"}}},
+      "entry": {"kind": "built_in", "permits": "write"},
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": true, "exceptions": [{"name": "comments", "tools": ["docs-a__list", "docs-a__missing"]}]}],
+      "expect": "ExceptionToolUnapproved", "names": ["`fenced`", "`comments`", "`docs-a__missing`"]
+    },
+    {
+      "name": "exception rule b: an exception naming a read tool is refused",
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": true, "exceptions": [{"name": "comments", "tools": ["docs-a__list"]}]}],
+      "expect": "ExceptionToolNotWrite", "names": ["`fenced`", "`comments`", "`docs-a__list`", "`read`"]
+    },
+    {
+      "name": "exception rule b: an exception naming a propose tool is refused",
+      "tool": {"classification": "propose", "settlement": {"lookup": {"system": "docs", "kind": "project"}}},
+      "entry": {"kind": "built_in", "permits": "propose"},
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": true, "exceptions": [{"name": "comments", "tools": ["docs-a__list"]}]}],
+      "expect": "ExceptionToolNotWrite", "names": ["`docs-a__list`", "`propose`"]
+    },
+    {
+      "name": "exception rule b: an exception naming a destructive tool is refused",
+      "tool": {"classification": "destructive", "settlement": {"lookup": {"system": "docs", "kind": "project"}}},
+      "entry": {"kind": "built_in", "permits": "destructive"},
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": true, "exceptions": [{"name": "comments", "tools": ["docs-a__list"]}]}],
+      "expect": "ExceptionToolNotWrite", "names": ["`docs-a__list`", "`destructive`"]
+    },
+    {
+      "name": "exception rule b: Atlassian's proxied addOrEditJiraIssueComment named in an exception is refused: a proxied tool is never write",
+      "tools": [{"name": "docs-a__list", "classification": "read", "connector": "docs-a", "resources": "declared", "declared_from": "arguments"}, {"name": "atlassian__addOrEditJiraIssueComment", "classification": "write", "connector": "docs-a", "resources": "declared", "declared_from": "arguments", "settlement": {"lookup": {"system": "docs", "kind": "project"}}}],
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": true, "exceptions": [{"name": "comments", "tools": ["atlassian__addOrEditJiraIssueComment"]}]}],
+      "expect": "ProxiedNotRead", "names": ["`atlassian__addOrEditJiraIssueComment`", "`docs-a`", "rule 2"]
+    },
+    {
+      "name": "exception rule b: Atlassian's proxied addOrEditJiraIssueComment classified read is still refused in an exception",
+      "tools": [{"name": "docs-a__list", "classification": "read", "connector": "docs-a", "resources": "declared", "declared_from": "arguments"}, {"name": "atlassian__addOrEditJiraIssueComment", "classification": "read", "connector": "docs-a", "resources": "declared", "declared_from": "arguments"}],
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": true, "exceptions": [{"name": "comments", "tools": ["atlassian__addOrEditJiraIssueComment"]}]}],
+      "expect": "ExceptionToolNotWrite", "names": ["`atlassian__addOrEditJiraIssueComment`", "`read`"]
+    },
+    {
+      "name": "exception rule c: an excepted write tool settled by a lookup loads",
+      "tool": {"classification": "write", "settlement": {"lookup": {"system": "docs", "kind": "project"}}},
+      "entry": {"kind": "built_in", "permits": "write"},
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": true, "exceptions": [{"name": "comments", "tools": ["docs-a__list"]}]}],
+      "expect": "loads"
+    },
+    {
+      "name": "exception rule c: an excepted write tool settled by a person is refused",
+      "tool": {"classification": "write", "settlement": "person"},
+      "entry": {"kind": "built_in", "permits": "write"},
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": true, "exceptions": [{"name": "comments", "tools": ["docs-a__list"]}]}],
+      "expect": "ExceptedWriteSettledByPerson", "names": ["`fenced`", "`comments`", "`docs-a__list`", "person"]
+    },
+    {
+      "name": "exception rule c: a write tool settled by a person that no exception names loads",
+      "tool": {"classification": "write", "settlement": "person"},
+      "entry": {"kind": "built_in", "permits": "write"},
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": true, "exceptions": []}],
+      "expect": "loads"
+    },
+    {
+      "name": "exception rule d: two exceptions of one profile with their own names and tools load",
+      "entry": {"kind": "built_in", "permits": "write"},
+      "tools": [{"name": "docs-a__list", "classification": "write", "connector": "docs-a", "resources": "declared", "declared_from": "arguments", "settlement": {"lookup": {"system": "docs", "kind": "project"}}}, {"name": "docs-a__note", "classification": "write", "connector": "docs-a", "resources": "declared", "declared_from": "arguments", "settlement": {"lookup": {"system": "docs", "kind": "project"}}}],
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": true, "exceptions": [{"name": "comments", "tools": ["docs-a__list"]}, {"name": "notes", "tools": ["docs-a__note"]}]}],
+      "expect": "loads"
+    },
+    {
+      "name": "exception rule d: one tool in the exceptions of two profiles loads: each profile has its own list",
+      "tool": {"classification": "write", "settlement": {"lookup": {"system": "docs", "kind": "project"}}},
+      "entry": {"kind": "built_in", "permits": "write"},
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": true, "exceptions": [{"name": "comments", "tools": ["docs-a__list"]}]}, {"name": "fenced-too", "classifications": ["read"], "requires_delegation": true, "requires_currency": true, "exceptions": [{"name": "comments", "tools": ["docs-a__list"]}]}],
+      "expect": "loads"
+    },
+    {
+      "name": "exception rule d: two exceptions of one profile with one name are refused",
+      "entry": {"kind": "built_in", "permits": "write"},
+      "tools": [{"name": "docs-a__list", "classification": "write", "connector": "docs-a", "resources": "declared", "declared_from": "arguments", "settlement": {"lookup": {"system": "docs", "kind": "project"}}}, {"name": "docs-a__note", "classification": "write", "connector": "docs-a", "resources": "declared", "declared_from": "arguments", "settlement": {"lookup": {"system": "docs", "kind": "project"}}}],
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": true, "exceptions": [{"name": "comments", "tools": ["docs-a__list"]}, {"name": "comments", "tools": ["docs-a__note"]}]}],
+      "expect": "DuplicateException", "names": ["`fenced`", "`comments`", "`docs-a__note`"]
+    },
+    {
+      "name": "exception rule d: one tool in two exceptions of one profile is refused",
+      "entry": {"kind": "built_in", "permits": "write"},
+      "tools": [{"name": "docs-a__list", "classification": "write", "connector": "docs-a", "resources": "declared", "declared_from": "arguments", "settlement": {"lookup": {"system": "docs", "kind": "project"}}}, {"name": "docs-a__note", "classification": "write", "connector": "docs-a", "resources": "declared", "declared_from": "arguments", "settlement": {"lookup": {"system": "docs", "kind": "project"}}}],
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": true, "exceptions": [{"name": "comments", "tools": ["docs-a__list"]}, {"name": "notes", "tools": ["docs-a__list", "docs-a__note"]}]}],
+      "expect": "ToolInTwoExceptions", "names": ["`fenced`", "`comments`", "`notes`", "`docs-a__list`"]
+    },
+    {
+      "name": "exception: one that names no tool is refused",
+      "tool": {"classification": "write", "settlement": {"lookup": {"system": "docs", "kind": "project"}}},
+      "entry": {"kind": "built_in", "permits": "write"},
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": true, "exceptions": [{"name": "comments", "tools": []}]}],
+      "expect": "ExceptionNamesNoTool", "names": ["`fenced`", "`comments`"]
+    },
+    {
+      "name": "exception: one with a field the format does not know does not parse",
+      "tool": {"classification": "write", "settlement": {"lookup": {"system": "docs", "kind": "project"}}},
+      "entry": {"kind": "built_in", "permits": "write"},
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": true, "exceptions": [{"name": "comments", "tools": ["docs-a__list"], "classification": "write"}]}],
+      "expect": "does not parse"
+    },
+    {
+      "name": "exception: one that names a classification instead of tools does not parse",
+      "tool": {"classification": "write", "settlement": {"lookup": {"system": "docs", "kind": "project"}}},
+      "entry": {"kind": "built_in", "permits": "write"},
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": true, "exceptions": [{"name": "comments", "classification": "write"}]}],
+      "expect": "does not parse"
+    },
+    {
+      "name": "exception: a name that is not lowercase letters, digits and dashes does not parse",
+      "tool": {"classification": "write", "settlement": {"lookup": {"system": "docs", "kind": "project"}}},
+      "entry": {"kind": "built_in", "permits": "write"},
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": true, "exceptions": [{"name": "Comments", "tools": ["docs-a__list"]}]}],
+      "expect": "does not parse"
+    },
+    {
+      "name": "exception: a name longer than 64 characters does not parse",
+      "tool": {"classification": "write", "settlement": {"lookup": {"system": "docs", "kind": "project"}}},
+      "entry": {"kind": "built_in", "permits": "write"},
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": true, "exceptions": [{"name": "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "tools": ["docs-a__list"]}]}],
+      "expect": "does not parse"
+    },
+    {
+      "name": "exception: a name of 64 characters loads",
+      "tool": {"classification": "write", "settlement": {"lookup": {"system": "docs", "kind": "project"}}},
+      "entry": {"kind": "built_in", "permits": "write"},
+      "profiles": [{"name": "fenced", "classifications": ["read"], "requires_delegation": true, "requires_currency": true, "exceptions": [{"name": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "tools": ["docs-a__list"]}]}],
+      "expect": "loads"
     }
   ]
 }

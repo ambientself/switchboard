@@ -295,7 +295,7 @@ fn a_user_in_two_groups_with_different_profiles_is_denied_whatever_it_calls() {
             READ_TOOL,
             &json!({"document": gateway_testkit::GROUP_G_DOCUMENT}),
         ),
-        key: None,
+        key: gateway_core::CallKey::Absent,
         currency: gateway_core::Currency::NotAsked,
     };
     assert_eq!(
@@ -317,7 +317,7 @@ fn every_kind_of_denial_the_decision_function_makes_is_reachable_from_the_fixtur
                 caller: fixture.caller_context(caller, surface).unwrap(),
                 tool: RequestedTool::new(tool),
                 resources: FixtureConnector::resources_of(tool, &arguments),
-                key: keyed.then(fresh_key),
+                key: keyed.then(fresh_key).into(),
                 currency: gateway_core::Currency::NotAsked,
             };
             decide(&fixture.policy, &call)
@@ -468,7 +468,7 @@ fn every_kind_of_denial_the_decision_function_makes_is_reachable_from_the_fixtur
         caller,
         tool: RequestedTool::new(READ_TOOL),
         resources: FixtureConnector::resources_of(READ_TOOL, &own(Caller::TeamA)),
-        key: None,
+        key: gateway_core::CallKey::Absent,
         currency: gateway_core::Currency::NotAsked,
     };
     assert_eq!(

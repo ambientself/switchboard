@@ -7,42 +7,72 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# The custodian is its own process (design section 9). Its client is a module of this crate, so
-# the GitHub connector can depend on the crate for the client; the gateway never starts the
-# custodian and never reads the key.
+# The custodian is its own process (design section 9). Its client is in this crate too, behind
+# the `client` feature, so the GitHub connector can depend on the crate for the client alone:
+# with `default-features = false, features = ["client"]` it links the client and the wire
+# protocol, and nothing that reads the key, signs a JWT, calls GitHub or serves the socket. That
+# is the `server` feature. tests/packaging.rs checks that the gateway's build leaves it off.
 [dependencies]
 # The metrics listener's HTTP, and the fake GitHub App API's. HTTP/1.1 only.
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"], optional = true }
 gateway-core = { path = "../gateway-core" }
-# The custodian's copy of policy is loaded by the same loader as the gateway's snapshot.
+# The custodian's copy of policy is loaded by the same loader as the gateway's snapshot, and a
+# request names each permission's level as the registry does.
 gateway-registry = { path = "../gateway-registry" }
 # The GitHub client: HTTP/1.1 only, as issuer-keys and gateway-otto have it.
-http-body-util = "0.1"
-hyper = { version = "1", features = ["client", "http1"] }
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1", features = ["client", "http1"], optional = true }
 # The TLS connector for GitHub's API, with no roots of its own: only the CA file the
 # configuration names is trusted. Its provider is ring, which this crate passes to the client.
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12"], optional = true }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"], optional = true }
 # Signs the App JWT with RS256, and the fake checks it. The pure-Rust backend, as every other
 # crate here has it: `jsonwebtoken` panics on first use if both are enabled anywhere in the build.
-jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"], optional = true }
 # The fake's installation tokens, from the operating system's randomness.
 rand_core = { version = "0.6", features = ["getrandom"], optional = true }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+# The client's socket and deadline. The server turns on the rest it needs.
+tokio = { version = "1", features = ["io-util", "net", "time"] }
 # The configuration file.
-toml = "1"
-tracing = "0.1"
+toml = { version = "1", optional = true }
+tracing = { version = "0.1", optional = true }
 # Logs: one JSON object per line, on standard error. The record goes to standard output.
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
 
-# `test-support` adds the fake GitHub App API, a local HTTP server. The custodian's own build
-# never turns it on.
+# `client` is the client the gateway asks with. `server` is the custodian itself: the key, the
+# GitHub App client, the policy check, the socket, the record, the metrics and the
+# `switchboard-custodian` binary. `test-support` adds the fake GitHub App API, a local HTTP
+# server; the custodian's own build never turns it on.
 [features]
-test-support = ["dep:rand_core"]
+default = ["client", "server"]
+client = []
+server = [
+    "dep:axum",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-rustls",
+    "dep:hyper-util",
+    "dep:jsonwebtoken",
+    "dep:rustls",
+    "dep:toml",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "tokio/fs",
+    "tokio/macros",
+    "tokio/rt-multi-thread",
+    "tokio/signal",
+    "tokio/sync",
+]
+test-support = ["client", "server", "dep:rand_core"]
+
+[[bin]]
+name = "switchboard-custodian"
+path = "src/bin/switchboard-custodian.rs"
+required-features = ["server"]
 
 [dev-dependencies]
 key-custodian = { path = ".", features = ["test-support"] }

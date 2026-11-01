@@ -89,8 +89,13 @@ pub const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 12,
+        name: "exception",
+        sql: include_str!("../sql/migrations/0012_exception.sql"),
+    },
+    Migration {
+        version: 13,
         name: "held_and_counted_claims",
-        sql: include_str!("../sql/migrations/0012_held_and_counted_claims.sql"),
+        sql: include_str!("../sql/migrations/0013_held_and_counted_claims.sql"),
     },
 ];
 

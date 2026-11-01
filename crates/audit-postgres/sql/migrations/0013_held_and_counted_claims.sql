@@ -10,11 +10,11 @@
 --   counts an attempt when it claims, so a lookup whose record then fails to save still uses up
 --   an attempt, and a receipt is looked up a bounded number of times however often saves fail.
 --
--- Additive: no column or row 0008 to 0011 made is changed, but for `receipt_moves`, which is
+-- Additive: no column or row 0008 to 0012 made is changed, but for `receipt_moves`, which is
 -- replaced. A receipt reserved before this migration has made no counted claim: its lookups so
 -- far are its attempts so far.
 --
--- 0001 to 0011 are not edited: applied versions are recorded, and an edit to one would not
+-- 0001 to 0012 are not edited: applied versions are recorded, and an edit to one would not
 -- apply.
 
 ALTER TABLE switchboard_audit.receipts

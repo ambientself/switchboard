@@ -64,7 +64,7 @@ impl TokenRequest {
     /// `owner/name`, a repository named twice, or a permission that is not a permission name.
     /// The counts and the policy are checked after this, by the custodian.
     pub fn malformed(&self) -> Option<String> {
-        if self.team.as_str().is_empty() || self.team.as_str().len() > MAX_NAME_BYTES {
+        if !self.team_well_formed() {
             return Some("the team is empty or too long".into());
         }
         let base = base_revision(&self.revision);
@@ -92,6 +92,12 @@ impl TokenRequest {
             return Some(format!("`{}` is not a permission name", bounded(name)));
         }
         None
+    }
+
+    /// Whether the team is a name the request may carry: not empty, and at most
+    /// [`MAX_NAME_BYTES`].
+    pub fn team_well_formed(&self) -> bool {
+        !self.team.as_str().is_empty() && self.team.as_str().len() <= MAX_NAME_BYTES
     }
 }
 

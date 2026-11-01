@@ -4,7 +4,9 @@
 //! for: the team, the tool, the repositories, the permissions and the revision it was decided
 //! under, with the revision the custodian checked it against. Repositories are listed up to
 //! [`LISTED_REPOSITORIES`], and past that only counted. A request refused before it was read,
-//! or that did not parse, has only what is known. A line never holds a token or the key.
+//! or that did not parse, has only what is known. A malformed request has the tool, which
+//! parsed as a tool name, and the team unless the team is what is malformed; the rest of it is
+//! left out. A line never holds a token or the key.
 //!
 //! ```json
 //! {"at":1760529600,"peer_uid":10001,"outcome":"issued","reason":null,"team":"team-a",
@@ -74,6 +76,14 @@ impl<'a> RecordLine<'a> {
             checked_revision,
             expires_at: None,
         }
+    }
+
+    /// The line with who asked, for a request refused as malformed: the tool, and the team if
+    /// it is well formed (see [`TokenRequest::team_well_formed`]).
+    pub fn attribution(mut self, request: &'a TokenRequest) -> Self {
+        self.tool = Some(request.tool.as_str());
+        self.team = request.team_well_formed().then_some(request.team.as_str());
+        self
     }
 
     /// The line with what `request` asked for.

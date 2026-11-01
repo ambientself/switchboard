@@ -7,8 +7,9 @@
 //! minutes after now, inside GitHub's ten.
 //!
 //! A token is asked for with `repositories` and `permissions` both set, so GitHub narrows it to
-//! them. What GitHub answers is checked: a token that names any other repository, all of
-//! them, or a permission beyond what was asked for (other than `metadata: read`, which GitHub
+//! them. What GitHub answers is checked: a token that names any other repository (names are
+//! compared without regard to ASCII case, as GitHub compares them), all of them, or a
+//! permission beyond what was asked for (other than `metadata: read`, which GitHub
 //! adds to every token) is never handed out. The one exception is a reach report's request,
 //! which the policy lets name no repository, for `metadata: read` alone (see
 //! [`crate::policy`]): it is asked for with no `repositories`, so for the installation's whole
@@ -413,14 +414,22 @@ fn widened(
         if answer.repository_selection.as_deref() != Some("selected") {
             return Some("GitHub issued a token for every repository of the installation".into());
         }
-        let asked: BTreeSet<&str> = repositories.iter().map(String::as_str).collect();
-        let given: BTreeSet<&str> = answer
-            .repositories
+        // GitHub's names are not case-sensitive, and its answer writes each `full_name` as the
+        // repository's owner cased it, so both sides are compared in ASCII lowercase. A request's
+        // names are ASCII (see `crate::protocol::split_repository`), and only ASCII letters are
+        // folded, so a name GitHub answers matches only the one repository it names. The answer
+        // must list as many repositories as were asked for, so it cannot list one twice in two
+        // cases and still pass.
+        let asked: BTreeSet<String> = repositories
             .iter()
-            .flatten()
-            .map(|repository| repository.full_name.as_str())
+            .map(|repository| repository.to_ascii_lowercase())
             .collect();
-        if given != asked {
+        let listed: Vec<&RepositoryAnswer> = answer.repositories.iter().flatten().collect();
+        let given: BTreeSet<String> = listed
+            .iter()
+            .map(|repository| repository.full_name.to_ascii_lowercase())
+            .collect();
+        if given != asked || listed.len() != repositories.len() {
             return Some("GitHub issued a token for other repositories than asked for".into());
         }
     }
@@ -486,4 +495,72 @@ fn tls_client(
         Arc::new(DefaultServerNameResolver::default()),
     );
     Ok(client(connector))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GitHub's answer for a token on `full_names`, selected, with `issues: read`.
+    fn answer(full_names: &[&str]) -> TokenAnswer {
+        TokenAnswer {
+            token: String::new(),
+            expires_at: String::new(),
+            permissions: BTreeMap::from([("issues".to_owned(), "read".to_owned())]),
+            repository_selection: Some("selected".to_owned()),
+            repositories: Some(
+                full_names
+                    .iter()
+                    .map(|name| RepositoryAnswer {
+                        full_name: (*name).to_owned(),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    fn widened_for(asked: &[&str], full_names: &[&str]) -> Option<String> {
+        let asked: Vec<String> = asked.iter().map(|name| (*name).to_owned()).collect();
+        let permissions = BTreeMap::from([("issues".to_owned(), Access::Read)]);
+        widened(&answer(full_names), &asked, &permissions)
+    }
+
+    #[test]
+    fn a_name_github_writes_in_another_case_is_the_one_asked_for() {
+        let asked = ["example-org/atlas", "example-org/borealis"];
+        assert_eq!(
+            widened_for(&asked, &["Example-Org/Atlas", "EXAMPLE-ORG/borealis"]),
+            None
+        );
+        assert_eq!(
+            widened_for(&["Example-Org/Atlas"], &["example-org/atlas"]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_name_that_differs_beyond_ascii_case_is_another_repository() {
+        for (asked, given) in [
+            ("example-org/atlas", "example-org/atlas2"),
+            ("example-org/atlas", "other-org/atlas"),
+            // The Kelvin sign, which Unicode lowercases to `k` and ASCII leaves alone.
+            ("example-org/keep", "example-org/\u{212A}eep"),
+        ] {
+            assert!(
+                widened_for(&[asked], &[given]).is_some(),
+                "{given} passed as {asked}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_repository_listed_twice_in_two_cases_is_not_what_was_asked_for() {
+        assert!(
+            widened_for(
+                &["example-org/atlas"],
+                &["example-org/atlas", "EXAMPLE-ORG/ATLAS"]
+            )
+            .is_some()
+        );
+    }
 }

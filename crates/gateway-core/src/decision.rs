@@ -4,7 +4,8 @@
 //! no global state. It first finds the caller's profile in the snapshot, then runs the six
 //! checks of decision 0006 in order, with decision 0012's currency check between checks 5 and
 //! 6, and then the key check, which its amendment of 2026-10-07 adds last. The first that fails
-//! decides the reason.
+//! decides the reason. Check 5 lets a `write` tool past only when the calling profile's own
+//! list of exceptions names it (decision 0011, section 9), and every later check still runs.
 //!
 //! A decision does not give out the sentence a caller would read. That sentence exists only on
 //! the [`Refusal`](crate::audit::Refusal) that [`audit::begin`](crate::audit::begin) returns
@@ -19,7 +20,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::classification::Classification;
 use crate::names::{
-    DeploymentName, PolicyRevision, ProfileName, RequestedTool, SurfaceName, TeamId, ToolName,
+    DeploymentName, ExceptionName, PolicyRevision, ProfileName, RequestedTool, SurfaceName, TeamId,
+    ToolName,
 };
 use crate::policy::{
     ApprovedTool, Narrowing, PolicySnapshot, Profile, Resource, ResourceDeclaration,
@@ -66,17 +68,47 @@ pub struct CallContext {
     pub tool: RequestedTool,
     /// The resources the call names, from the tool's resource adapter.
     pub resources: Resources,
-    /// The call's idempotency key, if it carries one (decision 0009, "The key"). The decision
-    /// reads only whether there is one: a call of a tool not classified `read` without one is
-    /// denied by the key check. [`audit::begin`](crate::audit::begin) takes the key from here,
+    /// The call's idempotency key, if it carries one, or whether it sent one that is not valid
+    /// (decision 0009, "The key"). The decision reads only whether there is one: a call of a
+    /// tool not classified `read` without one is denied by the key check, whose sentence says
+    /// which of the two it was. [`audit::begin`](crate::audit::begin) takes the key from here,
     /// through the decision, to reserve the call's receipt, so the key the decision saw is the
     /// key the receipt holds.
-    pub key: Option<IdempotencyKey>,
+    pub key: CallKey,
     /// Whether the control plane that issued the delegation says the call's turn is current
     /// (decision 0012, "Currency"). An adapter asks only for a tool not classified `read` under
     /// a profile that requires currency; one that does not ask leaves [`Currency::NotAsked`],
     /// which the currency check denies.
     pub currency: Currency,
+}
+
+/// What a call carries as its idempotency key (decision 0009, "The key").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CallKey {
+    /// A valid key: one the caller sent on purpose, or its tool-use identifier.
+    Valid(IdempotencyKey),
+    /// No key: no carrier held anything.
+    Absent,
+    /// The caller sent a key on purpose, and it is not a valid key. The call has no key: an
+    /// explicit key that is not valid is not passed over for the tool-use identifier.
+    Invalid,
+}
+
+impl CallKey {
+    /// The key, if the call carries a valid one.
+    pub fn key(&self) -> Option<&IdempotencyKey> {
+        match self {
+            CallKey::Valid(key) => Some(key),
+            CallKey::Absent | CallKey::Invalid => None,
+        }
+    }
+}
+
+impl From<Option<IdempotencyKey>> for CallKey {
+    /// A key if there is one, and otherwise none sent.
+    fn from(key: Option<IdempotencyKey>) -> Self {
+        key.map_or(CallKey::Absent, CallKey::Valid)
+    }
 }
 
 /// The call's currency: whether the control plane that issued its delegation says the turn is
@@ -187,7 +219,7 @@ pub enum Reason {
         failure: DelegationFailure,
     },
     /// The profile does not permit the tool's classification. Always the case for a `write`
-    /// or `destructive` tool.
+    /// or `destructive` tool, unless the profile's own list of exceptions names the tool.
     ClassificationNotPermitted {
         /// The tool the call named.
         tool: ToolName,
@@ -223,6 +255,9 @@ pub enum Reason {
         tool: ToolName,
         /// The tool's classification, which is not `read`.
         classification: Classification,
+        /// Whether the call sent a key that is not valid, rather than none
+        /// ([`CallKey::Invalid`]). Its sentence then says so, rather than that it carried none.
+        invalid: bool,
     },
 }
 
@@ -365,8 +400,8 @@ pub enum Verdict {
     },
 }
 
-/// The result of [`decide`]: the verdict, the call it was made for, and the policy revision it
-/// was made from.
+/// The result of [`decide`]: the verdict, the call it was made for, the policy revision it was
+/// made from, and, for a call allowed by an exception, which one.
 ///
 /// Only [`decide`] constructs one, so an allowed decision is evidence that the checks ran. The
 /// audit begin step consumes it, which ties the audit row, the guard and the tool that runs to
@@ -377,6 +412,7 @@ pub struct Decision {
     verdict: Verdict,
     policy_revision: PolicyRevision,
     caller_limit: Option<Vec<Resource>>,
+    exception: Option<ExceptionName>,
 }
 
 impl Decision {
@@ -425,20 +461,41 @@ impl Decision {
         self.caller_limit.as_deref()
     }
 
-    pub(crate) fn into_parts(
-        self,
-    ) -> (CallContext, Verdict, PolicyRevision, Option<Vec<Resource>>) {
-        (
-            self.call,
-            self.verdict,
-            self.policy_revision,
-            self.caller_limit,
-        )
+    /// The exception in the caller's profile that let the call's `write` tool past check 5
+    /// (decision 0011, section 9), when the call is allowed and needed one. `None` for every
+    /// denial, a call that passed check 5 by an exception and was then denied included, and for
+    /// a call whose tool the profile's classifications permit. The audit row records it.
+    pub fn exception(&self) -> Option<&ExceptionName> {
+        self.exception.as_ref()
+    }
+
+    pub(crate) fn into_parts(self) -> DecisionParts {
+        DecisionParts {
+            call: self.call,
+            verdict: self.verdict,
+            policy_revision: self.policy_revision,
+            caller_limit: self.caller_limit,
+            exception: self.exception,
+        }
     }
 }
 
+/// A [`Decision`] taken apart by the audit begin step, which consumes it.
+pub(crate) struct DecisionParts {
+    pub(crate) call: CallContext,
+    pub(crate) verdict: Verdict,
+    pub(crate) policy_revision: PolicyRevision,
+    pub(crate) caller_limit: Option<Vec<Resource>>,
+    pub(crate) exception: Option<ExceptionName>,
+}
+
+/// What a call that passed every check of [`check`] got past check 5 with: its approved tool,
+/// and the exception in the caller's profile that named it, if check 5 needed one.
+type Passed<'s> = (&'s ApprovedTool, Option<&'s ExceptionName>);
+
 /// Decides one `tools/call`: every check [`list_tools`] runs, then the currency check and check
-/// 6, then the key check, last.
+/// 6, then the key check, last. A call check 5 let past by an exception goes through all of
+/// them too, and its decision names the exception only if it is allowed.
 pub fn decide(snapshot: &PolicySnapshot, call: &CallContext) -> Decision {
     let checked = check(
         snapshot,
@@ -447,18 +504,22 @@ pub fn decide(snapshot: &PolicySnapshot, call: &CallContext) -> Decision {
         Some(call.currency),
         Some(&call.resources),
     )
-    .and_then(|tool| key_is_carried(tool, call.key.as_ref()).map(|()| tool));
-    let verdict = match checked {
-        Ok(tool) => Verdict::Allow(tool.clone()),
-        Err(reason) => Verdict::Deny {
-            reason,
-            tool: call
-                .tool
-                .name()
-                .ok()
-                .and_then(|name| snapshot.tool_on_surface(&call.caller.surface, &name))
-                .cloned(),
-        },
+    .and_then(|(tool, exception)| key_is_carried(tool, &call.key).map(|()| (tool, exception)));
+    let (verdict, exception) = match checked {
+        Ok((tool, exception)) => (Verdict::Allow(tool.clone()), exception.cloned()),
+        Err(reason) => (
+            Verdict::Deny {
+                reason,
+                tool: call
+                    .tool
+                    .name()
+                    .ok()
+                    .and_then(|name| snapshot.tool_on_surface(&call.caller.surface, &name))
+                    .cloned(),
+            },
+            // A denial names no exception, whichever check denied it.
+            None,
+        ),
     };
     // Only an allowed call runs, so only its decision carries the limit its credential is
     // narrowed to, read from the same snapshot as the checks.
@@ -483,6 +544,7 @@ pub fn decide(snapshot: &PolicySnapshot, call: &CallContext) -> Decision {
         verdict,
         policy_revision: snapshot.revision().clone(),
         caller_limit,
+        exception,
     }
 }
 
@@ -491,6 +553,8 @@ pub fn decide(snapshot: &PolicySnapshot, call: &CallContext) -> Decision {
 /// The currency check, check 6 and the key check are skipped: a list request asks no control
 /// plane, names no resources and carries no key, so a `propose` tool is listed to a caller who
 /// may call it, and is denied on `tools/call` unless its turn is current and it carries a key.
+/// A `write` tool is listed only to callers whose own profile's exceptions name it, as check 5
+/// decides a call of it.
 pub fn list_tools<'s>(
     snapshot: &'s PolicySnapshot,
     caller: &CallerContext,
@@ -502,15 +566,17 @@ pub fn list_tools<'s>(
         .tools
         .iter()
         .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None, None).ok())
+        .map(|(tool, _)| tool)
         .collect()
 }
 
 /// The checks, in order. The order is the contract: a call that fails two checks is reported
 /// by the earlier one. Checks 1 to 6 are decision 0006's; the profile lookup comes first
-/// because none of them means anything without a profile. Decision 0012's currency check sits
-/// after check 5, and after the exception step decision 0011 adds to it once #12 builds it, and
-/// before check 6. The key check is not here: it is last, after check 6, and [`decide`] runs it
-/// once these pass.
+/// because none of them means anything without a profile. Check 5 includes decision 0011's
+/// exception step: it returns the exception in the caller's own profile that let a `write`
+/// tool past, if it needed one, and nothing returns early on it, so decision 0012's currency
+/// check, after check 5 and before check 6, and check 6 still run. The key check is not here:
+/// it is last, after check 6, and [`decide`] runs it once these pass.
 ///
 /// `currency` and `resources` are `None` for `tools/list`, which decides with neither, so the
 /// currency check and check 6 are skipped for it; for a call they are the call's.
@@ -520,21 +586,21 @@ fn check<'s>(
     tool: &RequestedTool,
     currency: Option<Currency>,
     resources: Option<&Resources>,
-) -> Result<&'s ApprovedTool, Reason> {
+) -> Result<Passed<'s>, Reason> {
     let principal = caller.principal.get();
     let profile = profile_is_known(snapshot, &caller.profile)?;
     surface_is_permitted(snapshot, caller, principal)?;
     let tool = tool_is_approved_on_surface(snapshot, &caller.surface, tool)?;
     delegation_agrees(caller, profile, principal)?;
     delegation_lists_tool(caller.delegation.as_ref(), tool)?;
-    classification_is_permitted(profile, tool)?;
+    let exception = classification_is_permitted(profile, tool)?;
     if let Some(currency) = currency {
         control_plane_is_current(profile, tool, currency)?;
     }
     if let Some(resources) = resources {
         resources_are_within_limit(snapshot.limits(), principal, tool, resources)?;
     }
-    Ok(tool)
+    Ok((tool, exception))
 }
 
 /// Check 0. The profile comes from the snapshot the decision is made from, never from the
@@ -656,23 +722,34 @@ fn delegation_lists_tool(
     }
 }
 
-/// Check 5. A direct write and a destructive tool are refused before the profile is consulted,
-/// so no profile data can permit either. Permitting direct writes takes a decision record that
-/// replaces this part of decision 0006, and a change here.
-fn classification_is_permitted(profile: &Profile, tool: &ApprovedTool) -> Result<(), Reason> {
+/// Check 5. A direct write and a destructive tool are refused whatever classifications the
+/// profile lists, so no profile's classifications can permit either. The one way past is
+/// decision 0011's exception (section 9): a tool whose exact name the calling profile's own
+/// list of exceptions names, never another profile's list, a classification or a part of a
+/// name. Then this returns the exception, for the decision to name if the call is allowed. The
+/// loader lets a list name only approved `write` tools settled by a lookup, and only on a
+/// profile that requires currency, so every call an exception lets past is fenced by the
+/// currency check, and still meets check 6 and the key check. Permitting direct writes in
+/// general takes a decision record that replaces this part of decision 0006, and a change here.
+fn classification_is_permitted<'p>(
+    profile: &'p Profile,
+    tool: &ApprovedTool,
+) -> Result<Option<&'p ExceptionName>, Reason> {
     let denied_everywhere = matches!(
         tool.classification,
         Classification::Write | Classification::Destructive
     );
     let permitted = !denied_everywhere && profile.classifications.contains(&tool.classification);
     if permitted {
-        Ok(())
-    } else {
-        Err(Reason::ClassificationNotPermitted {
+        return Ok(None);
+    }
+    match profile.excepting(&tool.name) {
+        Some(exception) => Ok(Some(exception)),
+        None => Err(Reason::ClassificationNotPermitted {
             tool: tool.name.clone(),
             classification: tool.classification,
             profile: profile.name.clone(),
-        })
+        }),
     }
 }
 
@@ -680,7 +757,7 @@ fn classification_is_permitted(profile: &Profile, tool: &ApprovedTool) -> Result
 /// requires currency, a call of a tool not classified `read` is allowed only if the control
 /// plane that issued its delegation says the turn is current. That covers every such tool, not
 /// only `propose`: a `write` tool that decision 0011's exception lets past check 5 is fenced the
-/// same way. Not current is denied under its own reason; unconfirmed and not asked are denied
+/// same way, and the loader lets only a profile that requires currency list one. Not current is denied under its own reason; unconfirmed and not asked are denied
 /// as unconfirmed. Run only for a `tools/call`: a list request asks no control plane.
 fn control_plane_is_current(
     profile: &Profile,
@@ -755,14 +832,17 @@ fn resources_are_within_limit(
 /// The key check, last (decision 0006, amended on 2026-10-07). A call of a tool not classified
 /// `read` must carry an idempotency key, so that a retry of its side effect is answered from
 /// its receipt rather than run again. A `read` tool needs none. Run only for a `tools/call`: a
-/// list request carries no key.
-fn key_is_carried(tool: &ApprovedTool, key: Option<&IdempotencyKey>) -> Result<(), Reason> {
+/// list request carries no key. A call that sent a key that is not valid carries none, and its
+/// denial says that is why.
+fn key_is_carried(tool: &ApprovedTool, carried: &CallKey) -> Result<(), Reason> {
+    let key = carried.key();
     if tool.classification == Classification::Read || key.is_some() {
         Ok(())
     } else {
         Err(Reason::KeyMissing {
             tool: tool.name.clone(),
             classification: tool.classification,
+            invalid: *carried == CallKey::Invalid,
         })
     }
 }
@@ -791,6 +871,7 @@ mod tests {
             requires_delegation: false,
             requires_currency,
             idempotency_key_header: false,
+            exceptions: Vec::new(),
         }
     }
 
@@ -802,9 +883,8 @@ mod tests {
     }
 
     /// The currency check covers every classification but `read`, `write` and `destructive`
-    /// included: check 5 denies those first today, and decision 0011's exception will let a
-    /// `write` tool past it, which must then be fenced like a proposal (decision 0012, "Tools
-    /// and resources").
+    /// included: decision 0011's exception lets a `write` tool past check 5, which must then
+    /// be fenced like a proposal (decision 0012, "Tools and resources").
     #[test]
     fn the_currency_check_fences_every_tool_not_classified_read() {
         for classification in Classification::ALL {

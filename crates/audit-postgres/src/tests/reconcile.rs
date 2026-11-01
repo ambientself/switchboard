@@ -6,7 +6,7 @@
 //! yet settled or handed to a person, and a hand-off and a count of claims only on one in
 //! `unknown`; a hand-off is never undone, and the count of claims rises by one at a time; and
 //! of two claims sent at once on two connections, the second waits for the first and claims
-//! nothing (migration 0012).
+//! nothing (migration 0013).
 
 use std::time::Duration;
 
@@ -236,7 +236,7 @@ async fn a_lookup_is_appended_as_the_next_attempt_and_never_changed_or_removed()
 
 /// A lease is written only on a receipt not yet settled or handed to a person: `pending`, within
 /// its row's deadline or past it, or `unknown`, as the call that reserved it holds it while its
-/// side effect runs on (migration 0012). A hand-off is written only on a receipt that reads as
+/// side effect runs on (migration 0013). A hand-off is written only on a receipt that reads as
 /// `unknown` and has not been handed to a person; it takes the database's time and is never
 /// undone, and once it is made reconciliation settles nothing. A receipt is reserved with
 /// neither. The gateway's role cannot write a receipt's target, nor a lookup's time.
@@ -382,7 +382,7 @@ async fn a_lease_is_written_only_on_a_receipt_not_settled_and_a_hand_off_only_in
 
 /// A claim is counted only on a receipt in `unknown` not handed to a person, and only one at a
 /// time, for every role: the count cannot jump, fall or be written on a receipt `pending`
-/// within its row's deadline, settled or handed off (migration 0012).
+/// within its row's deadline, settled or handed off (migration 0013).
 #[tokio::test]
 async fn a_claim_is_counted_one_at_a_time_and_only_in_unknown() {
     let Some(db) = TestDatabase::create().await else {

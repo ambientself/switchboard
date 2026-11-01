@@ -61,14 +61,15 @@ pub(crate) const COLUMNS: &[(&str, &str)] = &[
     ("delegation_egress", "text"),
     ("delegation_failure", "text"),
     ("currency", "text"),
+    ("allowed_by_exception", "text"),
 ];
 
 /// The columns the gateway's role inserts: the identifier it chose and the first half of a row,
 /// with the instance, the kind, the allowance, the credential identity, the proved pod, the
-/// delegation's columns and the currency answer (migration 0010), and without the times or the
-/// deadline; for a list row, the tools listed and their count; and for the answer to a reused
-/// key, written complete at begin, its outcome, sentence, latency and the earlier receipt a
-/// `duplicate` names.
+/// delegation's columns and the currency answer (migration 0010), and the exception that
+/// allowed the call (migration 0012), and without the times or the deadline; for a list row,
+/// the tools listed and their count; and for the answer to a reused key, written complete at
+/// begin, its outcome, sentence, latency and the earlier receipt a `duplicate` names.
 pub(crate) const INSERTED: &[&str] = &[
     "id",
     "tool_use_id",
@@ -114,6 +115,7 @@ pub(crate) const INSERTED: &[&str] = &[
     "delegation_egress",
     "delegation_failure",
     "currency",
+    "allowed_by_exception",
 ];
 
 /// The columns the gateway's role updates: the completion, with an error's kind, and the
@@ -166,7 +168,7 @@ pub(crate) const RECEIPT_INSERTED: &[&str] = &[
 ];
 
 /// The columns of `receipts` the gateway's role updates: a move's, and reconciliation's lease,
-/// hand-off and count of claims (migration 0012). Never its row, scope, key, call, target or
+/// hand-off and count of claims (migration 0013). Never its row, scope, key, call, target or
 /// time.
 pub(crate) const RECEIPT_UPDATED: &[&str] = &[
     "state",
@@ -206,7 +208,7 @@ pub(crate) const RECEIPT_SELECTED: &[&str] = &[
     "claims",
 ];
 
-/// The columns of `receipts` that migrations 0009 and 0012 add for reconciliation, with their
+/// The columns of `receipts` that migrations 0009 and 0013 add for reconciliation, with their
 /// types as Postgres's `format_type` names them.
 pub(crate) const RECEIPT_COLUMNS: &[(&str, &str)] = &[
     ("target_system", "text"),

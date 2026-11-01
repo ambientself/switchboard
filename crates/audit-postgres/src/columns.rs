@@ -83,6 +83,9 @@ use crate::store::{Budgets, PgAuditError};
 ///   `delegation_failure` 21, `currency` 11, `delegation_epoch` 8 and `delegation_egress` 6. A
 ///   verified delegation's values come from the control plane that signed it, and nothing from
 ///   a delegation that did not verify reaches a row.
+/// - `allowed_by_exception` (migration 0012): 64 at most. It names an exception in the
+///   gateway's own configuration, not a caller's choice, and the core refuses a longer name
+///   when the policy is loaded (`gateway_core::MAX_EXCEPTION_NAME`).
 ///
 /// The rest have no cap of their own. `deployment`, `profile`, `connector`, `policy_revision`,
 /// `proved_issuer`, `proved_team` and `credential_principal` come from the gateway's own
@@ -256,6 +259,8 @@ pub(crate) struct BeginRow {
     pub delegation_failure: Option<&'static str>,
     /// What the control plane answered when asked whether the turn is current.
     pub currency: Option<&'static str>,
+    /// The exception that let an allowed call's `write` tool past check 5.
+    pub allowed_by_exception: Option<String>,
 }
 
 /// The proved pod and the verified delegation's columns (decision 0012), which a call row and a
@@ -381,11 +386,11 @@ impl BeginRow {
             allowance_ms, credential_mode, credential_principal,
             proved_pod, delegation_digest, delegation_issuer, delegation_key_id,
             delegation_session, delegation_turn, delegation_execution, delegation_epoch,
-            delegation_egress, delegation_failure, currency
+            delegation_egress, delegation_failure, currency, allowed_by_exception
         ) VALUES (
             ($1::text)::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
             $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27,
-            $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38
+            $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39
         ) ON CONFLICT (id) DO NOTHING";
 
     /// The first half of a row and the answer to a reused key, in one insert: the row written
@@ -399,13 +404,13 @@ impl BeginRow {
             allowance_ms, credential_mode, credential_principal,
             proved_pod, delegation_digest, delegation_issuer, delegation_key_id,
             delegation_session, delegation_turn, delegation_execution, delegation_epoch,
-            delegation_egress, delegation_failure, currency,
+            delegation_egress, delegation_failure, currency, allowed_by_exception,
             outcome, outcome_sentence, latency_ms, duplicate_of
         ) VALUES (
             ($1::text)::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
             $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27,
-            $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38,
-            $39, $40, $41, ($42::text)::uuid
+            $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39,
+            $40, $41, $42, ($43::text)::uuid
         ) ON CONFLICT (id) DO NOTHING";
 
     /// The decision of the row already stored under an identifier, read with only the columns
@@ -499,6 +504,10 @@ impl BeginRow {
                 .as_ref()
                 .map(|failure| failure.failure.as_str()),
             currency: record.currency.map(|answer| answer.as_str()),
+            allowed_by_exception: record
+                .allowed_by_exception
+                .as_ref()
+                .map(|exception| exception.as_str().to_owned()),
         };
         within_bound(&row.sizes(), MAX_BEGUN_ROW_BYTES)?;
         Ok(row)
@@ -506,7 +515,7 @@ impl BeginRow {
 
     /// Each column and its bytes, as [`MAX_ROW_BYTES`] counts them: an allowed call's
     /// `unknown` resources as [`MAX_REACHED_BYTES`], which finish may write in their place.
-    pub fn sizes(&self) -> [(&'static str, usize); 38] {
+    pub fn sizes(&self) -> [(&'static str, usize); 39] {
         let [
             pod,
             digest,
@@ -569,6 +578,10 @@ impl BeginRow {
                 optional_bytes(self.delegation_failure),
             ),
             ("currency", optional_bytes(self.currency)),
+            (
+                "allowed_by_exception",
+                optional_bytes(self.allowed_by_exception.as_deref()),
+            ),
         ]
     }
 
@@ -594,7 +607,7 @@ impl BeginRow {
     }
 
     /// The values for [`INSERT`](Self::INSERT), in order.
-    pub fn parameters(&self) -> [&(dyn ToSql + Sync); 38] {
+    pub fn parameters(&self) -> [&(dyn ToSql + Sync); 39] {
         let [
             pod,
             digest,
@@ -645,6 +658,7 @@ impl BeginRow {
             egress,
             &self.delegation_failure,
             &self.currency,
+            &self.allowed_by_exception,
         ]
     }
 }
@@ -1735,8 +1749,34 @@ mod tests {
                 },
                 delegation_failure: None,
                 currency: Some("superseded"),
+                allowed_by_exception: None,
             }
         );
+    }
+
+    /// An allowed call's exception is written as the core names it, in its own column; a row
+    /// without one writes none.
+    #[test]
+    fn an_exception_goes_to_its_own_column() {
+        let mut record = allowed_workload();
+        record.classification = Some(gateway_core::Classification::Write);
+        record.allowed_by_exception =
+            Some(gateway_core::ExceptionName::parse("otto-comment-tools").unwrap());
+        let row = BeginRow::from_record(&id(), &record, &budgets()).unwrap();
+        assert_eq!(
+            row.allowed_by_exception.as_deref(),
+            Some("otto-comment-tools")
+        );
+        let sizes: std::collections::BTreeMap<&str, usize> = row.sizes().into_iter().collect();
+        assert_eq!(sizes["allowed_by_exception"], "otto-comment-tools".len());
+        assert!(
+            row.parameters()
+                .iter()
+                .any(|parameter| format!("{parameter:?}") == "Some(\"otto-comment-tools\")"),
+            "the exception is not among the insert's parameters"
+        );
+        let row = BeginRow::from_record(&id(), &allowed_workload(), &budgets()).unwrap();
+        assert_eq!(row.allowed_by_exception, None);
     }
 
     /// A delegation that did not verify writes its failure and, after a verified signature,

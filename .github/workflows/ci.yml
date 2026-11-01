@@ -32,7 +32,7 @@ jobs:
         run: |
           rustup toolchain install
           rustc --version
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Format
         run: cargo fmt --all --check
       - name: Lint
@@ -86,7 +86,7 @@ jobs:
         run: |
           rustup toolchain install
           rustc --version
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build switchboard as deploy/Dockerfile does
         run: cargo build --release --locked -p gateway --bin switchboard
       # deploy/ci/proxied-propose/ serves one proxied `propose` tool, with identity enforced
@@ -216,7 +216,7 @@ jobs:
         run: |
           rustup toolchain install
           rustc --version
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # A test with no server says "skipped" and passes. Here that would mean the job checked
       # nothing, so the job fails if any test says it. --nocapture also puts the latency test's
       # p50 and p95 in the log; they measure a CI runner, not production.

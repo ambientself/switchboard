@@ -12,8 +12,8 @@
 //!   [`KeyConfigError`] has one variant for each refusal.
 //! - [`ToolMapping`] maps Otto's bare tool names to this gateway's, one to one.
 //! - [`GrantVerifier`] checks a grant as presented, in the decision's order, against a clock
-//!   it is given. A failure is a [`FailureKind`] and, only once the signature verified, the
-//!   grant's [`GrantDigest`]: nothing from the claims.
+//!   it is given. A failure is a [`FailureKind`] and, only for a binding's failure (the
+//!   audience, the lifetime or the pod), the grant's [`GrantDigest`]: nothing from the claims.
 //! - [`resolver`] is the client for Otto's resolver interface (decision 0003) and its currency
 //!   question (decision 0012), with a budget of one second, no cache, a bounded answer, and
 //!   every failure unconfirmed. The interface is proposed in `docs/resolver-interface.md`. The

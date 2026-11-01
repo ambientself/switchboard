@@ -18,7 +18,10 @@ use serde_json::{Value, json};
 use tokio_postgres::Client;
 
 use super::schema::{complete, denied, insert, insert_row, list};
-use super::{ADDED_BY_0010, GATEWAY_ROLE, INSUFFICIENT_PRIVILEGE, TestDatabase, code, message};
+use super::{
+    ADDED_BY_0010, EXCEPTION_COLUMN, GATEWAY_ROLE, INSUFFICIENT_PRIVILEGE, TestDatabase, code,
+    message,
+};
 use crate::{MIGRATIONS, OWNER_ROLE, PgAuditError, PgAuditStore, PoolSizes, migrate};
 
 const STATES: [(&str, ReceiptState); 4] = [
@@ -264,7 +267,7 @@ fn proposal(
         caller: fixture.caller_context(Caller::TeamA, SURFACE_ALL).unwrap(),
         tool: RequestedTool::new(DRAFT_TOOL),
         resources: FixtureConnector::resources_of(DRAFT_TOOL, &arguments),
-        key: Some(key.clone()),
+        key: gateway_core::CallKey::Valid(key.clone()),
         currency: gateway_core::Currency::NotAsked,
     };
     let decision = decide(&fixture.policy, &context);
@@ -589,11 +592,14 @@ async fn the_receipts_migration_keeps_the_rows_already_written() {
     )
     .await;
 
-    assert_eq!(migrate(&mut owner).await.unwrap(), vec![8, 9, 10, 11, 12]);
+    assert_eq!(
+        migrate(&mut owner).await.unwrap(),
+        vec![8, 9, 10, 11, 12, 13]
+    );
     let after = values(
         &owner,
         &format!(
-            "SELECT to_jsonb(r) - 'duplicate_of' - {ADDED_BY_0010}
+            "SELECT to_jsonb(r) - 'duplicate_of' - {ADDED_BY_0010} - '{EXCEPTION_COLUMN}'
                FROM switchboard_audit.call_rows r ORDER BY id"
         ),
     )

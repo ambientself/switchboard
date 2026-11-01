@@ -182,6 +182,41 @@ async fn a_line_that_is_not_a_request_is_refused() {
 }
 
 #[tokio::test]
+async fn a_malformed_request_is_recorded_with_who_asked() {
+    let world = World::new().await;
+    let mut twice = request();
+    twice.repositories.push(format!("{ACCOUNT}/atlas"));
+    let mut no_team = request();
+    no_team.team = TeamId::new("");
+    for asked in [&twice, &no_team] {
+        let error = world.client.token(asked).await.unwrap_err();
+        assert_eq!(refused(&error), Refusal::Malformed);
+    }
+    world.raw(b"not json\n").await;
+    let lines = world.record.lines();
+    assert_eq!(lines.len(), 3);
+    for line in &lines {
+        assert_eq!(line["reason"], "malformed", "{line}");
+        for left_out in [
+            "repositories",
+            "repository_count",
+            "permissions",
+            "revision",
+        ] {
+            assert!(line[left_out].is_null(), "{left_out}: {line}");
+        }
+    }
+    assert_eq!(lines[0]["team"], "team-a");
+    assert_eq!(lines[0]["tool"], "github__get_issue");
+    // The team is what is malformed: only the tool is kept.
+    assert!(lines[1]["team"].is_null(), "{}", lines[1]);
+    assert_eq!(lines[1]["tool"], "github__get_issue");
+    // A line that did not parse has no one to name.
+    assert!(lines[2]["team"].is_null() && lines[2]["tool"].is_null());
+    assert_eq!(world.fake.token_requests(), 0);
+}
+
+#[tokio::test]
 async fn a_peer_with_other_credentials_is_refused_and_not_read() {
     // The socket is served to another UID; this test's process is a stranger to it. The UID is
     // read from the kernel: SO_PEERCRED on Linux, getpeereid on macOS, through Tokio, so the

@@ -7,8 +7,8 @@ mod common;
 
 use common::{at, base, load, rehash, remove, set, table_at, value};
 use gateway_core::{
-    Admitted, Classification, ConnectorEntry, CredentialMode, DeclaredFrom, EntryKind, Narrowing,
-    Resource, ResourceDeclaration, SnapshotError, ToolName,
+    Admitted, Classification, ConnectorEntry, CredentialMode, DeclaredFrom, EntryKind,
+    ExceptionName, Narrowing, Resource, ResourceDeclaration, SnapshotError, ToolName,
 };
 use gateway_registry::{Destination, Probe, ProbeResult, RegistryError, RulePrincipal};
 use toml::Table;
@@ -134,6 +134,93 @@ fn cases() -> Vec<Case> {
             "an unknown profile field",
             |t| set(t, "profiles.0", "default", value("true")),
             Want::Parse("unknown field `default`"),
+        ),
+        // A profile's exceptions (decision 0011, section 9): the TOML form reaches the snapshot
+        // loader, which holds it to its rules; an exception refuses any key but its name and
+        // tools.
+        case(
+            "an unknown field inside a profile's exception",
+            |t| {
+                set(t, "profiles.0", "requires_currency", value("true"));
+                set(
+                    t,
+                    "profiles.0",
+                    "exceptions",
+                    value(
+                        r#"[{ name = "comments", tools = ["docs__read"], classification = "write" }]"#,
+                    ),
+                );
+            },
+            Want::Parse("unknown field `classification`"),
+        ),
+        case(
+            "an exception that is not a lowercase name",
+            |t| {
+                set(t, "profiles.0", "requires_currency", value("true"));
+                set(
+                    t,
+                    "profiles.0",
+                    "exceptions",
+                    value(r#"[{ name = "Comments", tools = ["docs__read"] }]"#),
+                );
+            },
+            Want::Parse("not a valid exception name"),
+        ),
+        case(
+            "an exception on a profile that does not require currency",
+            |t| {
+                set(
+                    t,
+                    "profiles.0",
+                    "exceptions",
+                    value(r#"[{ name = "comments", tools = ["docs__read"] }]"#),
+                );
+            },
+            Want::Error(E::Snapshot(SnapshotError::ExceptionWithoutCurrency {
+                profile: "workload-read".into(),
+                exception: ExceptionName::parse("comments").unwrap(),
+                tool: tool("docs__read"),
+            })),
+        ),
+        case(
+            "an exception naming a read tool",
+            |t| {
+                set(t, "profiles.0", "requires_currency", value("true"));
+                set(
+                    t,
+                    "profiles.0",
+                    "exceptions",
+                    value(r#"[{ name = "comments", tools = ["docs__read"] }]"#),
+                );
+            },
+            Want::Error(E::Snapshot(SnapshotError::ExceptionToolNotWrite {
+                profile: "workload-read".into(),
+                exception: ExceptionName::parse("comments").unwrap(),
+                tool: tool("docs__read"),
+                classification: Classification::Read,
+            })),
+        ),
+        case(
+            "an exception naming a tool the file does not approve",
+            |t| {
+                set(t, "profiles.0", "requires_currency", value("true"));
+                set(
+                    t,
+                    "profiles.0",
+                    "exceptions",
+                    value(r#"[{ name = "comments", tools = ["docs__comment"] }]"#),
+                );
+            },
+            Want::Error(E::Snapshot(SnapshotError::ExceptionToolUnapproved {
+                profile: "workload-read".into(),
+                exception: ExceptionName::parse("comments").unwrap(),
+                tool: tool("docs__comment"),
+            })),
+        ),
+        case(
+            "an empty list of exceptions",
+            |t| set(t, "profiles.0", "exceptions", value("[]")),
+            Want::Loads,
         ),
         case(
             "an unknown profile rule field",
@@ -1809,6 +1896,24 @@ fn a_profile_requires_currency_only_when_it_says_so() {
         load(&table).is_err(),
         "a setting that is not a boolean loaded"
     );
+}
+
+/// A profile lists no exceptions unless it says so (decision 0011, section 9): a profile that
+/// does not mention them, as every file written before the list does not, lists none.
+#[test]
+fn a_profile_lists_no_exceptions_unless_it_says_so() {
+    let registry = load(&base()).unwrap();
+    for profile in ["workload-read", "user-read"] {
+        assert!(
+            registry
+                .snapshot()
+                .profile(&profile.into())
+                .unwrap()
+                .exceptions
+                .is_empty(),
+            "{profile}"
+        );
+    }
 }
 
 #[test]
