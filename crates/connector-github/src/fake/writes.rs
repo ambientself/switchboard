@@ -215,7 +215,13 @@ fn open(
             "sha": head_sha,
             "repo": {"full_name": format!("{account}/{repo}")},
         },
-        "base": {"ref": pull["base"], "repo": {"full_name": format!("{account}/{repo}")}},
+        "base": {
+            "ref": pull["base"],
+            "repo": {
+                "full_name": format!("{account}/{repo}"),
+                "default_branch": pull["base"],
+            },
+        },
         "user": {"login": author},
         "merged_at": null,
     });

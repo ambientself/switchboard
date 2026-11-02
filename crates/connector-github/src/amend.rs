@@ -15,7 +15,7 @@
 //!
 //! 1. the pull request, `GET /repos/{owner}/{repo}/pulls/{n}`. Closed is an `error`, not a
 //!    refusal. Each of these is `refused`: opened by anyone but the bot login; its head in
-//!    another repository; its head branch not under `otto/`; no `completed` receipt of
+//!    another repository; its head branch not under `otto/`, or the repository's default branch; no `completed` receipt of
 //!    `github__propose_change` for the caller's issuer and subject, in this repository, for
 //!    `pull/<n>`; not a draft; and a body without the line marking that receipt, which a person
 //!    removed;
@@ -267,6 +267,24 @@ impl GitHubConnector {
             return ToolOutcome::Refused(format!(
                 "pull request #{number} is from the branch \"{}\", which is not under the \
                  reserved \"{BRANCH_PREFIX}\" prefix",
+                gateway_core::escape(&branch, gateway_core::MAX_RENDERED)
+            ));
+        }
+        // An administrator can make an `otto/` branch the default; a fast-forward of it would
+        // then move the repository's default branch.
+        let Some(default_branch) = text("/base/repo/default_branch") else {
+            return ToolOutcome::error(
+                ErrorKind::Other,
+                format!(
+                    "pull request #{number}'s repository default branch could not be read, so \
+                     nothing was written"
+                ),
+            );
+        };
+        if branch == default_branch {
+            return ToolOutcome::Refused(format!(
+                "pull request #{number}'s branch \"{}\" is now {repository}'s default branch, \
+                 so it may not be amended",
                 gateway_core::escape(&branch, gateway_core::MAX_RENDERED)
             ));
         }

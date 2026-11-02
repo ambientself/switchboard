@@ -1863,9 +1863,9 @@ body alone. Its result is `{state: "amended", branch, prNumber, headSha, url, pr
 records `pull/<n>` on its receipt. The first blob is each one's first write, so a definite
 refusal of it is `error` and every failure after it is `unknown`, a 422 on the ref and a broken
 pull request write included. Neither ever deletes a ref, writes one outside `otto/`, forces one,
-or opens a second pull request for a key. `github__amend_change` does not check whether the
-`otto/` branch it moves has since been made the repository's default branch, so an amendment
-after an administrator did that would move the default branch, forward only.
+or opens a second pull request for a key. `github__amend_change` reads the pull request's
+`base.repo.default_branch` and refuses a head branch equal to it, before any write, so an `otto/`
+branch an administrator has since made the default is never moved.
 
 A proposal's body is the claims block, a blank line, the marker block, and, after a blank line,
 the caller's description. The claims block is GitHub's warning alert, then each claim in a code
@@ -2963,9 +2963,14 @@ deployed policy, which waits on the security owner's signature
   and the ref's move fails the move, `unknown`; a file of the same text but another mode at the
   base counts as unchanged; and the amendment's commit `commit_landed_body_failed` state, a
   commit that lands while the body write fails, is `unknown` here, and a lookup does not find it,
-  since the body does not hold the amendment's line, so it goes to a person; and an amendment
-  does not check whether its `otto/` branch has since been made the default branch, so after an
-  administrator did that it would move the default branch, forward only.
+  since the body does not hold the amendment's line, so it goes to a person. An amendment
+  refuses a branch that has since been made the repository's default branch. The `[github]
+  bot_login` is completed with `[bot]` when given without it. Mutations now remove the
+  existing-branch refusal, the `.git` segment check, the default-branch refusal and the Postgres
+  attribution read's reference and state filters (the state filter's may survive: only a
+  completed receipt carries a reference, so it is defence in depth). No test boots a write entry
+  with a Postgres store, so `start::prepare`'s `read_receipts_from(store.clone())` is not
+  covered.
 
 - Built: `github__pr_comment` (section 13), served only under a profile whose own exception
   names it, and the command-text predicate made broader for every write: `@atlantis`,

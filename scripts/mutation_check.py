@@ -5219,6 +5219,12 @@ mutate("pg-lookup-record-updated", "a lookup record may be changed, by any role 
        "    IF TG_OP <> 'INSERT' THEN\n", "    IF TG_OP = 'DELETE' THEN\n")
 mutate("pg-settle-without-a-lookup", "reconciliation may settle a receipt with no lookup recorded that establishes the state", PG_HELD,
        "        IF NOT EXISTS (\n", "        IF false AND NOT EXISTS (\n")
+mutate("pg-attribution-reference-unchecked", "the attribution read matches a receipt whatever its vendor reference", PG + "src/reconcile.rs",
+       " WHERE r.reference = $7 AND r.state = 'completed'\n         AND r.principal_issuer = $1",
+       " WHERE r.reference = r.reference AND r.state = 'completed'\n         AND r.principal_issuer = $1")
+mutate("pg-attribution-state-unchecked", "the attribution read matches a receipt in any state", PG + "src/reconcile.rs",
+       " WHERE r.reference = $7 AND r.state = 'completed'\n         AND r.principal_issuer = $1",
+       " WHERE r.reference = $7\n         AND r.principal_issuer = $1")
 mutate("pg-claim-ignores-lease", "a claim is granted whatever lease another holder has", PG + "src/reconcile.rs",
        "         AND (r.lease_until IS NULL OR r.lease_until <= clock_timestamp())\n     RETURNING \",",
        "     RETURNING \",")
@@ -7340,6 +7346,13 @@ mutate("github-proposal-truncated-listing-accepted", "a tree listing GitHub cut 
        "        if false {")
 mutate("github-no-change-check-removed", "files the same as the base or the head are written, as a change", GHP,
        "            if !same_file(&found, &file.content) {", "            if true {")
+mutate("github-proposal-git-segment-allowed", "a path with a .git segment may be proposed", GHP,
+       '            .any(|segment| segment.eq_ignore_ascii_case(".git"))', "            .any(|_| false)")
+mutate("github-propose-existing-branch-written", "a proposal writes to an otto/<key> branch that exists with no pull request from it", GHPC,
+       "            Ok(Read::Missing) => {}\n            Ok(Read::Found(_)) => {\n                return ToolOutcome::Refused(format!(\n                    \"the branch {branch} already exists with no pull request",
+       "            Ok(Read::Missing | Read::Found(_)) => {}\n            #[allow(unreachable_patterns)]\n            Ok(Read::Found(_)) => {\n                return ToolOutcome::Refused(format!(\n                    \"the branch {branch} already exists with no pull request")
+mutate("github-amend-default-branch-moved", "an amendment moves a branch that is now the repository's default", GHAC,
+       "        if branch == default_branch {", "        if false && branch == default_branch {")
 mutate("github-claims-fence-short", "a claim's fence is three backticks, which a claim holding three closes", GHP,
        '    "`".repeat(longest.max(2) + 1)', '    "`".repeat(3)')
 mutate("github-commit-parent-wrong", "a proposal's commit names the base's tree as its parent", GHP,

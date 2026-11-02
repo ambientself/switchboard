@@ -1292,6 +1292,19 @@ async fn an_amendment_of_what_the_gateway_did_not_open_for_the_caller_or_a_perso
     let ready = refused(1, TEAM_A, "toolu_ready").await;
     assert!(ready.contains("marked ready for review"), "{ready}");
     world.rest.set_pull("atlas", 1, json!({"draft": true}));
+    // A branch an administrator has since made the repository's default.
+    world.rest.set_pull(
+        "atlas",
+        1,
+        json!({"base": {"repo": {"default_branch": "otto/widget-1.2"}}}),
+    );
+    let default = refused(1, TEAM_A, "toolu_default").await;
+    assert!(default.contains("default branch"), "{default}");
+    world.rest.set_pull(
+        "atlas",
+        1,
+        json!({"base": {"repo": {"default_branch": "main"}}}),
+    );
     // Opened by someone other than the App.
     world
         .rest
