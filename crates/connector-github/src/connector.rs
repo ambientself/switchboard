@@ -207,7 +207,15 @@ impl GitHubConnector {
                 settings.custodian_deadline,
             ),
             entries: served,
-            bot_login: settings.bot_login.clone(),
+            // GitHub names an App's own account with `[bot]` after it, and that is what
+            // `user.login` holds, so a login given without it is completed.
+            bot_login: settings.bot_login.as_ref().map(|login| {
+                if login.ends_with("[bot]") {
+                    login.clone()
+                } else {
+                    format!("{login}[bot]")
+                }
+            }),
             receipts: OnceLock::new(),
         })
     }
@@ -745,8 +753,6 @@ fn not_served(call: &ToolCall) -> ToolOutcome {
     )
 }
 
-/// The caller's sentence when no token came back. The custodian's own sentence goes to the
-/// log, not the caller.
 /// Whether `login` is a GitHub login, 1 to 39 ASCII letters, digits and hyphens, with `[bot]`
 /// after it or not, as GitHub names an App's own account.
 fn bot_login(login: &str) -> bool {
@@ -757,6 +763,8 @@ fn bot_login(login: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
+/// The caller's sentence when no token came back. The custodian's own sentence goes to the
+/// log, not the caller.
 fn custodian_sentence(team: &TeamId, kind: ErrorKind) -> String {
     match kind {
         ErrorKind::CustodianRefusal => format!(
@@ -987,6 +995,12 @@ mod tests {
                 GitHubConnector::new(&with(refused), []).unwrap_err(),
                 SettingsError::BotLogin(refused.to_owned())
             );
+        }
+        // GitHub's `user.login` for an App's own account always ends in `[bot]`, so a login
+        // given without it is completed, and compared as such.
+        for (given, kept) in [("octocat", "octocat[bot]"), ("app[bot]", "app[bot]")] {
+            let connector = GitHubConnector::new(&with(given), []).unwrap();
+            assert_eq!(connector.bot_login(), Some(kept));
         }
         let longest = format!("{}[bot]", "a".repeat(39));
         for accepted in ["switchboard-app[bot]", "octocat", longest.as_str()] {
