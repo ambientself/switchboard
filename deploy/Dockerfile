@@ -64,7 +64,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     done; \
     ls -l /out/bin
 
-FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
 # curl and jq for the workload, the kind demo's token writer and health checks, psql for the
 # migration runner and the audit query, ca-certificates for any TLS upstream.
 RUN set -eu; \
