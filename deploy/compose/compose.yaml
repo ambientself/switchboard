@@ -27,7 +27,7 @@ services:
     # image into kind as POSTGRES_IMAGE, and crates/demo-checks/tests/pins.rs holds every Postgres
     # pin to one release and digest. A Dependabot pull request that changes this line fails that
     # test until the other pins, which deploy/Dockerfile lists, are changed to match on its branch.
-    image: postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+    image: postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
     environment:
       POSTGRES_PASSWORD: dummy-superuser-password
     healthcheck:
